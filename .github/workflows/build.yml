@@ -1,0 +1,50 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Put main.dart in lib/ (works if uploaded flat at the root)
+        run: |
+          mkdir -p lib
+          if [ -f main.dart ]; then mv main.dart lib/main.dart; fi
+
+      - name: Generate Android project (keeps our own files)
+        run: |
+          cp pubspec.yaml /tmp/pubspec.yaml
+          cp -r lib /tmp/lib_bak
+          flutter create . --platforms=android --project-name py_runner --org dev.pyrunner
+          cp /tmp/pubspec.yaml pubspec.yaml
+          rm -rf lib && cp -r /tmp/lib_bak lib
+          rm -rf test
+          sed -i 's/android:label="[^"]*"/android:label="مشغّل بايثون"/' android/app/src/main/AndroidManifest.xml
+
+      - run: flutter pub get
+
+      - name: Build release APK (obfuscated)
+        run: flutter build apk --release --obfuscate --split-debug-info=build/symbols
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: build/app/outputs/flutter-apk/app-release.apk
