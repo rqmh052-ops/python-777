@@ -1,0 +1,16 @@
+name: py_runner
+description: واجهة تطبيق تشغيل سكربتات بايثون (نسخة تجريبية)
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  material_ui: ^1.0.0
+  url_launcher: ^6.3.2
+
+flutter:
+  uses-material-design: true
