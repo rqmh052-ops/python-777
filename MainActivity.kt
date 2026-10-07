@@ -454,7 +454,7 @@ class BayanPythonBridge(private val context: Context) :
         }
     }
 
-    private inner class RunSession(val runId: String) {
+    inner class RunSession(val runId: String) {
         @Volatile var stopped = false
         @Volatile var finished = false
         @Volatile var exitCode = -1
