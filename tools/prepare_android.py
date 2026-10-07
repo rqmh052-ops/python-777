@@ -129,6 +129,45 @@ def patch_app_build() -> None:
         else:
             text += chaq + "\n"
 
+    # Flutter يضيف ABIs إضافية (مثل armeabi-v7a) لنسخة debug، وChaquopy مع Python 3.13
+    # يدعم arm64-v8a و x86_64 فقط، فيفشل التهيئة حتى لو بنينا release فقط.
+    # finalizeDsl آخر نقطة قبل قفل الإعدادات، فنفرض الـ ABI على كل الـ buildTypes.
+    if "finalizeDsl" not in text:
+        if kts:
+            text += """
+androidComponents {
+    finalizeDsl { dsl ->
+        dsl.defaultConfig.ndk {
+            abiFilters.clear()
+            abiFilters.add("arm64-v8a")
+        }
+        dsl.buildTypes.configureEach {
+            ndk {
+                abiFilters.clear()
+                abiFilters.add("arm64-v8a")
+            }
+        }
+    }
+}
+"""
+        else:
+            text += """
+androidComponents {
+    finalizeDsl { dsl ->
+        dsl.defaultConfig.ndk {
+            abiFilters.clear()
+            abiFilters.add('arm64-v8a')
+        }
+        dsl.buildTypes.configureEach {
+            ndk {
+                abiFilters.clear()
+                abiFilters.add('arm64-v8a')
+            }
+        }
+    }
+}
+"""
+
     path.write_text(text, encoding="utf-8")
 
 
