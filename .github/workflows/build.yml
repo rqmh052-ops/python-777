@@ -32,6 +32,9 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          # مثبّت عمدًا: يمنع تغيّر Flutter/AGP/Kotlin فجأة بين بناء وآخر.
+          # لا تغيّره إلا عند الحاجة، ثم اختبر بناءً واحدًا.
+          flutter-version: "3.47.4"
           cache: true
 
       - name: Validate Python runtime
