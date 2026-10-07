@@ -51,6 +51,15 @@ jobs:
           rm -rf lib
           cp -r /tmp/bayan_lib lib
           cp /tmp/bayan_pubspec.yaml pubspec.yaml
+          # flutter create يولّد اختبار MyApp الافتراضي (يحتاج flutter_test) وملف
+          # analysis_options.yaml يشير إلى flutter_lints، وكلاهما غير موجود في pubspec.yaml
+          rm -rf test
+          cat > analysis_options.yaml <<'EOF'
+          analyzer:
+            exclude:
+              - build/**
+              - test/**
+          EOF
 
       - name: Configure Chaquopy and Android
         run: python tools/prepare_android.py
