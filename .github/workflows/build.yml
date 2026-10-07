@@ -39,8 +39,9 @@ jobs:
 
       - name: Validate Python runtime
         run: |
-          python -m py_compile bayan_runtime.py tools/test_runtime.py
+          python -m py_compile bayan_runtime.py tools/test_runtime.py tools/test_extra.py
           python tools/test_runtime.py
+          python tools/test_extra.py
           flutter --version
 
       - name: Generate Android shell
@@ -73,10 +74,12 @@ jobs:
       - name: Analyze Dart
         run: flutter analyze
 
+      # --no-shrink ضروري: R8 يعيد تسمية كلاسات Kotlin (مثل RunCallback -> y0) ويحذف
+      # دوال emitState/emitPackage لأن بايثون وحده يستدعيها، فتفشل كل السكربتات والمكتبات.
       - name: Build release APK
         env:
           JAVA_TOOL_OPTIONS: -Xmx4g
-        run: flutter build apk --release --target-platform android-arm64 --obfuscate --split-debug-info=build/symbols
+        run: flutter build apk --release --no-shrink --target-platform android-arm64 --obfuscate --split-debug-info=build/symbols
 
       - name: Verify APK
         run: |
