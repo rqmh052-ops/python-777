@@ -424,6 +424,7 @@ class BayanPythonBridge(private val context: Context) :
         @Suppress("unused")
         fun emitExit(code: Int) {
             session.exitCode = code
+            session.finished = true
             emit(
                 mapOf(
                     "channel" to "run",
@@ -436,6 +437,11 @@ class BayanPythonBridge(private val context: Context) :
     }
 
     inner class PackageCallback(private val jobId: String) {
+        // بايثون يستدعيها بعد تثبيت كل حزمة (install_package). غيابها كان يسبب
+        // AttributeError ويلغي التثبيت بعد أول wheel.
+        @Suppress("unused")
+        fun shouldStop(): Boolean = closed
+
         @Suppress("unused")
         fun emitPackage(stage: String, received: Int, total: Int, message: String) {
             val progress = if (total > 0) received.toDouble() / total.toDouble() else 0.0

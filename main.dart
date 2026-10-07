@@ -63,6 +63,10 @@ const catalog = <Lib>[
   Lib('Telethon', 'عميل Telegram عبر MTProto', 'telethon'),
 ];
 
+// يعرض رسالة الخطأ الحقيقية بدل PlatformException(code, message, null, null)
+String errText(Object e) =>
+    e is PlatformException ? (e.message ?? e.code) : '$e';
+
 String _pkgKey(String name) => name.replaceAll(RegExp(r'[_.-]+'), '-').toLowerCase();
 String cleanPackageName({required String clean}) {
   final match = RegExp(r'^([A-Za-z0-9][A-Za-z0-9_.-]*)').firstMatch(clean);
@@ -1012,7 +1016,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
-      _snack('تعذر فتح مدير المكتبات: $e');
+      _snack('تعذر فتح مدير المكتبات: ${errText(e)}');
     }
   }
 
@@ -1034,7 +1038,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         _catalog = catalog;
       });
     } catch (e) {
-      if (mounted && !silent) _snack('تعذر تحديث حالة المكتبات: $e');
+      if (mounted && !silent) _snack('تعذر تحديث حالة المكتبات: ${errText(e)}');
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
@@ -1083,7 +1087,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     } catch (e) {
       await _refresh(silent: true, force: true);
       if (!mounted) return;
-      _snack('فشل تثبيت المكتبة: $e');
+      _snack('فشل تثبيت المكتبة: ${errText(e)}');
       setState(() {
         _jobs.remove(jobId);
         _jobPackages.remove(jobId);
@@ -1118,7 +1122,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       await _refresh(silent: true);
       if (mounted) _snack('تمت إزالة ${package.name}');
     } catch (e) {
-      if (mounted) _snack('تعذر إزالة المكتبة: $e');
+      if (mounted) _snack('تعذر إزالة المكتبة: ${errText(e)}');
     }
   }
 
@@ -2186,6 +2190,7 @@ class _OutputScreenState extends State<OutputScreen> {
           _lines.last.text += ch;
         }
       }
+      if (_lines.length > 5000) _lines.removeRange(0, _lines.length - 5000);
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
@@ -2204,7 +2209,7 @@ class _OutputScreenState extends State<OutputScreen> {
     try {
       await _runner.start();
     } catch (e) {
-      if (mounted) _add('تعذر بدء Python: $e', 3);
+      if (mounted) _add('تعذر بدء Python: ${errText(e)}', 3);
     } finally {
       _starting = false;
       if (mounted) setState(() {});
@@ -2220,7 +2225,7 @@ class _OutputScreenState extends State<OutputScreen> {
       await _runner.sendInput(text);
       if (mounted) setState(() {});
     } catch (e) {
-      _add('تعذر إرسال الإدخال: $e', 3);
+      _add('تعذر إرسال الإدخال: ${errText(e)}', 3);
     }
   }
 
@@ -2230,7 +2235,7 @@ class _OutputScreenState extends State<OutputScreen> {
     try {
       await _runner.stop();
     } catch (e) {
-      if (mounted) _add('تعذر إيقاف التشغيل: $e', 3);
+      if (mounted) _add('تعذر إيقاف التشغيل: ${errText(e)}', 3);
     }
   }
 

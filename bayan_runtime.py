@@ -31,6 +31,7 @@ from typing import Any
 
 PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
+PYPI_SIMPLE = "https://pypi.org/simple/{name}/"
 CHAQUOPY_INDEX = "https://chaquo.com/pypi-13.1/{name}/"
 
 _ENV_ROOT: Path | None = None
@@ -94,6 +95,14 @@ class StopRequested(BaseException):
     pass
 
 
+def _should_stop(callback: Any) -> bool:
+    """Ask the Android bridge whether the user pressed stop (never raises)."""
+    try:
+        return bool(callback.shouldStop())
+    except AttributeError:
+        return False
+
+
 class _CallbackStream(io.TextIOBase):
     def __init__(self, callback: Any, kind: str):
         super().__init__()
@@ -122,13 +131,11 @@ class _CallbackStdin(io.TextIOBase):
         self.callback = callback
 
     def readline(self, size: int = -1) -> str:
-        if self.callback.shouldStop():
+        if _should_stop(self.callback):
             raise StopRequested()
         self.callback.emitInput("")
         value = self.callback.requestInput("")
-        if value is None:
-            raise StopRequested()
-        if self.callback.shouldStop():
+        if value is None or _should_stop(self.callback):
             raise StopRequested()
         return str(value) + "\n"
 
@@ -143,18 +150,24 @@ class _CallbackStdin(io.TextIOBase):
         return "utf-8"
 
 
+_STOP_POLL_SECONDS = 0.05
+
+
 def _trace_factory(callback: Any):
+    """Line tracer that checks the stop flag at most every 50 ms.
+
+    Every call into `callback` crosses into Java (slow), so asking on every
+    line/opcode made ordinary loops crawl. A backward jump inside a loop still
+    fires a "line" event, so even `while True: pass` stays stoppable.
+    """
+    state = {"last": 0.0}
+    clock = time.monotonic
+
     def trace(frame, event, arg):
-        if callback.shouldStop():
-            raise StopRequested()
-        # Opcode tracing makes stop responsive even for tight single-line loops.
-        if event == "call":
-            try:
-                frame.f_trace_opcodes = True
-            except Exception:
-                pass
-        elif event == "opcode":
-            if callback.shouldStop():
+        now = clock()
+        if now - state["last"] >= _STOP_POLL_SECONDS:
+            state["last"] = now
+            if _should_stop(callback):
                 raise StopRequested()
         return trace
 
@@ -170,6 +183,17 @@ def _run_exit_code(value: Any) -> int:
         return int(str(value))
     except Exception:
         return 1
+
+
+def _print_user_traceback(exc: BaseException, file: Any) -> None:
+    """Print a traceback without the runner's own internal frames."""
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_frame.f_globals is globals():
+        tb = tb.tb_next
+    try:
+        traceback.print_exception(type(exc), exc, tb, file=file)
+    except Exception:
+        file.write(f"{type(exc).__name__}: {exc}\n")
 
 
 def run_script(script_path: str, callback: Any) -> int:
@@ -207,11 +231,11 @@ def run_script(script_path: str, callback: Any) -> int:
         sys.stdin = stdin
 
         def bayan_input(prompt: str = "") -> str:
-            if callback.shouldStop():
+            if _should_stop(callback):
                 raise StopRequested()
             callback.emitInput(str(prompt))
             value = callback.requestInput(str(prompt))
-            if value is None or callback.shouldStop():
+            if value is None or _should_stop(callback):
                 raise StopRequested()
             return str(value)
 
@@ -238,11 +262,12 @@ def run_script(script_path: str, callback: Any) -> int:
         callback.emitState("stopped")
     except SystemExit as exc:
         exit_code = _run_exit_code(exc.code)
-        if exit_code != 0:
-            traceback.print_exc(file=err)
-    except BaseException:
+        if isinstance(exc.code, str) and exc.code:
+            # Same as CPython: sys.exit("message") prints the message to stderr.
+            err.write(exc.code + "\n")
+    except BaseException as exc:
         exit_code = 1
-        traceback.print_exc(file=err)
+        _print_user_traceback(exc, err)
     finally:
         try:
             sys.settrace(old_trace)
@@ -306,11 +331,12 @@ def _parse_spec(spec: str) -> tuple[str, list[tuple[str, str]]]:
     if ";" in raw_name:
         raise ValueError("اسم المكتبة غير صالح")
     constraints: list[tuple[str, str]] = []
-    remainder = remainder.strip()
+    # Extras such as requests[socks] are optional features; ignore the brackets.
+    remainder = re.sub(r"^\s*\[[^\]]*\]", "", remainder).strip()
     if remainder:
         remainder = remainder.replace("(", "").replace(")", "")
         for part in re.split(r",\s*", remainder):
-            m = re.match(r"^(==|!=|<=|>=|<|>|~=)\s*([A-Za-z0-9!+._-]+)$", part.strip())
+            m = re.match(r"^(===|==|!=|<=|>=|<|>|~=)\s*([A-Za-z0-9!+._*-]+)$", part.strip())
             if not m:
                 raise ValueError("صيغة الإصدار غير مدعومة")
             constraints.append((m.group(1), m.group(2)))
@@ -329,24 +355,38 @@ def _version_parts(v: str) -> tuple:
             epoch = 0
     # Common PEP 440 prerelease/postrelease handling. Good for package selection
     # without bringing the large `packaging` dependency into the base runtime.
+    v = v.lstrip("v")
     m = re.match(r"^([0-9]+(?:\.[0-9]+)*)(.*)$", v)
     if not m:
-        return (epoch, (0,), 0, "")
+        # Same 5-field shape as below so tuples are always comparable.
+        return (epoch, (0,), 3, 0, 0)
     release = tuple(int(x) for x in m.group(1).split("."))
+    # 1.0 == 1.0.0: drop trailing zeros so comparisons follow PEP 440.
+    while len(release) > 1 and release[-1] == 0:
+        release = release[:-1]
     tail = m.group(2)
     pre_rank = 3
     pre_num = 0
     post = 0
     if tail:
-        pm = re.search(r"(?:^|\.)(a|alpha|b|beta|rc)([0-9]*)", tail)
+        # dev releases sort before every pre-release of the same version.
+        if re.search(r"(?:^|[._-])dev", tail):
+            pre_rank = -1
+        pm = re.search(r"(?:^|[._-])(a|alpha|b|beta|c|rc|pre|preview)[._-]?([0-9]*)", tail)
         if pm:
             pre_tag = pm.group(1)
-            pre_rank = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "rc": 2}[pre_tag]
+            pre_rank = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}[pre_tag]
             pre_num = int(pm.group(2) or 0)
         postm = re.search(r"(?:post|rev|r)[._-]?([0-9]+)", tail)
         if postm:
             post = int(postm.group(1)) + 1
     return (epoch, release, pre_rank, pre_num, post)
+
+
+def _is_prerelease(v: str) -> bool:
+    """True for alpha/beta/rc/dev versions (pip skips these by default)."""
+    parts = _version_parts(v)
+    return parts[2] != 3
 
 
 def _cmp_version(a: str, b: str) -> int:
@@ -358,8 +398,24 @@ def _cmp_version(a: str, b: str) -> int:
     return 0
 
 
+def _wildcard_match(version: str, wanted: str) -> bool:
+    """PEP 440 prefix matching for `==1.2.*` / `!=1.2.*`."""
+    prefix = wanted[:-2].lower()
+    version = version.lower().split("+", 1)[0]
+    return version == prefix or version.startswith(prefix + ".")
+
+
 def _satisfies(version: str, constraints: list[tuple[str, str]]) -> bool:
     for op, wanted in constraints:
+        if wanted.endswith(".*") and op in {"==", "!="}:
+            matches = _wildcard_match(version, wanted)
+            if (op == "==" and not matches) or (op == "!=" and matches):
+                return False
+            continue
+        if op == "===":
+            if version.strip().lower() != wanted.strip().lower():
+                return False
+            continue
         c = _cmp_version(version, wanted)
         if op == "==" and c != 0:
             return False
@@ -388,13 +444,22 @@ def _marker_value(name: str) -> str:
     if name == "sys_platform":
         return sys.platform
     if name == "platform_machine":
-        return os.environ.get("BAYAN_ABI", "aarch64")
+        return {
+            "arm64-v8a": "aarch64",
+            "armeabi-v7a": "armv7l",
+            "x86_64": "x86_64",
+            "x86": "i686",
+        }.get(os.environ.get("BAYAN_ABI", "arm64-v8a"), "aarch64")
     if name == "platform_system":
         return "Android"
     if name == "os_name":
         return "posix"
     if name == "implementation_name":
         return "cpython"
+    if name in {"platform_python_implementation", "python_implementation"}:
+        return "CPython"
+    if name == "implementation_version":
+        return f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     return ""
 
 
@@ -457,6 +522,61 @@ def _req_parts(raw: str) -> tuple[str, list[tuple[str, str]]] | None:
         raise ValueError(f"اعتماد غير مدعوم: {raw}")
 
 
+def _http_read(url: str, accept: str | None = None, timeout: float = 25, attempts: int = 2) -> bytes:
+    """GET with one retry for transient server/network errors."""
+    headers = {"User-Agent": "Bayan-Python/1.0"}
+    if accept:
+        headers["Accept"] = accept
+    last: Exception | None = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(urllib.parse.urldefrag(url)[0], headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (500, 502, 503, 504) and attempt + 1 < attempts:
+                last = exc
+                time.sleep(0.6)
+                continue
+            raise
+        except OSError as exc:  # URLError, timeouts, connection resets
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.6)
+                continue
+            raise
+    assert last is not None
+    raise last
+
+
+def _pypi_simple_releases(key: str) -> dict[str, list[dict[str, Any]]]:
+    """Release/file list from PyPI's Simple API (PEP 691 JSON).
+
+    PyPI documents the legacy `releases` key of /pypi/<name>/json as deprecated
+    and possibly removed in future, so this is used as the fallback.
+    """
+    url = PYPI_SIMPLE.format(name=urllib.parse.quote(key, safe=""))
+    raw = _http_read(url, accept="application/vnd.pypi.simple.v1+json")
+    data = json.loads(raw.decode("utf-8"))
+    releases: dict[str, list[dict[str, Any]]] = {}
+    for item in data.get("files") or []:
+        filename = item.get("filename", "")
+        info = _parse_wheel_filename(filename)
+        if not info:
+            continue
+        releases.setdefault(info["version"], []).append(
+            {
+                "filename": filename,
+                "url": item.get("url"),
+                "digests": {"sha256": (item.get("hashes") or {}).get("sha256")},
+                "requires_python": item.get("requires-python"),
+                "size": item.get("size") or 0,
+                "yanked": bool(item.get("yanked")),
+            }
+        )
+    return releases
+
+
 def _get_json(name: str, callback: Any | None = None) -> dict[str, Any]:
     key = _norm_name(name)
     now = time.monotonic()
@@ -467,16 +587,21 @@ def _get_json(name: str, callback: Any | None = None) -> dict[str, Any]:
     url = PYPI_JSON.format(name=urllib.parse.quote(key, safe=""))
     if callback is not None:
         callback.emitPackage("search", 0, 0, f"البحث عن {key}...")
-    req = urllib.request.Request(url, headers={"User-Agent": "Bayan-Python/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = json.loads(_http_read(url).decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             raise ValueError("لم يتم العثور على مكتبة بهذا الاسم")
         raise RuntimeError(f"PyPI HTTP {exc.code}")
     except urllib.error.URLError as exc:
         raise RuntimeError(f"تعذر الاتصال بـPyPI: {exc.reason}")
+    except OSError as exc:
+        raise RuntimeError(f"تعذر الاتصال بـPyPI: {exc}")
+    if not data.get("releases"):
+        try:
+            data["releases"] = _pypi_simple_releases(key)
+        except Exception:
+            data["releases"] = {}
     with _CACHE_LOCK:
         _CACHE_JSON[key] = (time.monotonic(), data)
     return data
@@ -500,11 +625,14 @@ def _requires_python_ok(requires_python: str | None) -> bool:
 def _parse_wheel_filename(filename: str) -> dict[str, str] | None:
     if not filename.lower().endswith(".whl"):
         return None
+    # name-version(-build)?-python-abi-platform. Chaquopy wheels always carry a
+    # build tag (e.g. PyYAML-6.0.2-0-cp313-cp313-android_21_arm64_v8a.whl); the
+    # old code read that build tag ("0") as the version.
     parts = filename[:-4].split("-")
-    if len(parts) < 5:
+    if len(parts) not in (5, 6):
         return None
     py_tag, abi_tag, platform_tag = parts[-3], parts[-2], parts[-1]
-    version = parts[-4]
+    version = parts[1]
     return {"version": version, "python": py_tag, "abi": abi_tag, "platform": platform_tag}
 
 
@@ -525,10 +653,17 @@ def _wheel_compatible(filename: str) -> bool:
     if not info:
         return False
     py = info["python"]
-    if py not in {"py3", "py2.py3", "py3.py3", "abi3", f"cp{sys.version_info.major}{sys.version_info.minor}"}:
-        # Multiple Python tags may be dot separated in a wheel name.
-        if f"cp{sys.version_info.major}{sys.version_info.minor}" not in py.split("."):
-            return False
+    current_cp = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    py_tags = py.split(".")
+    py_ok = bool({"py3", f"py{sys.version_info.major}", current_cp} & set(py_tags))
+    if not py_ok and info["abi"] == "abi3":
+        # Stable-ABI wheels built for an older CPython run on newer ones too.
+        for tag in py_tags:
+            m_abi = re.match(r"^cp3(\d+)$", tag)
+            if m_abi and int(m_abi.group(1)) <= sys.version_info.minor:
+                py_ok = True
+    if not py_ok:
+        return False
     platform = info["platform"]
     if platform == "any":
         return info["abi"] == "none"
@@ -540,32 +675,45 @@ def _wheel_compatible(filename: str) -> bool:
     return min_api <= _android_api() and abi == _abi_tag()
 
 
-def _chaquopy_wheel(name: str, requested_version: str | None = None) -> dict[str, Any] | None:
+def _chaquopy_wheel(name: str, constraints: list[tuple[str, str]] | None = None) -> dict[str, Any] | None:
     url = CHAQUOPY_INDEX.format(name=urllib.parse.quote(_norm_name(name), safe=""))
-    req = urllib.request.Request(url, headers={"User-Agent": "Bayan-Python/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
+        text = _http_read(url).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None
         raise RuntimeError(f"Chaquopy wheel index HTTP {exc.code}")
     except urllib.error.URLError as exc:
         raise RuntimeError(f"تعذر الاتصال بمستودع Chaquopy: {exc.reason}")
+    except OSError as exc:
+        raise RuntimeError(f"تعذر الاتصال بمستودع Chaquopy: {exc}")
     hrefs = re.findall(r'href=["\']([^"\']+)["\']', text, flags=re.I)
     items: list[dict[str, Any]] = []
     for href in hrefs:
-        filename = urllib.parse.unquote(href.rsplit("/", 1)[-1].split("#", 1)[0])
+        base, _, fragment = href.partition("#")
+        filename = urllib.parse.unquote(base.rsplit("/", 1)[-1])
         info = _parse_wheel_filename(filename)
         if not info or not _wheel_compatible(filename):
             continue
-        if requested_version and _cmp_version(info["version"], requested_version) != 0:
+        if constraints and not _satisfies(info["version"], constraints):
             continue
-        items.append({"filename": filename, "url": urllib.parse.urljoin(url, href), "digest": None, "requires_python": None, "source": "chaquopy", "version": info["version"]})
+        sha = fragment[len("sha256="):] if fragment.startswith("sha256=") else None
+        items.append(
+            {
+                "filename": filename,
+                "url": urllib.parse.urljoin(url, base),
+                "digests": {"sha256": sha} if sha else {},
+                "requires_python": None,
+                "source": "chaquopy",
+                "version": info["version"],
+            }
+        )
     if not items:
         return None
-    items.sort(key=lambda x: _version_parts(x["version"]), reverse=True)
-    return items[0]
+    stable = [i for i in items if not _is_prerelease(i["version"])]
+    pool = stable or items
+    pool.sort(key=lambda x: _version_parts(x["version"]), reverse=True)
+    return pool[0]
 
 
 def _distribution_record(norm: str) -> tuple[Path, dict[str, Any]] | None:
@@ -669,35 +817,47 @@ def _wheel_cache_path(name: str, version: str, filename: str, sha256: str | None
     return cache / "downloads" / safe
 
 
+def _select_pypi_candidate(data: dict[str, Any], constraints: list[tuple[str, str]]) -> dict[str, Any] | None:
+    """Newest release with a wheel this device can run.
+
+    Like pip: skips yanked files and pre-releases unless nothing else fits.
+    """
+    releases = data.get("releases") or {}
+    info_requires = (data.get("info") or {}).get("requires_python")
+    versions = sorted(releases.keys(), key=_version_parts, reverse=True)
+    for allow_pre in (False, True):
+        for version in versions:
+            if not allow_pre and _is_prerelease(version):
+                continue
+            if constraints and not _satisfies(version, constraints):
+                continue
+            files = [
+                f
+                for f in releases.get(version, [])
+                if not f.get("yanked")
+                and _wheel_compatible(f.get("filename", ""))
+                and _requires_python_ok(f.get("requires_python") or info_requires)
+            ]
+            if not files:
+                continue
+            # A platform-specific Android wheel beats a generic one.
+            files.sort(key=lambda f: 0 if "android" in f.get("filename", "") else 1)
+            candidate = dict(files[0])
+            candidate["version"] = version
+            candidate["source"] = "pypi"
+            return candidate
+    return None
+
+
 def _obtain_wheel(name: str, constraints: list[tuple[str, str]], callback: Any | None = None) -> tuple[Path, dict[str, Any]]:
     data = _get_json(name, callback)
     releases = data.get("releases") or {}
-    requested_version = None
-    if constraints and len(constraints) == 1 and constraints[0][0] == "==":
-        requested_version = constraints[0][1]
-    candidate = None
     # Search PyPI first for a compatible pure-Python or Android-specific wheel.
-    for version in ([requested_version] if requested_version else sorted(releases.keys(), key=_version_parts, reverse=True)):
-        if version is None:
-            continue
-        if constraints and not _satisfies(version, constraints):
-            continue
-        for file_info in releases.get(version, []):
-            filename = file_info.get("filename", "")
-            if not _wheel_compatible(filename):
-                continue
-            if not _requires_python_ok(file_info.get("requires_python") or (data.get("info") or {}).get("requires_python")):
-                continue
-            candidate = dict(file_info)
-            candidate["version"] = version
-            candidate["source"] = "pypi"
-            break
-        if candidate:
-            break
+    candidate = _select_pypi_candidate(data, constraints)
 
     # If PyPI has no Android-compatible native wheel, use Chaquopy's Android wheel repo.
     if candidate is None:
-        candidate = _chaquopy_wheel(name, requested_version)
+        candidate = _chaquopy_wheel(name, constraints)
         if candidate is not None and constraints and not _satisfies(candidate["version"], constraints):
             candidate = None
 
@@ -706,7 +866,7 @@ def _obtain_wheel(name: str, constraints: list[tuple[str, str]], callback: Any |
 
     version = candidate["version"]
     filename = candidate["filename"]
-    sha = ((candidate.get("digests") or {}).get("sha256") if candidate.get("source") == "pypi" else None)
+    sha = (candidate.get("digests") or {}).get("sha256")
     path = _wheel_cache_path(name, version, filename, sha)
     if path.is_file() and path.stat().st_size > 0:
         if sha:
@@ -744,27 +904,70 @@ def _plan_package(norm: str, constraints: list[tuple[str, str]], callback: Any, 
     installed = _installed_version(norm)
     if installed and _satisfies(installed, constraints):
         return
+    # Dependency cycles are legal in the wild (pip tolerates them): a package
+    # that is already being planned further up the chain is simply skipped.
     if norm in visiting:
-        raise ValueError(f"اعتماد دائري اكتُشف عند {norm}")
+        return
+    planned = next((meta for _, meta, _, _ in plan if _norm_name(meta["name"]) == norm), None)
+    if planned is not None and _satisfies(planned["version"], constraints):
+        return
     visiting.add(norm)
-    wheel_path, source_info = _obtain_wheel(norm, constraints, callback)
-    metadata, reqs, top = _read_metadata_from_wheel(wheel_path)
-    actual_norm = _norm_name(metadata["name"] or norm)
-    if actual_norm != norm:
-        norm = actual_norm
-    if not _satisfies(metadata["version"], constraints):
-        raise ValueError(f"الإصدار {metadata['version']} لا يطابق الطلب")
-    if not _requires_python_ok(metadata.get("requires_python")):
-        raise ValueError("الحزمة لا تدعم إصدار Python الحالي")
-    for raw_req in reqs:
-        parsed = _req_parts(raw_req)
-        if parsed is None:
+    try:
+        wheel_path, _source = _obtain_wheel(norm, constraints, callback)
+        metadata, reqs, top = _read_metadata_from_wheel(wheel_path)
+        actual_norm = _norm_name(metadata["name"] or norm)
+        if not _satisfies(metadata["version"], constraints):
+            raise ValueError(f"الإصدار {metadata['version']} لا يطابق الطلب")
+        if not _requires_python_ok(metadata.get("requires_python")):
+            raise ValueError("الحزمة لا تدعم إصدار Python الحالي")
+        for raw_req in reqs:
+            parsed = _req_parts(raw_req)
+            if parsed is None:
+                continue
+            dep_norm, dep_constraints = parsed
+            _plan_package(dep_norm, dep_constraints, callback, plan, visiting)
+        if not any(_norm_name(meta["name"]) == actual_norm and meta["version"] == metadata["version"] for _, meta, _, _ in plan):
+            plan.append((wheel_path, metadata, reqs, top))
+    finally:
+        visiting.discard(norm)
+
+
+def _relocate_member(safe: str) -> str | None:
+    """Map a wheel member to its path under site-packages.
+
+    `<name>-<ver>.data/purelib|platlib/...` is installed straight into
+    site-packages. Scripts, headers and other data have no meaning for Bayan's
+    runtime, so they are skipped instead of failing the whole installation.
+    """
+    first, _, rest = safe.partition("/")
+    if first.endswith(".data"):
+        if rest.startswith(("purelib/", "platlib/")):
+            return rest.split("/", 1)[1] if "/" in rest else None
+        return None
+    return safe
+
+
+def _top_level_from_files(files: list[str]) -> list[str]:
+    """Importable top-level names found in the installed files.
+
+    Many modern wheels (hatchling, flit, uv, ...) ship no top_level.txt.
+    """
+    names: list[str] = []
+    for rel in files:
+        first, sep, _rest = rel.partition("/")
+        if first.endswith((".dist-info", ".data")) or first == "__pycache__":
             continue
-        dep_norm, dep_constraints = parsed
-        _plan_package(dep_norm, dep_constraints, callback, plan, visiting)
-    if not any(_norm_name(meta["name"]) == actual_norm and meta["version"] == metadata["version"] for _, meta, _, _ in plan):
-        plan.append((wheel_path, metadata, reqs, top))
-    visiting.remove(norm)
+        if sep:
+            candidate = first
+        elif rel.endswith(".py"):
+            candidate = rel[:-3]
+        elif ".so" in rel:
+            candidate = rel.split(".", 1)[0]
+        else:
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", candidate) and candidate not in names:
+            names.append(candidate)
+    return names
 
 
 def _extract_wheel(path: Path, staging: Path) -> tuple[list[str], str]:
@@ -778,15 +981,10 @@ def _extract_wheel(path: Path, staging: Path) -> tuple[list[str], str]:
             safe = _safe_member(member.filename)
             if not safe:
                 continue
-            if ".data/" in safe:
-                # Only allow purelib/platlib targets. Scripts/data outside the
-                # import tree are not meaningful for Bayan's runtime installer.
-                marker = ".data/"
-                _, rest = safe.split(marker, 1)
-                if rest.startswith("purelib/") or rest.startswith("platlib/"):
-                    safe = rest.split("/", 1)[1]
-                else:
-                    raise ValueError("هذه wheel تستخدم مسارات تثبيت خارج site-packages")
+            relocated = _relocate_member(safe)
+            if relocated is None:
+                continue
+            safe = relocated
             target = (staging / safe).resolve()
             if staging.resolve() not in target.parents and target != staging.resolve():
                 raise ValueError("wheel تحتوي مساراً خارج مجلد التثبيت")
@@ -810,8 +1008,9 @@ def _record_paths(dist_info: Path) -> list[str]:
         for row in csv.reader(fh):
             if row and row[0]:
                 safe = _safe_member(row[0])
-                if safe:
-                    out.append(safe)
+                relocated = _relocate_member(safe) if safe else None
+                if relocated:
+                    out.append(relocated)
     return out
 
 
@@ -918,12 +1117,9 @@ def list_installed() -> str:
 
 def _latest_compatible_for(name: str) -> dict[str, Any]:
     data = _get_json(name)
-    releases = data.get("releases") or {}
-    for version in sorted(releases.keys(), key=_version_parts, reverse=True):
-        files = releases.get(version, [])
-        if any(_wheel_compatible(f.get("filename", "")) and _requires_python_ok(f.get("requires_python") or (data.get("info") or {}).get("requires_python")) for f in files):
-            f = next(f for f in files if _wheel_compatible(f.get("filename", "")) and _requires_python_ok(f.get("requires_python") or (data.get("info") or {}).get("requires_python")))
-            return {"version": version, "size": f.get("size") or 0, "compatible": True}
+    found = _select_pypi_candidate(data, [])
+    if found:
+        return {"version": found["version"], "size": found.get("size") or 0, "compatible": True}
     native = _chaquopy_wheel(name)
     if native:
         return {"version": native["version"], "size": 0, "compatible": True}
@@ -987,6 +1183,7 @@ def install_package(spec: str, callback: Any, job_id: str) -> str:
         installed_now: list[str] = []
         primary_name = root_norm
         primary_version = ""
+        primary_top: list[str] = []
         try:
             callback.emitPackage("dependencies", 0, len(plan), f"تم العثور على {len(plan)} حزمة")
             for index, (wheel_path, metadata, reqs, top) in enumerate(plan, 1):
@@ -1002,10 +1199,11 @@ def install_package(spec: str, callback: Any, job_id: str) -> str:
                 _install_from_staging(stage, files, site, backup_root, backed, installed_now)
                 if norm == primary_name:
                     primary_version = metadata["version"]
+                    primary_top = list(top) or _top_level_from_files(files)
                 # Drop cached modules from the shared site-packages tree so updates
                 # become visible to the next import in the same Python process.
                 _clear_site_modules()
-                if callback.shouldStop():
+                if _should_stop(callback):
                     raise RuntimeError("تم إيقاف التثبيت")
 
             # Verify the primary distribution by importing a top-level module.
@@ -1013,7 +1211,7 @@ def install_package(spec: str, callback: Any, job_id: str) -> str:
             primary = next((item for item in plan if _norm_name(item[1]["name"]) == primary_name), None)
             if primary is None:
                 raise RuntimeError("لم تكتمل خطة تثبيت المكتبة المطلوبة")
-            top_levels = primary[3] or [primary_name.replace("-", "_")]
+            top_levels = primary_top or primary[3] or [primary_name.replace("-", "_")]
             import_errors = []
             tested = False
             for mod in top_levels:

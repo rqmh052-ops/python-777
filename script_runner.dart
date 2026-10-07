@@ -15,7 +15,8 @@ class ScriptRunner {
   }
 
   final String scriptPath;
-  final String runId;
+  // يتجدد مع كل تشغيل حتى لا تتسرب أحداث تشغيل قديم إلى التشغيل الجديد.
+  String runId;
 
   final _eventsController = StreamController<BayanEvent>.broadcast();
   late final StreamSubscription<BayanEvent> _subscription;
@@ -98,6 +99,7 @@ class ScriptRunner {
     if (_disposed) return;
     if (isRunning) return;
     _exitCode = null;
+    runId = bayanPython.newId('run');
     _finished = Completer<void>();
     _state = ScriptRunnerState.running;
     try {
