@@ -7,9 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ANDROID = ROOT / "android"
 
-AGP = "9.2.0"
-KOTLIN = "2.2.10"
-GRADLE = "9.4.1"
+# لا نفرض إصدارات AGP أو Gradle: نترك ما يولّده flutter create للإصدار المثبّت
+# من Flutter (هذا ما كان يسبب الأعطال). Chaquopy 17.0 يدعم AGP من 7.3 إلى 9.2.
+MIN_KOTLIN = "2.2.20"  # أقل إصدار Kotlin يقبله Flutter
 CHAQUOPY = "17.0.0"
 PYTHON = "3.13"
 ABIS = ["arm64-v8a"]
@@ -25,6 +25,23 @@ def patch_plugin_version(text: str, plugin: str, version: str) -> str:
         if count:
             return new
     return text
+
+
+def _vt(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def ensure_min_kotlin(text: str) -> str:
+    """يرفع إصدار Kotlin في settings إذا كان أقل من الحد الأدنى، ولا ينزّله أبدًا."""
+    pattern = r'(id\s*\(?\s*["\']org\.jetbrains\.kotlin\.android["\']\s*\)?\s+version\s+["\'])([^"\']+)(["\'])'
+
+    def fix(m: re.Match) -> str:
+        current = m.group(2)
+        if _vt(current) >= _vt(MIN_KOTLIN):
+            return m.group(0)
+        return m.group(1) + MIN_KOTLIN + m.group(3)
+
+    return re.sub(pattern, fix, text, count=1)
 
 
 def add_to_plugins(text: str, line: str) -> str:
@@ -47,9 +64,16 @@ def patch_settings() -> None:
         raise RuntimeError("Flutter لم ينشئ settings.gradle(.kts)")
 
     text = path.read_text(encoding="utf-8")
-    text = patch_plugin_version(text, "com.android.application", AGP)
-    text = patch_plugin_version(text, "org.jetbrains.kotlin.android", KOTLIN)
-    text = patch_plugin_version(text, "kotlin-android", KOTLIN)
+    text = ensure_min_kotlin(text)
+    if "org.jetbrains.kotlin.android" not in text and "kotlin-android" not in text:
+        # Kotlin مضمّن في AGP 9 بإصدار قد يكون أقل من حد Flutter؛ التصريح بالإضافة
+        # (بدون تطبيقها) هو الطريقة الرسمية لرفع إصدار Kotlin المضمّن.
+        kotlin_line = (
+            f'id("org.jetbrains.kotlin.android") version "{MIN_KOTLIN}" apply false'
+            if kts
+            else f"id 'org.jetbrains.kotlin.android' version '{MIN_KOTLIN}' apply false"
+        )
+        text = add_to_plugins(text, kotlin_line)
     chaq_line = (
         'id("com.chaquo.python") version "' + CHAQUOPY + '" apply false'
         if kts
@@ -68,9 +92,6 @@ def patch_app_build() -> None:
         raise RuntimeError("Flutter لم ينشئ app/build.gradle(.kts)")
 
     text = path.read_text(encoding="utf-8")
-    text = re.sub(r'(?m)^(\s*)id\("kotlin-android"\)', r'\1id("org.jetbrains.kotlin.android")', text)
-    text = re.sub(r"(?m)^(\s*)id [\"']kotlin-android[\"']", r"\1id 'org.jetbrains.kotlin.android'", text)
-
     if "com.chaquo.python" not in text:
         m = re.search(r"plugins\s*\{(?P<body>[\s\S]*?)\n\}", text)
         if not m:
@@ -111,18 +132,19 @@ def patch_app_build() -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def patch_wrapper() -> None:
-    path = ANDROID / "gradle" / "wrapper" / "gradle-wrapper.properties"
-    if not path.exists():
-        raise RuntimeError("Flutter لم ينشئ Gradle wrapper")
-    text = path.read_text(encoding="utf-8")
-    text = re.sub(
-        r"distributionUrl=.*",
-        f"distributionUrl=https\\://services.gradle.org/distributions/gradle-{GRADLE}-all.zip",
-        text,
-        count=1,
-    )
-    path.write_text(text, encoding="utf-8")
+def report_versions() -> None:
+    """يطبع الإصدارات الفعلية التي ولّدها Flutter (للتشخيص في سجل البناء)."""
+    for name in ("settings.gradle.kts", "settings.gradle"):
+        f = ANDROID / name
+        if f.exists():
+            t = f.read_text(encoding="utf-8")
+            for plugin in ("com.android.application", "org.jetbrains.kotlin.android"):
+                m = re.search(re.escape(plugin) + r"[\"')\s]+version\s+[\"']([^\"']+)", t)
+                print(f"  {plugin}: {m.group(1) if m else 'غير مُعرَّف (مضمّن في AGP)'}")
+    w = ANDROID / "gradle" / "wrapper" / "gradle-wrapper.properties"
+    if w.exists():
+        m = re.search(r"gradle-([\d.]+)-", w.read_text(encoding="utf-8"))
+        print(f"  gradle: {m.group(1) if m else '?'}")
 
 
 def patch_manifest() -> None:
@@ -176,11 +198,11 @@ def main() -> None:
         raise SystemExit("android directory is missing; run flutter create first")
     patch_settings()
     patch_app_build()
-    patch_wrapper()
+    report_versions()
     patch_manifest()
     install_native_sources()
     print("Bayan Android/Chaquopy configuration prepared successfully")
-    print(f"Chaquopy={CHAQUOPY}, Python={PYTHON}, AGP={AGP}, Gradle={GRADLE}, ABI={ABIS}")
+    print(f"Chaquopy={CHAQUOPY}, Python={PYTHON}, ABI={ABIS}")
 
 
 if __name__ == "__main__":
