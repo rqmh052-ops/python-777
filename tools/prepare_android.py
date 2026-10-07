@@ -193,11 +193,22 @@ def install_native_sources() -> None:
     shutil.copy2(source_py, py_root / "bayan_runtime.py")
 
 
+def print_final_app_build() -> None:
+    """يطبع ملف app/build.gradle النهائي في سجل البناء (للتأكد من ABI)."""
+    for name in ("build.gradle.kts", "build.gradle"):
+        f = ANDROID / "app" / name
+        if f.exists():
+            print(f"----- final android/app/{name} -----")
+            print(f.read_text(encoding="utf-8"))
+            print("----- end -----")
+
+
 def main() -> None:
     if not ANDROID.exists():
         raise SystemExit("android directory is missing; run flutter create first")
     patch_settings()
     patch_app_build()
+    print_final_app_build()
     report_versions()
     patch_manifest()
     install_native_sources()
