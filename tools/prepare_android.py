@@ -13,6 +13,7 @@ MIN_KOTLIN = "2.2.20"  # أقل إصدار Kotlin يقبله Flutter
 CHAQUOPY = "17.0.0"
 PYTHON = "3.13"
 ABIS = ["arm64-v8a"]
+COMPILE_SDK = 37  # permission_handler_android يتطلب 37
 
 
 def patch_plugin_version(text: str, plugin: str, version: str) -> str:
@@ -99,6 +100,10 @@ def patch_app_build() -> None:
         line = '    id("com.chaquo.python")' if kts else "    id 'com.chaquo.python'"
         text = text[: m.end(1)] + "\n" + line + text[m.end(1) :]
 
+    # بعض الإضافات (permission_handler_android) تتطلب compileSdk 37 بينما Flutter يولّد 36.
+    text = re.sub(r"compileSdk\s*=\s*[^\n]+", f"compileSdk = {COMPILE_SDK}", text, count=1)
+    text = re.sub(r"compileSdkVersion\s+[^\n]+", f"compileSdkVersion {COMPILE_SDK}", text, count=1)
+
     if kts:
         text = re.sub(r"minSdk\s*=\s*[^\n]+", "minSdk = 24", text, count=1)
         text = re.sub(r"minSdkVersion\s+[^\n]+", "minSdkVersion 24", text, count=1)
@@ -138,13 +143,17 @@ def patch_app_build() -> None:
 androidComponents {
     finalizeDsl { dsl ->
         dsl.defaultConfig.ndk {
+            println("BAYAN-ABI before defaultConfig: $abiFilters")
             abiFilters.clear()
             abiFilters.add("arm64-v8a")
         }
         dsl.buildTypes.configureEach {
+            val typeName = name
             ndk {
+                println("BAYAN-ABI before $typeName: $abiFilters")
                 abiFilters.clear()
                 abiFilters.add("arm64-v8a")
+                println("BAYAN-ABI after $typeName: $abiFilters")
             }
         }
     }
@@ -169,6 +178,18 @@ androidComponents {
 """
 
     path.write_text(text, encoding="utf-8")
+
+
+def patch_gradle_properties() -> None:
+    """AGP 9.1 يوصي بحد أقصى compileSdk 36؛ هذا يكتم التحذير ويسمح بـ 37."""
+    path = ANDROID / "gradle.properties"
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    key = "android.suppressUnsupportedCompileSdk"
+    if key not in text:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += f"{key}={COMPILE_SDK}\n"
+        path.write_text(text, encoding="utf-8")
 
 
 def report_versions() -> None:
@@ -247,6 +268,7 @@ def main() -> None:
         raise SystemExit("android directory is missing; run flutter create first")
     patch_settings()
     patch_app_build()
+    patch_gradle_properties()
     print_final_app_build()
     report_versions()
     patch_manifest()
