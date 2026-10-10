@@ -66,7 +66,7 @@ def test_kotlin_contract() -> None:
     pkg_methods = kotlin_class_methods(kt, "PackageCallback")
     tree = ast.parse(RUNTIME.read_text(encoding="utf-8"))
 
-    run_nodes = {"run_script", "_CallbackStream", "_CallbackStdin", "_trace_factory"}
+    run_nodes = {"run_script", "_CallbackStream", "_CallbackStdin", "_trace_factory", "_OutputHub"}
     run_used: set[str] = set()
     pkg_used: set[str] = set()
     for node in tree.body:
@@ -91,6 +91,7 @@ def test_build_disables_shrink() -> None:
     wf = (ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
     line = next(l for l in wf.splitlines() if "flutter build apk" in l and "run:" in l)
     assert "--no-shrink" in line, "R8 would rename RunCallback/PackageCallback again"
+    assert "tools/verify_apk.py" in wf, "CI must fail when the APK lost the Kotlin callbacks"
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +397,200 @@ def test_run_script_behaviour() -> None:
 
         cb = NoStop()
         assert run("print('ok')\n", cb, root) == 0
+
+
+# ---------------------------------------------------------------------------
+# 5. R8 safety net, worker-thread behaviour, batching
+# ---------------------------------------------------------------------------
+def _load_tool(name: str):
+    spec_ = importlib.util.spec_from_file_location(f"bayan_tool_{name}", ROOT / "tools" / f"{name}.py")
+    assert spec_ and spec_.loader
+    m = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(m)
+    return m
+
+
+def _run_in_thread(source: str, cb: "RunCb", root: Path, stop_after: float | None = None, limit: float = 8.0):
+    """Run a script on a worker thread (like Android) and optionally press Stop."""
+    result: dict = {}
+
+    def target() -> None:
+        result["code"] = run(source, cb, root)
+
+    t = threading.Thread(target=target, name="Bayan-Python")
+    started = time.monotonic()
+    t.start()
+    if stop_after is not None:
+        time.sleep(stop_after)
+        cb.stop = True
+    t.join(limit)
+    assert not t.is_alive(), "script did not finish in time"
+    return result.get("code"), time.monotonic() - started
+
+
+def test_missing_callback_gives_clear_message() -> None:
+    class Stripped:  # what an R8-minified build looks like to Python
+        pass
+
+    with tempfile.TemporaryDirectory(prefix="bayan-r8-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        (root / "t.py").write_text("print(1)\n", encoding="utf-8")
+        for call in (
+            lambda: mod.run_script(str(root / "t.py"), Stripped()),
+            lambda: mod.install_package("requests", Stripped(), "job"),
+        ):
+            try:
+                call()
+            except RuntimeError as exc:
+                assert "R8" in str(exc) and "no-shrink" in str(exc), str(exc)
+            else:
+                raise AssertionError("a stripped callback must be reported, not ignored")
+
+
+def test_keep_rules_and_apk_check() -> None:
+    prep = _load_tool("prepare_android")
+    with tempfile.TemporaryDirectory(prefix="bayan-keep-") as td:
+        app = Path(td)
+        prep.write_proguard_rules(app)
+        rules = (app / "proguard-rules.pro").read_text(encoding="utf-8")
+    pkg = re.search(r"^package\s+([\w.]+)", KOTLIN.read_text(encoding="utf-8"), re.M).group(1)
+    assert f"{pkg}.BayanPythonBridge" in rules and "-keep" in rules, rules
+
+    verify = _load_tool("verify_apk")
+    good = b"\x00".join(n.encode() for n in verify.REQUIRED)
+    with tempfile.TemporaryDirectory(prefix="bayan-apk-") as td:
+        ok_apk, bad_apk = Path(td) / "ok.apk", Path(td) / "bad.apk"
+        with zipfile.ZipFile(ok_apk, "w") as z:
+            z.writestr("classes.dex", b"dex\n035\x00" + good)
+        with zipfile.ZipFile(bad_apk, "w") as z:
+            z.writestr("classes.dex", b"dex\n035\x00" + good.replace(b"emitState", b"a"))
+        assert verify.missing_names(ok_apk) == []
+        assert "emitState" in verify.missing_names(bad_apk)
+
+
+def test_worker_thread_asyncio_and_signals() -> None:
+    script = (
+        "import asyncio, signal, threading\n"
+        "assert threading.current_thread() is not threading.main_thread()\n"
+        "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+        "async def main():\n"
+        "    loop = asyncio.get_running_loop()\n"
+        "    loop.add_signal_handler(signal.SIGINT, lambda: None)\n"
+        "    await asyncio.sleep(0.05)\n"
+        "    return 'asyncio-ok'\n"
+        "loop = asyncio.get_event_loop()\n"
+        "print(loop.run_until_complete(main()))\n"
+        "print(asyncio.run(main()))\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="bayan-aio-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        cb = RunCb()
+        code, _ = _run_in_thread(script, cb, root)
+        text = "".join(t for k, t in cb.out)
+        err = "".join(t for k, t in cb.out if k == "stderr")
+        assert code == 0 and text.count("asyncio-ok") == 2, (code, text, err)
+        # shims are removed again
+        assert not getattr(mod.time.sleep, "__name__", "") == "bayan_sleep"
+
+
+def test_stop_interrupts_sleep_and_idle_asyncio() -> None:
+    with tempfile.TemporaryDirectory(prefix="bayan-stop-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        for source in (
+            "import time\nprint('start', flush=True)\ntime.sleep(60)\n",
+            "import asyncio\nasync def main():\n    await asyncio.sleep(3600)\nasyncio.run(main())\n",
+            "import asyncio\nasync def main():\n    await asyncio.Event().wait()\nasyncio.get_event_loop().run_until_complete(main())\n",
+            # the python-telegram-bot run_polling() pattern
+            "import asyncio, signal\nloop = asyncio.get_event_loop()\nloop.add_signal_handler(signal.SIGINT, loop.stop)\ntry:\n    loop.run_forever()\nfinally:\n    loop.close()\n",
+        ):
+            cb = RunCb()
+            code, took = _run_in_thread(source, cb, root, stop_after=0.4, limit=6)
+            assert code == 130 and ("exit", 130) in cb.events, (source, code, cb.events)
+            assert took < 3, f"Stop took {took:.1f}s for: {source!r}"
+
+
+def test_output_is_batched_and_ordered() -> None:
+    with tempfile.TemporaryDirectory(prefix="bayan-out-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        cb = RunCb()
+        script = (
+            "import sys\n"
+            "for i in range(20000):\n"
+            "    print(i)\n"
+            "print('E1', file=sys.stderr)\n"
+            "print('after')\n"
+        )
+        assert run(script, cb, root) == 0
+        assert len(cb.out) < 400, f"{len(cb.out)} Java calls for 20000 prints"
+        stdout = "".join(t for k, t in cb.out if k == "stdout")
+        assert stdout.splitlines()[:3] == ["0", "1", "2"] and stdout.endswith("19999\nafter\n")
+        kinds = [k for k, _ in cb.out]
+        assert kinds[-3:] == ["stdout", "stderr", "stdout"] or kinds[-2:] == ["stderr", "stdout"], kinds[-4:]
+
+        # output reaches the UI while the script is still sleeping (watchdog flush)
+        cb = RunCb()
+        done: dict = {}
+        t = threading.Thread(target=lambda: done.setdefault("c", run("import time\nprint('early')\ntime.sleep(1.5)\n", cb, root)))
+        t.start()
+        time.sleep(0.5)
+        assert "early" in "".join(x for k, x in cb.out), "output was held back until the script ended"
+        t.join(5)
+
+        # prompts are flushed before the input request
+        cb = RunCb(["x"])
+        assert run("print('before')\ninput('? ')\n", cb, root) == 0
+        assert "before" in "".join(x for k, x in cb.out)
+
+
+def test_script_environment_details() -> None:
+    with tempfile.TemporaryDirectory(prefix="bayan-env-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        cb = RunCb()
+        script = (
+            "import sys\n"
+            "sys.stdout.reconfigure(encoding='utf-8')\n"
+            "sys.stdout.buffer.write('مرحبا\\n'.encode('utf-8'))\n"
+            "print(sys.argv[0].endswith('t.py'), len(sys.argv))\n"
+        )
+        assert run(script, cb, root) == 0
+        text = "".join(t for k, t in cb.out)
+        assert "مرحبا" in text and "True 1" in text, text
+        assert sys.argv[0] != str(root / "t.py"), "sys.argv must be restored"
+
+        # a non-daemon thread keeps the run alive (as CPython does) and Stop still works
+        cb = RunCb()
+        script = (
+            "import threading, time\n"
+            "def late():\n"
+            "    time.sleep(0.4)\n"
+            "    print('late-thread')\n"
+            "threading.Thread(target=late).start()\n"
+            "print('main-done')\n"
+        )
+        code, took = _run_in_thread(script, cb, root)
+        assert code == 0 and "late-thread" in "".join(t for k, t in cb.out) and took >= 0.4
+
+        cb = RunCb()
+        script = "import threading, time\nthreading.Thread(target=lambda: [time.sleep(0.05) for _ in iter(int, 1)]).start()\n"
+        code, took = _run_in_thread(script, cb, root, stop_after=0.4, limit=6)
+        assert code == 130 and took < 3, (code, took)
+        assert "StopRequested" not in "".join(t for k, t in cb.out), "Stop must not print a traceback from user threads"
+
+        # daemon threads die with the run, like CPython exiting (no zombie bots)
+        cb = RunCb()
+        script = (
+            "import threading, time\n"
+            "t = threading.Thread(target=lambda: [time.sleep(0.02) for _ in iter(int, 1)], daemon=True, name='bayan-daemon-test')\n"
+            "t.start()\n"
+        )
+        assert run(script, cb, root) == 0
+        time.sleep(0.3)
+        assert not [th for th in threading.enumerate() if th.name == "bayan-daemon-test"], "daemon thread outlived the run"
 
 
 def main() -> None:
