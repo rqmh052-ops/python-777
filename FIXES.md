@@ -32,3 +32,40 @@
 - `MainActivity.kt`, `bayan_runtime.py`, `main.dart`, `script_runner.dart`
 - `tools/test_extra.py` (جديد)
 ثم شغّل Build من تبويب Actions وثبّت الـ APK الجديد (أزل القديم أولًا).
+
+
+---
+
+# الجولة الثانية (فحص شامل بعد ظهور الخطأ `'y0' object has no attribute 'emitState'` مرة أخرى)
+
+## لماذا يظهر الخطأ حتى مع وجود `--no-shrink` في الكود؟
+الاحتمالان الوحيدان: (1) الـ APK المثبّت على الهاتف مبني قبل رفع الإصلاح، أو (2) R8 ما زال يعمل رغم الإعلان.
+بدل التخمين صار الأمر قابلًا للتحقق:
+- `tools/prepare_android.py` يكتب الآن `android/app/proguard-rules.pro` (يحمي `BayanPythonBridge` وكل كلاساتها الداخلية)؛
+  Flutter يضيف هذا الملف تلقائيًا إلى بناء release إذا كان R8 فعّالًا. أي أن الحماية تعمل **مع** `--no-shrink` و**بدونه**.
+- خطوة CI جديدة `Verify Kotlin callbacks survived R8` تشغّل `tools/verify_apk.py` على الـ APK الناتج وتُفشل البناء
+  إذا لم تجد أسماء `emitState/emitPackage/...` داخل `classes.dex`. إذا كانت الخطوة خضراء فالـ APK سليم.
+- إن وصل إلى الهاتف APK ناقص رغم ذلك، يعرض المشغّل رسالة عربية واضحة تشرح السبب بدل `'y0' object has no attribute`.
+
+## مشاكل أخرى كانت ستمنع العمل الفعلي (تم إصلاحها في `bayan_runtime.py`)
+1. **أزرار Stop لا تعمل أثناء `time.sleep()`** ولا أثناء انتظار حلقة asyncio. الآن `time.sleep` يُقسَّم إلى شرائح 0.1ث تفحص الإيقاف،
+   وخيط مراقبة يوقظ حلقات asyncio الخاملة عند الضغط على إيقاف (بوتات تيليجرام).
+2. **`python-telegram-bot` و`Telethon` كانا سيفشلان**: السكربت يعمل في خيط ثانوي، و`asyncio.get_event_loop()` و`signal.signal()` و`loop.add_signal_handler()`
+   لا تعمل خارج الخيط الرئيسي (`RuntimeError`/`ValueError`). أُضيفت طبقة توافق تنشئ event loop للخيط وتجعل أخطاء الإشارات بلا أثر.
+3. **ازدحام الواجهة**: كل `print` كان يرسل رسالتين إلى Flutter. الإخراج يُجمَّع الآن دفعات (≤ 4096 حرف أو كل 30ms) مع الحفاظ على ترتيب stdout/stderr.
+4. `sys.stdout.reconfigure(encoding="utf-8")` و`sys.stdout.buffer` كانا يرميان `AttributeError` (شائعة في السكربتات العربية).
+5. `sys.argv` لم يكن يُضبط على مسار السكربت.
+6. الخيوط غير daemon التي يبدأها السكربت: ينتظرها المشغّل كما يفعل CPython، وخيوط daemon تُنهى مع نهاية التشغيل (لا بوتات زومبي).
+7. الضغط على Stop لم يعد يطبع `StopRequested` من خيوط المستخدم.
+
+## اختبارات جديدة (تعمل في CI قبل البناء)
+`tools/test_extra.py`: رسالة R8 الواضحة، قواعد keep + `verify_apk`، asyncio/signals في خيط ثانوي، إيقاف `sleep` وحلقات asyncio الخاملة،
+تجميع الإخراج وترتيبه، `argv`/`reconfigure`/`buffer`، الخيوط المتبقية.
+
+## قيود معروفة (لم تُحل بعد)
+- **البوتات الطويلة في الخلفية**: أندرويد يجمّد/يقتل العملية عند خروج التطبيق من الشاشة. تشغيل بوت لساعات يحتاج Foreground Service + إشعار (إصدار قادم).
+- إيقاف سكربت عالق داخل استدعاء شبكة/ملف blocking (مثل `socket.recv` بلا timeout) غير ممكن حتى يعود الاستدعاء.
+- حزم تحتاج مترجم C (sdist) لا تُثبَّت؛ يُثبَّت فقط wheel جاهز (pure-Python أو Android من مستودع Chaquopy).
+
+## الملفات المعدّلة في هذه الجولة
+`.github/workflows/build.yml`, `bayan_runtime.py`, `tools/prepare_android.py`, `tools/test_extra.py`, `tools/verify_apk.py` (جديد), `FIXES.md`

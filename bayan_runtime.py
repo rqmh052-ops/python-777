@@ -6,6 +6,7 @@ under the private Bayan environment configured by the Android bridge.
 
 from __future__ import annotations
 
+import _thread
 import builtins
 import csv
 import hashlib
@@ -15,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import threading
@@ -24,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 import zipfile
 from email.parser import Parser
 from pathlib import Path
@@ -103,19 +106,129 @@ def _should_stop(callback: Any) -> bool:
         return False
 
 
+# Methods that Python calls on the Kotlin callback objects. If R8 renames or
+# deletes them in a release build, every run fails with the cryptic
+# "'y0' object has no attribute 'emitState'". Checking up front turns that
+# into a message that says what is wrong and how to fix it.
+_RUN_CALLBACK_REQUIRED = ("emitOutput", "emitError", "emitInput", "requestInput", "emitState", "emitExit")
+_PACKAGE_CALLBACK_REQUIRED = ("emitPackage",)
+
+_CALLBACK_HINT = (
+    "نسخة التطبيق المثبّتة ناقصة: دوال Kotlin التي يستدعيها بايثون ({names}) غير موجودة داخل الـ APK. "
+    "السبب المعتاد أن R8 حذفها أو غيّر أسماءها في بناء release. "
+    "أعد بناء التطبيق بعد تطبيق إصلاح R8 (--no-shrink وملف proguard-rules.pro)، "
+    "ثم احذف النسخة القديمة من الهاتف وثبّت الجديدة."
+)
+
+
+def _missing_callback_methods(callback: Any, names: tuple[str, ...]) -> list[str]:
+    missing: list[str] = []
+    for name in names:
+        try:
+            getattr(callback, name)
+        except AttributeError:
+            missing.append(name)
+        except Exception:
+            pass
+    return missing
+
+
+def _require_callback_api(callback: Any, names: tuple[str, ...]) -> None:
+    missing = _missing_callback_methods(callback, names)
+    if missing:
+        raise RuntimeError(_CALLBACK_HINT.format(names=", ".join(missing)))
+
+
+class _OutputHub:
+    """Collects stdout/stderr writes and hands them to Java in batches.
+
+    One Java call plus one Flutter message per write() made a plain
+    `for i in range(100000): print(i)` freeze the screen. Batches keep the
+    original order of stdout and stderr.
+    """
+
+    FLUSH_CHARS = 4096
+
+    def __init__(self, callback: Any):
+        self.callback = callback
+        self._lock = threading.Lock()
+        self._parts: list[tuple[str, str]] = []
+        self._size = 0
+
+    def write(self, kind: str, text: str) -> None:
+        with self._lock:
+            self._parts.append((kind, text))
+            self._size += len(text)
+            if self._size >= self.FLUSH_CHARS:
+                self._flush_locked()
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if not self._parts:
+            return
+        parts, self._parts, self._size = self._parts, [], 0
+        grouped: list[tuple[str, list[str]]] = []
+        for kind, text in parts:
+            if grouped and grouped[-1][0] == kind:
+                grouped[-1][1].append(text)
+            else:
+                grouped.append((kind, [text]))
+        for kind, chunks in grouped:
+            self.callback.emitOutput(kind, "".join(chunks))
+
+
+class _BufferShim:
+    """`sys.stdout.buffer` for scripts that write bytes."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+
+    def write(self, data: Any) -> int:
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            self._stream.write(bytes(data).decode("utf-8", errors="replace"))
+        else:
+            self._stream.write(str(data))
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
 class _CallbackStream(io.TextIOBase):
-    def __init__(self, callback: Any, kind: str):
+    errors = "replace"
+    line_buffering = False
+
+    def __init__(self, callback: Any, kind: str, hub: "_OutputHub | None" = None):
         super().__init__()
         self.callback = callback
         self.kind = kind
+        self.hub = hub
 
     def write(self, s: str) -> int:
         if s:
-            self.callback.emitOutput(self.kind, s)
+            if self.hub is not None:
+                self.hub.write(self.kind, s)
+            else:
+                self.callback.emitOutput(self.kind, s)
         return len(s)
 
     def flush(self) -> None:
+        if self.hub is not None:
+            self.hub.flush()
+
+    def reconfigure(self, **_kwargs: Any) -> None:
+        # Scripts written for Windows often call sys.stdout.reconfigure(encoding="utf-8").
         return None
+
+    @property
+    def buffer(self) -> _BufferShim:
+        return _BufferShim(self)
 
     def isatty(self) -> bool:
         return False
@@ -126,13 +239,16 @@ class _CallbackStream(io.TextIOBase):
 
 
 class _CallbackStdin(io.TextIOBase):
-    def __init__(self, callback: Any):
+    def __init__(self, callback: Any, hub: "_OutputHub | None" = None):
         super().__init__()
         self.callback = callback
+        self.hub = hub
 
     def readline(self, size: int = -1) -> str:
         if _should_stop(self.callback):
             raise StopRequested()
+        if self.hub is not None:
+            self.hub.flush()
         self.callback.emitInput("")
         value = self.callback.requestInput("")
         if value is None or _should_stop(self.callback):
@@ -160,10 +276,14 @@ def _trace_factory(callback: Any):
     line/opcode made ordinary loops crawl. A backward jump inside a loop still
     fires a "line" event, so even `while True: pass` stays stoppable.
     """
-    state = {"last": 0.0}
+    state = {"last": 0.0, "dead": False}
     clock = time.monotonic
 
     def trace(frame, event, arg):
+        if state["dead"]:
+            # The run is over: threads the script left behind stop at their next line,
+            # like daemon threads dying when CPython exits.
+            raise StopRequested()
         now = clock()
         if now - state["last"] >= _STOP_POLL_SECONDS:
             state["last"] = now
@@ -171,7 +291,240 @@ def _trace_factory(callback: Any):
                 raise StopRequested()
         return trace
 
+    trace.kill = lambda: state.__setitem__("dead", True)  # type: ignore[attr-defined]
     return trace
+
+
+_RUNNING_LOOPS: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+
+def _noop() -> None:
+    return None
+
+
+def _wake_loops() -> None:
+    """Kick asyncio loops that sit idle inside select() so the tracer can run."""
+    try:
+        loops = list(_RUNNING_LOOPS)
+    except Exception:
+        return
+    for loop in loops:
+        try:
+            loop.call_soon_threadsafe(_noop)
+        except Exception:
+            pass
+
+
+class _Watchdog:
+    """Helper thread for one script run.
+
+    * flushes buffered output every 30 ms, so text appears while the script sleeps;
+    * once Stop is pressed, wakes idle asyncio loops (a bot waiting for Telegram
+      never executes a Python line, so the line tracer alone cannot stop it).
+
+    Started with _thread, not threading: the script's tracer never touches it and
+    it never shows up in threading.enumerate().
+    """
+
+    INTERVAL = 0.03
+
+    def __init__(self, callback: Any, hub: _OutputHub):
+        self.callback = callback
+        self.hub = hub
+        self._done = threading.Event()
+
+    def start(self) -> None:
+        _thread.start_new_thread(self._run, ())
+
+    def finish(self) -> None:
+        self._done.set()
+
+    def _run(self) -> None:
+        while not self._done.wait(self.INTERVAL):
+            try:
+                self.hub.flush()
+                if _should_stop(self.callback):
+                    _wake_loops()
+            except Exception:
+                pass
+
+
+class _WorkerShims:
+    """Makes common libraries work when the script runs on a worker thread.
+
+    * time.sleep() notices the Stop button instead of blocking until it ends;
+    * signal.signal() and loop.add_signal_handler() only work on the main thread
+      (python-telegram-bot's run_polling() calls them), so outside it they become no-ops;
+    * asyncio.get_event_loop() works (Telethon, python-telegram-bot, plain scripts).
+    """
+
+    def __init__(self, callback: Any):
+        self.callback = callback
+        self._undo: list[tuple[Any, str, Any]] = []
+        self._loop: Any = None
+
+    def _patch(self, owner: Any, name: str, value: Any) -> None:
+        self._undo.append((owner, name, getattr(owner, name)))
+        setattr(owner, name, value)
+
+    @staticmethod
+    def _on_main_thread() -> bool:
+        return threading.current_thread() is threading.main_thread()
+
+    def install(self) -> None:
+        callback = self.callback
+        real_sleep = time.sleep
+        on_main = self._on_main_thread
+
+        def bayan_sleep(seconds: Any) -> None:
+            try:
+                remaining = float(seconds)
+            except (TypeError, ValueError):
+                return real_sleep(seconds)  # let Python raise its usual error
+            if remaining == 0:
+                return real_sleep(0)
+            if remaining < 0:
+                raise ValueError("sleep length must be non-negative")
+            deadline = time.monotonic() + remaining
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                real_sleep(min(left, 0.1))
+                if _should_stop(callback):
+                    raise StopRequested()
+
+        self._patch(time, "sleep", bayan_sleep)
+
+        orig_signal = signal.signal
+
+        def bayan_signal(signalnum: Any, handler: Any) -> Any:
+            try:
+                return orig_signal(signalnum, handler)
+            except ValueError:
+                if on_main():
+                    raise
+                return signal.SIG_DFL
+
+        self._patch(signal, "signal", bayan_signal)
+
+        # A thread that the script started and that dies because Stop was pressed
+        # (or because the script ended) must not print a "StopRequested" traceback.
+        # Installed once and kept: such threads can die a moment after the run ends.
+        if not getattr(threading.excepthook, "_bayan", False):
+            orig_excepthook = threading.excepthook
+
+            def bayan_excepthook(args: Any) -> None:
+                if args.exc_type is not None and issubclass(args.exc_type, StopRequested):
+                    return
+                orig_excepthook(args)
+
+            bayan_excepthook._bayan = True  # type: ignore[attr-defined]
+            threading.excepthook = bayan_excepthook
+
+        try:
+            import asyncio
+            from asyncio import base_events
+        except Exception:
+            return
+
+        loop_cls = base_events.BaseEventLoop
+        orig_run_forever = loop_cls.run_forever
+
+        def run_forever(loop: Any) -> Any:
+            _RUNNING_LOOPS.add(loop)
+            try:
+                return orig_run_forever(loop)
+            finally:
+                _RUNNING_LOOPS.discard(loop)
+
+        self._patch(loop_cls, "run_forever", run_forever)
+
+        unix_cls = getattr(getattr(asyncio, "unix_events", None), "_UnixSelectorEventLoop", None)
+        if unix_cls is not None:
+            orig_add = unix_cls.add_signal_handler
+            orig_remove = unix_cls.remove_signal_handler
+
+            def add_signal_handler(loop: Any, sig: Any, cb: Any, *args: Any) -> Any:
+                try:
+                    return orig_add(loop, sig, cb, *args)
+                except (RuntimeError, ValueError, OSError):
+                    if on_main():
+                        raise
+                    return None
+
+            def remove_signal_handler(loop: Any, sig: Any) -> Any:
+                try:
+                    return orig_remove(loop, sig)
+                except (RuntimeError, ValueError, OSError):
+                    if on_main():
+                        raise
+                    return False
+
+            self._patch(unix_cls, "add_signal_handler", add_signal_handler)
+            self._patch(unix_cls, "remove_signal_handler", remove_signal_handler)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._loop)
+            except Exception:
+                self._loop = None
+
+    def restore(self) -> None:
+        while self._undo:
+            owner, name, value = self._undo.pop()
+            try:
+                setattr(owner, name, value)
+            except Exception:
+                pass
+        loop, self._loop = self._loop, None
+        if loop is not None:
+            try:
+                import asyncio
+
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+            try:
+                if not loop.is_closed():
+                    loop.close()
+            except Exception:
+                pass
+
+
+def _join_user_threads(before: set, callback: Any) -> None:
+    """Like CPython at exit: wait for non-daemon threads the script started."""
+    me = threading.current_thread()
+    while True:
+        alive = [
+            t
+            for t in threading.enumerate()
+            if t is not me and t not in before and not t.daemon and t.is_alive()
+        ]
+        if not alive:
+            return
+        if _should_stop(callback):
+            raise StopRequested()
+        alive[0].join(0.1)
+
+
+def _reap_user_threads(before: set, timeout: float) -> None:
+    """After the run: give threads the script left behind a moment to notice they must stop."""
+    me = threading.current_thread()
+    deadline = time.monotonic() + timeout
+    for t in list(threading.enumerate()):
+        if t is me or t in before:
+            continue
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            t.join(left)
+        except Exception:
+            pass
 
 
 def _run_exit_code(value: Any) -> int:
@@ -199,6 +552,7 @@ def _print_user_traceback(exc: BaseException, file: Any) -> None:
 def run_script(script_path: str, callback: Any) -> int:
     """Execute one user script in the shared Bayan Python interpreter."""
     _, _, site, _ = _require_config()
+    _require_callback_api(callback, _RUN_CALLBACK_REQUIRED)
     path = Path(script_path).resolve()
     if not path.is_file():
         callback.emitError(f"الملف غير موجود: {path}")
@@ -211,14 +565,20 @@ def run_script(script_path: str, callback: Any) -> int:
     old_stdin = sys.stdin
     old_input = builtins.input
     old_path = list(sys.path)
+    old_argv = list(getattr(sys, "argv", [""]))
     old_trace = sys.gettrace()
     old_thread_trace = threading.gettrace() if hasattr(threading, "gettrace") else None
 
-    out = _CallbackStream(callback, "stdout")
-    err = _CallbackStream(callback, "stderr")
-    stdin = _CallbackStdin(callback)
+    hub = _OutputHub(callback)
+    out = _CallbackStream(callback, "stdout", hub)
+    err = _CallbackStream(callback, "stderr", hub)
+    stdin = _CallbackStdin(callback, hub)
     trace = _trace_factory(callback)
+    shims = _WorkerShims(callback)
+    watchdog = _Watchdog(callback, hub)
+    threads_before = set(threading.enumerate())
     exit_code = 0
+    watchdog.start()
     callback.emitState("running")
 
     try:
@@ -226,6 +586,7 @@ def run_script(script_path: str, callback: Any) -> int:
         script_dir = str(path.parent)
         sys.path[:] = [script_dir, site_str] + [p for p in old_path if p not in {script_dir, site_str}]
         os.chdir(script_dir)
+        sys.argv = [str(path)]
         sys.stdout = out
         sys.stderr = err
         sys.stdin = stdin
@@ -233,6 +594,7 @@ def run_script(script_path: str, callback: Any) -> int:
         def bayan_input(prompt: str = "") -> str:
             if _should_stop(callback):
                 raise StopRequested()
+            hub.flush()
             callback.emitInput(str(prompt))
             value = callback.requestInput(str(prompt))
             if value is None or _should_stop(callback):
@@ -240,6 +602,10 @@ def run_script(script_path: str, callback: Any) -> int:
             return str(value)
 
         builtins.input = bayan_input
+        try:
+            shims.install()
+        except Exception:
+            pass  # the script still runs, just without the worker-thread helpers
         sys.settrace(trace)
         if hasattr(threading, "settrace"):
             threading.settrace(trace)
@@ -256,6 +622,7 @@ def run_script(script_path: str, callback: Any) -> int:
             "__cached__": None,
         }
         exec(code, namespace, namespace)
+        _join_user_threads(threads_before, callback)
         exit_code = 0
     except StopRequested:
         exit_code = 130
@@ -278,16 +645,31 @@ def run_script(script_path: str, callback: Any) -> int:
                 threading.settrace(old_thread_trace)
             except Exception:
                 pass
+        try:
+            trace.kill()
+            _reap_user_threads(threads_before, 1.0)
+        except Exception:
+            pass
+        try:
+            shims.restore()
+        except Exception:
+            pass
         sys.stdout = old_stdout
         sys.stderr = old_stderr
         sys.stdin = old_stdin
         builtins.input = old_input
         sys.path[:] = old_path
+        sys.argv = old_argv
         try:
             os.chdir(old_cwd)
         except Exception:
             pass
         importlib.invalidate_caches()
+        try:
+            hub.flush()
+        except Exception:
+            pass
+        watchdog.finish()
         callback.emitExit(exit_code)
         callback.emitState("finished" if exit_code == 0 else ("stopped" if exit_code == 130 else "error"))
     return exit_code
@@ -1163,6 +1545,7 @@ def _store_metadata(last_result: dict[str, Any]) -> None:
 
 
 def install_package(spec: str, callback: Any, job_id: str) -> str:
+    _require_callback_api(callback, _PACKAGE_CALLBACK_REQUIRED)
     with _PACKAGE_LOCK:
         callback.emitPackage("start", 0, 0, "بدء التثبيت")
         root_norm, root_constraints = _parse_spec(spec)
