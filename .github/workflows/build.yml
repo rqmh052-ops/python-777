@@ -39,7 +39,7 @@ jobs:
 
       - name: Validate Python runtime
         run: |
-          python -m py_compile bayan_runtime.py tools/test_runtime.py tools/test_extra.py
+          python -m py_compile bayan_runtime.py tools/test_runtime.py tools/test_extra.py tools/verify_apk.py tools/prepare_android.py
           python tools/test_runtime.py
           python tools/test_extra.py
           flutter --version
@@ -86,6 +86,14 @@ jobs:
           test -s build/app/outputs/flutter-apk/app-release.apk
           ls -lh build/app/outputs/flutter-apk/app-release.apk
 
+      # يفشل البناء فورًا إذا حذف R8 دوال Kotlin التي يستدعيها بايثون
+      # (بدلاً من اكتشاف الخطأ "'y0' object has no attribute" على الهاتف).
+      # لا يوقف الرفع: يبقى الـ APK متاحًا للتحليل، لكن الـ job ينتهي أحمر (آخر خطوة) إن كان ناقصًا.
+      - name: Verify Kotlin callbacks survived R8
+        id: verify
+        continue-on-error: true
+        run: python tools/verify_apk.py build/app/outputs/flutter-apk/app-release.apk
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -101,3 +109,9 @@ jobs:
           path: build/symbols
           if-no-files-found: error
           retention-days: 14
+
+      - name: Fail the build if the Kotlin callbacks were removed
+        if: steps.verify.outcome == 'failure'
+        run: |
+          echo "R8 removed the Kotlin callbacks - do NOT install this APK (it shows 'y0 object has no attribute')."
+          exit 1
