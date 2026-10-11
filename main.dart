@@ -63,16 +63,6 @@ const catalog = <Lib>[
   Lib('Telethon', 'عميل Telegram عبر MTProto', 'telethon'),
 ];
 
-// يعرض رسالة الخطأ الحقيقية بدل PlatformException(code, message, null, null)
-String errText(Object e) =>
-    e is PlatformException ? (e.message ?? e.code) : '$e';
-
-String _pkgKey(String name) => name.replaceAll(RegExp(r'[_.-]+'), '-').toLowerCase();
-String cleanPackageName({required String clean}) {
-  final match = RegExp(r'^([A-Za-z0-9][A-Za-z0-9_.-]*)').firstMatch(clean);
-  return _pkgKey(match?.group(1) ?? clean);
-}
-
 // ───────── انتقالات وحركات ─────────
 // منحنى يعرف الاتجاه: دخول يتباطأ عند النهاية، وخروج يبدأ بلطف ثم يسرع
 class _DirCurve extends Animatable<double> {
@@ -141,6 +131,341 @@ class Appear extends StatelessWidget {
             opacity: v,
             child: Transform.translate(offset: Offset(0, 14 * (1 - v)), child: ch)),
         child: child,
+      );
+}
+
+// ───────── قائمة التحديد بالعربية (نسخ / قص / لصق / تحديد الكل) ─────────
+// تُمرَّر إلى contextMenuBuilder في كل حقول التطبيق وSelectableText.
+Widget arContextMenu(BuildContext context, EditableTextState editable) {
+  final items = <ContextMenuButtonItem>[];
+  for (final item in editable.contextMenuButtonItems) {
+    String? label;
+    switch (item.type) {
+      case ContextMenuButtonType.copy:
+        label = 'نسخ';
+        break;
+      case ContextMenuButtonType.cut:
+        label = 'قص';
+        break;
+      case ContextMenuButtonType.paste:
+        label = 'لصق';
+        break;
+      case ContextMenuButtonType.selectAll:
+        label = 'تحديد الكل';
+        break;
+      case ContextMenuButtonType.delete:
+        label = 'حذف';
+        break;
+      default:
+        label = null;
+    }
+    items.add(label == null ? item : item.copyWith(label: label));
+  }
+  return AdaptiveTextSelectionToolbar.buttonItems(
+    anchors: editable.contextMenuAnchors,
+    buttonItems: items,
+  );
+}
+
+// يعيد بناء الواجهة كلما تغيّر طابور تثبيت المكتبات
+class InstallerBuilder extends StatelessWidget {
+  const InstallerBuilder({super.key, required this.builder});
+  final Widget Function(BuildContext context, LibInstaller installer) builder;
+
+  @override
+  Widget build(BuildContext context) => StreamBuilder<int>(
+        stream: libInstaller.changes,
+        initialData: libInstaller.revision,
+        builder: (context, _) => builder(context, libInstaller),
+      );
+}
+
+// ───────── سطر في Traceback: File "…", line N ─────────
+class FrameRef {
+  const FrameRef(this.path, this.relative, this.line);
+  final String path; // كما ظهر في Traceback
+  final String relative; // المسار داخل مجلد Bayan 777
+  final int line;
+}
+
+final _frameRe = RegExp(r'^\s*File "([^"]+)", line (\d+)');
+
+// يرجع null إن لم يكن السطر إطارًا، أو كان الملف خارج مجلد Bayan 777
+// (مثل مكتبات site-packages)، فلا يصبح قابلًا للضغط.
+FrameRef? parseFrame(String text) {
+  final m = _frameRe.firstMatch(text);
+  if (m == null) return null;
+  final path = m.group(1)!;
+  final line = int.tryParse(m.group(2)!);
+  if (line == null) return null;
+  final marker = '/$kFolderName/';
+  final at = path.indexOf(marker);
+  if (at < 0) return null;
+  final rel = path.substring(at + marker.length);
+  if (!isPyName(rel) ||
+      rel.contains('site-packages') ||
+      rel.split('/').contains('..')) {
+    return null;
+  }
+  return FrameRef(path, rel, line);
+}
+
+// ───────── منطقة التقدم داخل بطاقة المكتبة (ارتفاعها ثابت يحدده الأب) ─────────
+class LibJobZone extends StatelessWidget {
+  const LibJobZone({super.key, required this.job, this.onDetails, this.onDismiss});
+  final LibJob job;
+  final VoidCallback? onDetails;
+  final VoidCallback? onDismiss;
+
+  static String _stageLabel(String stage) {
+    if (stage == 'download') return 'التنزيل';
+    if (stage == 'install') return 'التثبيت';
+    return 'التحضير';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    switch (job.state) {
+      case JobState.queued:
+        return const Row(children: [
+          Icon(Icons.schedule_rounded, color: C.warn, size: 16),
+          SizedBox(width: 6),
+          Text('في الانتظار', style: TextStyle(fontSize: 12, color: C.warn)),
+        ]);
+      case JobState.running:
+        final raw = (job.progress * 100).floor();
+        final pct = raw > 100 ? 100 : raw;
+        return Row(children: [
+          SizedBox(
+            width: 58,
+            child: Text(_stageLabel(job.stage),
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11.5, color: C.muted)),
+          ),
+          Expanded(
+            child: TweenAnimationBuilder<double>(
+              tween: Tween<double>(begin: 0, end: job.progress),
+              duration: const Duration(milliseconds: 320),
+              curve: Curves.easeOutCubic,
+              builder: (_, v, __) => ClipRRect(
+                borderRadius: BorderRadius.circular(3),
+                child: LinearProgressIndicator(
+                  value: v,
+                  minHeight: 4,
+                  backgroundColor: C.border,
+                  color: C.ok,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 36,
+            child: Text('$pct%',
+                textDirection: TextDirection.ltr,
+                textAlign: TextAlign.left,
+                style: const TextStyle(fontSize: 11.5, color: C.muted)),
+          ),
+        ]);
+      case JobState.done:
+        return const Row(children: [
+          Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
+          SizedBox(width: 6),
+          Text('تم تثبيت المكتبة بنجاح',
+              style: TextStyle(fontSize: 12, color: C.ok)),
+        ]);
+      case JobState.failed:
+        return Row(children: [
+          const Icon(Icons.error_outline_rounded, color: C.error, size: 16),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(job.reason,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12, color: C.error)),
+          ),
+          if (onDetails != null)
+            InkWell(
+              onTap: onDetails,
+              borderRadius: BorderRadius.circular(6),
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                child: Text('التفاصيل',
+                    style: TextStyle(fontSize: 12, color: C.accent)),
+              ),
+            ),
+          if (onDismiss != null)
+            InkWell(
+              onTap: onDismiss,
+              borderRadius: BorderRadius.circular(6),
+              child: const Padding(
+                padding: EdgeInsets.all(3),
+                child: Icon(Icons.close_rounded, size: 16, color: C.muted),
+              ),
+            ),
+        ]);
+    }
+  }
+}
+
+// تفاصيل فشل التثبيت (نافذة، فلا يتغير ارتفاع البطاقة)
+void showInstallDetails(BuildContext context, LibJob job) {
+  final text = job.details.isEmpty ? job.reason : job.details;
+  showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: C.surface,
+      title: Text(job.name,
+          textDirection: TextDirection.ltr,
+          style: mono.copyWith(fontSize: 16)),
+      content: SingleChildScrollView(
+        child: SelectableText(
+          text,
+          contextMenuBuilder: arContextMenu,
+          style: const TextStyle(fontSize: 13, height: 1.5, color: C.text),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: text));
+            Navigator.pop(ctx);
+          },
+          child: const Text('نسخ'),
+        ),
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
+      ],
+    ),
+  );
+}
+
+// ───────── بطاقة تثبيت مكتبة ناقصة (تظهر تحت الخطأ في شاشة الإخراج) ─────────
+class MissingLib {
+  MissingLib(this.package, this.module);
+  final String package; // اسم التثبيت (opencv-python)
+  final String module; // اسم الاستيراد (cv2)
+  bool checking = true;
+  bool? available;
+  String reason = '';
+  String? version;
+}
+
+class MissingLibCard extends StatelessWidget {
+  const MissingLibCard({super.key, required this.item});
+  final MissingLib item;
+
+  Widget _action(LibJob? job) {
+    final key = pkgKey(item.package);
+    if (job != null) {
+      switch (job.state) {
+        case JobState.queued:
+          return Row(children: [
+            const Icon(Icons.schedule_rounded, color: C.warn, size: 16),
+            const SizedBox(width: 6),
+            const Expanded(
+              child: Text('في الانتظار',
+                  style: TextStyle(fontSize: 13, color: C.warn)),
+            ),
+            OButton(
+              label: 'إلغاء',
+              accent: false,
+              height: 36,
+              radius: 10,
+              fontSize: 13,
+              onPressed: () => libInstaller.cancel(key),
+            ),
+          ]);
+        case JobState.running:
+        case JobState.done:
+          return Center(child: LibJobZone(job: job));
+        case JobState.failed:
+          return OButton(
+            label: 'إعادة المحاولة',
+            icon: Icons.refresh_rounded,
+            height: 44,
+            radius: 10,
+            onPressed: () => libInstaller.retry(key),
+          );
+      }
+    }
+    if (item.available == false) {
+      return Row(children: [
+        const Icon(Icons.info_outline_rounded, color: C.warn, size: 18),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            item.reason.isEmpty ? 'لا توجد نسخة تعمل على أندرويد' : item.reason,
+            style: const TextStyle(fontSize: 13, color: C.warn),
+          ),
+        ),
+      ]);
+    }
+    return OButton(
+      label: 'تثبيت',
+      icon: Icons.download_rounded,
+      height: 44,
+      radius: 10,
+      onPressed: () => libInstaller.enqueue(item.package),
+    );
+  }
+
+  Widget _status(BuildContext context, LibJob? job) {
+    if (job != null && job.state == JobState.failed) {
+      return LibJobZone(job: job, onDetails: () => showInstallDetails(context, job));
+    }
+    if (job == null && item.checking) {
+      return const Align(
+        alignment: AlignmentDirectional.centerStart,
+        child: Text('جارٍ التحقق من التوفر…',
+            style: TextStyle(fontSize: 11.5, color: C.dim)),
+      );
+    }
+    final v = item.version;
+    if (job == null && item.available == true && v != null && v.isNotEmpty) {
+      return Align(
+        alignment: AlignmentDirectional.centerStart,
+        child: Text('أحدث نسخة: $v',
+            textDirection: TextDirection.ltr,
+            style: const TextStyle(fontSize: 11.5, color: C.dim)),
+      );
+    }
+    return const SizedBox.shrink();
+  }
+
+  @override
+  Widget build(BuildContext context) => InstallerBuilder(
+        builder: (context, installer) {
+          final job = installer.jobFor(pkgKey(item.package));
+          return Container(
+            margin: const EdgeInsets.only(top: 10),
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+            decoration: _box(C.surface),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(children: [
+                  const Icon(Icons.extension_outlined, color: C.accent, size: 19),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(item.package,
+                        textDirection: TextDirection.ltr,
+                        textAlign: TextAlign.right,
+                        overflow: TextOverflow.ellipsis,
+                        style: mono.copyWith(fontSize: 15)),
+                  ),
+                  if (item.module != item.package)
+                    Text('import ${item.module}',
+                        textDirection: TextDirection.ltr,
+                        style: const TextStyle(fontSize: 11, color: C.dim)),
+                ]),
+                const SizedBox(height: 10),
+                SizedBox(height: 44, child: _action(job)),
+                const SizedBox(height: 6),
+                SizedBox(height: 22, child: _status(context, job)),
+              ],
+            ),
+          );
+        },
       );
 }
 
@@ -774,6 +1099,7 @@ Future<void> renameScript(BuildContext context, Script s) async {
       backgroundColor: C.surface,
       title: const Text('إعادة تسمية'),
       content: TextField(
+        contextMenuBuilder: arContextMenu,
         controller: ctl,
         autofocus: true,
         textDirection: TextDirection.ltr,
@@ -970,29 +1296,45 @@ class LibrariesScreen extends StatefulWidget {
 
 class _LibrariesScreenState extends State<LibrariesScreen> {
   final _packages = <String, InstalledPackage>{};
-  final _jobs = <String, BayanEvent>{};
-  final _jobPackages = <String, String>{};
+  // مفاتيح المكتبات المعروضة في قسم «المثبتة». لا تتغير أثناء التثبيت
+  // حتى لا تقفز البطاقات من مكانها؛ تُحدَّث بعد انتهاء كل العمليات.
+  Set<String> _shown = <String>{};
   List<CatalogPackage> _catalog = const <CatalogPackage>[];
-  StreamSubscription<BayanEvent>? _events;
+  StreamSubscription<int>? _installerSub;
   bool _loading = true;
   bool _refreshing = false;
+  bool _needsRefresh = false;
+  bool _wasLive = false;
 
   @override
   void initState() {
     super.initState();
-    _events = bayanPython.events.listen(_onEvent);
+    _wasLive = libInstaller.hasLiveJobs;
+    _installerSub = libInstaller.changes.listen(_onInstaller);
     _load();
   }
 
   @override
   void dispose() {
-    _events?.cancel();
+    _installerSub?.cancel();
     super.dispose();
   }
 
-  void _onEvent(BayanEvent e) {
-    if (e.channel != 'package' || !mounted || e.jobId.isEmpty) return;
-    setState(() => _jobs[e.jobId] = e);
+  void _syncShown() {
+    _shown = _packages.keys.toSet();
+  }
+
+  void _onInstaller(int _) {
+    if (!mounted) return;
+    if (libInstaller.consumeCompleted()) _needsRefresh = true;
+    // نحدّث قائمة المثبّت بعد آخر عملية فقط (لا أثناء تثبيت لاحق في الطابور)
+    if (_needsRefresh && !libInstaller.busy) {
+      _needsRefresh = false;
+      unawaited(_refresh(silent: true));
+    }
+    final live = libInstaller.hasLiveJobs;
+    if (_wasLive && !live) setState(_syncShown);
+    _wasLive = live;
   }
 
   Future<void> _load() async {
@@ -1009,9 +1351,10 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       setState(() {
         _packages
           ..clear()
-          ..addEntries(installed.map((p) => MapEntry(_pkgKey(p.name), p)));
+          ..addEntries(installed.map((p) => MapEntry(pkgKey(p.name), p)));
         _catalog = catalog;
         _loading = false;
+        _syncShown();
       });
     } catch (e) {
       if (!mounted) return;
@@ -1020,8 +1363,8 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     }
   }
 
-  Future<void> _refresh({bool silent = false, bool force = false}) async {
-    if (_refreshing || (_jobs.isNotEmpty && !force)) return;
+  Future<void> _refresh({bool silent = false}) async {
+    if (_refreshing) return;
     setState(() => _refreshing = true);
     try {
       final results = await Future.wait([
@@ -1034,8 +1377,9 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       setState(() {
         _packages
           ..clear()
-          ..addEntries(installed.map((p) => MapEntry(_pkgKey(p.name), p)));
+          ..addEntries(installed.map((p) => MapEntry(pkgKey(p.name), p)));
         _catalog = catalog;
+        if (!libInstaller.hasLiveJobs) _syncShown();
       });
     } catch (e) {
       if (mounted && !silent) _snack('تعذر تحديث حالة المكتبات: ${errText(e)}');
@@ -1050,53 +1394,18 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     messenger.showSnackBar(SnackBar(content: Text(text)));
   }
 
-  Future<void> _install(String spec) async {
+  // التثبيت يدخل الطابور؛ تثبيت واحد فقط يعمل في كل مرة
+  void _install(String spec) {
     final clean = spec.trim();
-    if (_jobs.isNotEmpty) {
-      _snack('انتظر حتى تنتهي عملية المكتبة الحالية');
-      return;
-    }
     if (clean.isEmpty) {
       _snack('اكتب اسم المكتبة أولاً');
       return;
     }
-    final jobId = bayanPython.newId('pkg');
-    String rootName = cleanPackageName(clean: clean);
-    setState(() {
-      _jobPackages[jobId] = rootName;
-      _jobs[jobId] = const BayanEvent({
-        'channel': 'package',
-        'type': 'progress',
-        'stage': 'start',
-        'progress': 0.0,
-      });
-    });
-    try {
-      await bayanPython.installPackage(spec: clean, jobId: jobId);
-      await _refresh(silent: true, force: true);
-      if (mounted) {
-        final job = _jobs[jobId];
-        if (job?.type != 'error') {
-          _snack('تم تثبيت المكتبة بنجاح');
-        }
-        setState(() {
-          _jobs.remove(jobId);
-          _jobPackages.remove(jobId);
-        });
-      }
-    } catch (e) {
-      await _refresh(silent: true, force: true);
-      if (!mounted) return;
-      _snack('فشل تثبيت المكتبة: ${errText(e)}');
-      setState(() {
-        _jobs.remove(jobId);
-        _jobPackages.remove(jobId);
-      });
-    }
+    libInstaller.enqueue(clean);
   }
 
   Future<void> _remove(InstalledPackage package) async {
-    if (_jobs.isNotEmpty) {
+    if (libInstaller.busy) {
       _snack('انتظر حتى تنتهي عملية المكتبة الحالية');
       return;
     }
@@ -1120,17 +1429,16 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     try {
       await bayanPython.removePackage(name: package.name);
       await _refresh(silent: true);
-      if (mounted) _snack('تمت إزالة ${package.name}');
+      if (mounted) {
+        setState(_syncShown);
+        _snack('تمت إزالة ${package.name}');
+      }
     } catch (e) {
       if (mounted) _snack('تعذر إزالة المكتبة: ${errText(e)}');
     }
   }
 
   Future<void> _downloadUnknown() async {
-    if (_jobs.isNotEmpty) {
-      _snack('انتظر حتى تنتهي عملية المكتبة الحالية');
-      return;
-    }
     final name = TextEditingController();
     final version = TextEditingController();
     try {
@@ -1143,6 +1451,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               TextField(
+                contextMenuBuilder: arContextMenu,
                 controller: name,
                 autofocus: true,
                 textDirection: TextDirection.ltr,
@@ -1157,6 +1466,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
               ),
               const SizedBox(height: 10),
               TextField(
+                contextMenuBuilder: arContextMenu,
                 controller: version,
                 textDirection: TextDirection.ltr,
                 style: mono.copyWith(fontSize: 15),
@@ -1186,7 +1496,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
           ],
         ),
       );
-      if (spec != null && mounted) await _install(spec);
+      if (spec != null && mounted) _install(spec);
     } finally {
       name.dispose();
       version.dispose();
@@ -1194,50 +1504,44 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
   }
 
   CatalogPackage? _catalogFor(String name) {
-    final key = _pkgKey(name);
+    final key = pkgKey(name);
     for (final p in _catalog) {
-      if (_pkgKey(p.name) == key) return p;
+      if (pkgKey(p.name) == key) return p;
     }
     return null;
   }
 
-  String _busyFor(Lib lib) {
-    final key = _pkgKey(lib.name);
-    for (final entry in _jobPackages.entries) {
-      if (entry.value == key && _jobs.containsKey(entry.key)) return entry.key;
+  // ───── أجزاء البطاقة ─────
+  Widget _trailing(
+      Lib lib, InstalledPackage? installed, CatalogPackage? cat, LibJob? job) {
+    final key = pkgKey(lib.name);
+    if (job != null && job.state == JobState.queued) {
+      return OButton(
+        label: 'إلغاء',
+        accent: false,
+        height: 42,
+        radius: 10,
+        onPressed: () => libInstaller.cancel(key),
+      );
     }
-    return '';
-  }
-
-  Widget _statusButton(Lib lib) {
-    final catalog = _catalogFor(lib.name);
-    final installed = _packages[_pkgKey(lib.name)];
-    final busyId = _busyFor(lib);
-    if (busyId.isNotEmpty && installed == null) {
-      final e = _jobs[busyId];
-      final progress = e?.progress ?? 0;
-      return SizedBox(
-        width: 108,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            LinearProgressIndicator(
-              value: progress > 0 ? progress.clamp(0.0, 1.0).toDouble() : null,
-              minHeight: 3,
-              backgroundColor: C.border,
-              color: C.accent,
-            ),
-            const SizedBox(height: 4),
-            Text(
-              e?.stage == 'download' ? 'جاري التنزيل' : 'جاري التثبيت',
-              style: const TextStyle(fontSize: 11, color: C.muted),
-            ),
-          ],
-        ),
+    if (job != null && job.state == JobState.running) {
+      return const Text('جارٍ التثبيت', style: TextStyle(fontSize: 12, color: C.muted));
+    }
+    if (job != null && job.state == JobState.failed) {
+      return OButton(
+        label: 'إعادة المحاولة',
+        height: 42,
+        radius: 10,
+        fontSize: 12.5,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        onPressed: () => libInstaller.retry(key),
       );
     }
     if (installed == null) {
-      if (catalog != null && !catalog.compatible) {
+      if (job != null && job.state == JobState.done) {
+        return const Icon(Icons.check_circle_rounded, color: C.ok, size: 22);
+      }
+      if (cat != null && !cat.compatible) {
         return const Text('غير متوافقة', style: TextStyle(fontSize: 12, color: C.dim));
       }
       return OButton(
@@ -1245,67 +1549,126 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         height: 42,
         radius: 10,
         fontSize: 14,
-        onPressed: _jobs.isEmpty ? () => _install(lib.name) : null,
+        onPressed: () => _install(lib.name),
       );
     }
-    if (catalog?.updateAvailable == true) {
+    final latest = cat?.latestVersion;
+    if (cat?.updateAvailable == true && latest != null) {
       return PButton(
         label: 'تحديث',
         height: 42,
         radius: 10,
         fontSize: 14,
-        onPressed: _jobs.isEmpty ? () => _install('${lib.name}==${catalog!.latestVersion}') : null,
+        onPressed: libInstaller.busy ? null : () => _install('${lib.name}==$latest'),
       );
     }
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        const Icon(Icons.check_circle_rounded, color: C.ok, size: 19),
-        const SizedBox(width: 5),
-        TextButton(
-          onPressed: _jobs.isEmpty ? () => _remove(installed) : null,
-          style: TextButton.styleFrom(foregroundColor: C.error),
-          child: const Text('إزالة'),
-        ),
-      ],
+    return TextButton(
+      onPressed: libInstaller.busy ? null : () => _remove(installed),
+      style: TextButton.styleFrom(foregroundColor: C.error),
+      child: const Text('إزالة'),
     );
   }
 
+  Widget _installedZone(InstalledPackage p, CatalogPackage? cat) {
+    final latest = cat?.latestVersion;
+    final update = cat?.updateAvailable == true && latest != null;
+    return Row(children: [
+      const Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
+      const SizedBox(width: 6),
+      const Text('تم تثبيت المكتبة بنجاح', style: TextStyle(fontSize: 12, color: C.ok)),
+      const SizedBox(width: 8),
+      Flexible(
+        child: Text(
+          'الإصدار ${p.version}${update ? '  ←  $latest' : ''}',
+          textDirection: TextDirection.ltr,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 11, color: C.dim),
+        ),
+      ),
+    ]);
+  }
+
+  Widget _idleZone(CatalogPackage? cat) {
+    final latest = cat?.latestVersion;
+    if (latest == null) return const SizedBox.shrink();
+    return Align(
+      alignment: AlignmentDirectional.centerStart,
+      child: Text('أحدث نسخة: $latest',
+          textDirection: TextDirection.ltr,
+          style: const TextStyle(fontSize: 11, color: C.dim)),
+    );
+  }
+
+  // كل بطاقة: عنوان + زر، ثم منطقة تقدم بارتفاع ثابت (22) محجوزة دائمًا،
+  // فلا يرتفع شيء ولا ينزل أثناء التثبيت.
   Widget _tile(Lib lib, int index) {
-    final installed = _packages[_pkgKey(lib.name)];
-    final catalog = _catalogFor(lib.name);
+    final key = pkgKey(lib.name);
+    final installed = _packages[key];
+    final cat = _catalogFor(lib.name);
+    final job = libInstaller.jobFor(key);
+
+    final Widget zone;
+    final String zoneKey;
+    if (job != null && job.state != JobState.done) {
+      zoneKey = 'job-${job.state.name}';
+      zone = LibJobZone(
+        job: job,
+        onDetails: job.state == JobState.failed ? () => showInstallDetails(context, job) : null,
+        onDismiss: job.state == JobState.failed ? () => libInstaller.dismiss(key) : null,
+      );
+    } else if (installed != null) {
+      zoneKey = 'installed';
+      zone = _installedZone(installed, cat);
+    } else if (job != null) {
+      zoneKey = 'done';
+      zone = LibJobZone(job: job);
+    } else {
+      zoneKey = 'idle';
+      zone = _idleZone(cat);
+    }
+
     return Padding(
+      key: ValueKey('lib-$key'),
       padding: const EdgeInsets.only(bottom: 10),
       child: Appear(
         index: index,
         child: Container(
-          constraints: const BoxConstraints(minHeight: 72),
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
           decoration: _box(C.surface),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(lib.name, textDirection: TextDirection.ltr, style: mono.copyWith(fontSize: 15)),
-                    const SizedBox(height: 2),
-                    Text(lib.desc, style: const TextStyle(fontSize: 12, color: C.muted)),
-                    if (installed != null || catalog?.latestVersion != null) ...[
-                      const SizedBox(height: 3),
-                      Text(
-                        installed != null
-                            ? 'الإصدار ${installed.version}${catalog?.updateAvailable == true && catalog?.latestVersion != null ? '  ←  ${catalog!.latestVersion}' : ''}'
-                            : 'أحدث نسخة: ${catalog!.latestVersion}',
-                        textDirection: TextDirection.ltr,
-                        style: const TextStyle(fontSize: 10.5, color: C.dim),
-                      ),
-                    ],
-                  ],
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(lib.name,
+                            textDirection: TextDirection.ltr,
+                            style: mono.copyWith(fontSize: 15)),
+                        const SizedBox(height: 2),
+                        Text(lib.desc,
+                            style: const TextStyle(fontSize: 12, color: C.muted)),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  SizedBox(
+                    width: 112,
+                    height: 42,
+                    child: Center(child: _trailing(lib, installed, cat, job)),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 22,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 200),
+                  child: KeyedSubtree(key: ValueKey(zoneKey), child: zone),
                 ),
               ),
-              const SizedBox(width: 10),
-              _statusButton(lib),
             ],
           ),
         ),
@@ -1313,161 +1676,116 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     );
   }
 
-  Widget _jobBanner(String jobId, BayanEvent e) {
-    final name = _jobPackages[jobId] ?? e.packageName;
-    final progress = e.progress.clamp(0.0, 1.0).toDouble();
-    final indeterminate = progress <= 0 && e.total <= 0 && e.stage != 'done';
-    final stage = switch (e.stage) {
-      'metadata' => 'جاري البحث عن الإصدار…',
-      'resolve' => 'جاري حل الاعتماديات…',
-      'download' => 'جاري تنزيل $name…',
-      'verify' => 'جاري التحقق…',
-      'extract' => 'جاري فك الحزمة…',
-      'install' => 'جاري تثبيت الاعتماديات…',
-      'rollback' => 'جاري استرجاع الحالة السابقة…',
-      'done' => 'تم التثبيت بنجاح ✓',
-      'error' => 'فشل التثبيت',
-      _ => e.message.isNotEmpty ? e.message : 'جاري تجهيز المكتبة…',
-    };
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: C.surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: e.stage == 'error' ? C.error : C.accent),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+  Widget _list(LibInstaller installer) {
+    final catalogKeys = <String>{for (final l in catalog) pkgKey(l.name)};
+    final customInstalled = _packages.values
+        .where((p) =>
+            _shown.contains(pkgKey(p.name)) && !catalogKeys.contains(pkgKey(p.name)))
+        .toList();
+    final shownCatalog =
+        catalog.where((l) => _shown.contains(pkgKey(l.name))).toList();
+    final restCatalog =
+        catalog.where((l) => !_shown.contains(pkgKey(l.name))).toList();
+    // مكتبات خارج الكتالوج قيد التثبيت: تظهر في آخر القائمة فلا تدفع ما فوقها
+    final customJobs = installer.jobs
+        .where((j) => !catalogKeys.contains(j.key) && !_shown.contains(j.key))
+        .toList();
+    var i = 0;
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: C.accent.withValues(alpha: .10),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: C.border),
+          ),
+          child: const Row(
             children: [
-              const Icon(Icons.download_rounded, color: C.accent, size: 19),
-              const SizedBox(width: 8),
+              Icon(Icons.info_outline, color: C.accent, size: 20),
+              SizedBox(width: 10),
               Expanded(
                 child: Text(
-                  name.isEmpty ? 'تثبيت مكتبة' : name,
-                  textDirection: TextDirection.ltr,
-                  style: mono.copyWith(fontSize: 14),
+                  'المكتبات تثبت مرة واحدة داخل بيئة Python العامة للتطبيق، وتصبح متاحة لكل سكربتاتك.',
+                  style: TextStyle(fontSize: 13, color: C.text),
                 ),
               ),
-              if (e.stage == 'error')
-                const Icon(Icons.error_outline_rounded, color: C.error, size: 19)
-              else if (e.stage == 'done')
-                const Icon(Icons.check_circle_rounded, color: C.ok, size: 19)
-              else
-                const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
             ],
           ),
-          const SizedBox(height: 8),
-          LinearProgressIndicator(
-            value: indeterminate ? null : progress,
-            minHeight: 4,
-            backgroundColor: C.border,
-            color: e.stage == 'error' ? C.error : C.accent,
-          ),
-          const SizedBox(height: 7),
-          Text(stage, style: const TextStyle(fontSize: 12, color: C.muted)),
-          if (e.total > 0)
-            Text(
-              '${formatBytes(e.received)} / ${formatBytes(e.total)}',
-              style: const TextStyle(fontSize: 11, color: C.dim),
-            ),
+        ),
+        const SizedBox(height: 20),
+        if (customInstalled.isNotEmpty || shownCatalog.isNotEmpty) ...[
+          const Text('المثبتة', style: TextStyle(color: C.muted, fontSize: 13)),
+          const SizedBox(height: 10),
+          for (final p in customInstalled)
+            _tile(Lib(p.name, 'مكتبة أضفتها بنفسك', p.name.replaceAll('-', '_')), i++),
+          for (final lib in shownCatalog) _tile(lib, i++),
+          const SizedBox(height: 10),
         ],
-      ),
+        const Text('المكتبات الأساسية', style: TextStyle(color: C.muted, fontSize: 13)),
+        const SizedBox(height: 10),
+        for (final lib in restCatalog) _tile(lib, i++),
+        if (customJobs.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          const Text('قيد التثبيت', style: TextStyle(color: C.muted, fontSize: 13)),
+          const SizedBox(height: 10),
+          for (final j in customJobs)
+            _tile(Lib(j.name, 'مكتبة أضفتها بنفسك', j.name.replaceAll('-', '_')), i++),
+        ],
+        const SizedBox(height: 14),
+        OButton(
+          label: '+ تنزيل مكتبة غير موجودة',
+          icon: Icons.download_rounded,
+          height: 50,
+          radius: 12,
+          onPressed: _downloadUnknown,
+        ),
+        const SizedBox(height: 12),
+        if (_packages.isNotEmpty)
+          Center(
+            child: Text(
+              'مساحة المكتبات: ${formatBytes(_packages.values.fold<int>(0, (sum, p) => sum + p.size))}',
+              style: const TextStyle(fontSize: 12, color: C.dim),
+            ),
+          ),
+      ],
     );
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        body: SafeArea(
-          child: Column(
-            children: [
-              Header(
-                title: 'المكتبات',
-                back: true,
-                actions: [
-                  PressFx(
-                    scale: .88,
-                    child: IconButton(
-                      tooltip: 'تحديث',
-                      color: C.text,
-                      onPressed: (_refreshing || _jobs.isNotEmpty) ? null : () => _refresh(),
-                      icon: _refreshing
-                          ? const SizedBox(width: 19, height: 19, child: CircularProgressIndicator(strokeWidth: 2))
-                          : const Icon(Icons.refresh_rounded),
-                    ),
-                  ),
-                ],
-              ),
-              Expanded(
-                child: _loading
-                    ? const Center(child: CircularProgressIndicator(color: C.accent))
-                    : ListView(
-                        padding: const EdgeInsets.all(16),
-                        children: [
-                          if (_jobs.isNotEmpty) ...[
-                            for (final entry in _jobs.entries) _jobBanner(entry.key, entry.value),
-                            const SizedBox(height: 12),
-                          ],
-                          Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: C.accent.withValues(alpha: .10),
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: C.border),
-                            ),
-                            child: const Row(
-                              children: [
-                                Icon(Icons.info_outline, color: C.accent, size: 20),
-                                SizedBox(width: 10),
-                                Expanded(
-                                  child: Text(
-                                    'المكتبات تثبت مرة واحدة داخل بيئة Python العامة للتطبيق، وتصبح متاحة لكل سكربتاتك.',
-                                    style: TextStyle(fontSize: 13, color: C.text),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 20),
-                          if (_packages.isNotEmpty) ...[
-                            const Text('المثبتة', style: TextStyle(color: C.muted, fontSize: 13)),
-                            const SizedBox(height: 10),
-                            for (final package in _packages.values.where((p) => _catalogFor(p.name) == null))
-                              _tile(Lib(package.name, 'مكتبة أضفتها بنفسك', package.name.replaceAll('-', '_')), _catalog.length + _packages.keys.toList().indexOf(_pkgKey(package.name))),
-                            for (final lib in catalog)
-                              if (_packages.containsKey(_pkgKey(lib.name)))
-                                _tile(lib, catalog.indexOf(lib)),
-                            const SizedBox(height: 10),
-                          ],
-                          const Text('المكتبات الأساسية', style: TextStyle(color: C.muted, fontSize: 13)),
-                          const SizedBox(height: 10),
-                          for (var i = 0; i < catalog.length; i++)
-                            if (!_packages.containsKey(_pkgKey(catalog[i].name))) _tile(catalog[i], i),
-                          const SizedBox(height: 14),
-                          OButton(
-                            label: '+ تنزيل مكتبة غير موجودة',
-                            icon: Icons.download_rounded,
-                            height: 50,
-                            radius: 12,
-                            onPressed: _jobs.isEmpty ? _downloadUnknown : null,
-                          ),
-                          const SizedBox(height: 12),
-                          if (_packages.isNotEmpty)
-                            Center(
-                              child: Text(
-                                'مساحة المكتبات: ${formatBytes(_packages.values.fold<int>(0, (sum, p) => sum + p.size))}',
-                                style: const TextStyle(fontSize: 12, color: C.dim),
-                              ),
-                            ),
-                        ],
+  Widget build(BuildContext context) => InstallerBuilder(
+        builder: (context, installer) => Scaffold(
+          body: SafeArea(
+            child: Column(
+              children: [
+                Header(
+                  title: 'المكتبات',
+                  back: true,
+                  actions: [
+                    PressFx(
+                      scale: .88,
+                      child: IconButton(
+                        tooltip: 'تحديث',
+                        color: C.text,
+                        onPressed: (_refreshing || installer.busy) ? null : () => _refresh(),
+                        icon: _refreshing
+                            ? const SizedBox(
+                                width: 19,
+                                height: 19,
+                                child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.refresh_rounded),
                       ),
-              ),
-            ],
+                    ),
+                  ],
+                ),
+                Expanded(
+                  child: _loading
+                      ? const Center(child: CircularProgressIndicator(color: C.accent))
+                      : _list(installer),
+                ),
+              ],
+            ),
           ),
         ),
       );
@@ -1585,6 +1903,7 @@ class _CreateScreenState extends State<CreateScreen> {
                       SizedBox(
                         height: 48,
                         child: TextField(
+                          contextMenuBuilder: arContextMenu,
                           controller: _name,
                           textDirection: TextDirection.ltr,
                           style: mono.copyWith(fontSize: 15),
@@ -1635,6 +1954,7 @@ class _CreateScreenState extends State<CreateScreen> {
       );
 
   Widget _pasteBox() => TextField(
+        contextMenuBuilder: arContextMenu,
         controller: _paste,
         expands: true,
         maxLines: null,
@@ -1704,6 +2024,13 @@ const _builtins = {
   'enumerate', 'zip', 'map', 'filter', 'bool', 'isinstance', 'round'
 };
 
+// جزء نصي له لون (أو لا): يُقسَّم لاحقًا عند حدود التظليل
+class _Seg {
+  const _Seg(this.start, this.end, this.style);
+  final int start, end;
+  final TextStyle? style;
+}
+
 class CodeController extends TextEditingController {
   CodeController(String text)
       : super.fromValue(TextEditingValue(
@@ -1711,15 +2038,34 @@ class CodeController extends TextEditingController {
   static final _tok = RegExp(
       r'''(#[^\n]*)|("[^"\n]*"|'[^'\n]*')|(\b\d+(?:\.\d+)?\b)|(\b[A-Za-z_][A-Za-z0-9_]*\b)''');
 
+  // تظليل مؤقت لسطر (عند الانتقال من سطر خطأ) ونتائج البحث
+  TextRange? _lineMark;
+  List<TextRange> _matches = const <TextRange>[];
+  int _current = -1;
+
+  bool get hasLineMark => _lineMark != null;
+
+  void setLineMark(TextRange? range) {
+    _lineMark = range;
+    notifyListeners();
+  }
+
+  void setMatches(List<TextRange> matches, int current) {
+    _matches = matches;
+    _current = current;
+    notifyListeners();
+  }
+
   @override
   TextSpan buildTextSpan(
       {required BuildContext context,
       TextStyle? style,
       required bool withComposing}) {
-    final spans = <TextSpan>[];
+    final t = text;
+    final segs = <_Seg>[];
     var i = 0;
-    for (final m in _tok.allMatches(text)) {
-      if (m.start > i) spans.add(TextSpan(text: text.substring(i, m.start)));
+    for (final m in _tok.allMatches(t)) {
+      if (m.start > i) segs.add(_Seg(i, m.start, null));
       final w = m[0]!;
       Color? col;
       var fs = FontStyle.normal;
@@ -1735,13 +2081,59 @@ class CodeController extends TextEditingController {
       } else if (_builtins.contains(w)) {
         col = C.cyan;
       }
-      spans.add(TextSpan(
-          text: w,
-          style: col == null ? null : TextStyle(color: col, fontStyle: fs)));
+      segs.add(_Seg(m.start, m.end,
+          col == null ? null : TextStyle(color: col, fontStyle: fs)));
       i = m.end;
     }
-    if (i < text.length) spans.add(TextSpan(text: text.substring(i)));
-    return TextSpan(style: style, children: spans);
+    if (i < t.length) segs.add(_Seg(i, t.length, null));
+
+    final lineMark = _lineMark;
+    if (lineMark == null && _matches.isEmpty) {
+      return TextSpan(style: style, children: [
+        for (final s in segs)
+          TextSpan(text: t.substring(s.start, s.end), style: s.style),
+      ]);
+    }
+
+    // علامة لكل حرف: 1 نتيجة بحث، 2 سطر منتقل إليه، 3 النتيجة الحالية (الأعلى أولوية)
+    final marks = List<int>.filled(t.length, 0);
+    void paint(TextRange r, int value) {
+      final from = r.start < 0 ? 0 : r.start;
+      final to = r.end > t.length ? t.length : r.end;
+      for (var j = from; j < to; j++) {
+        marks[j] = value;
+      }
+    }
+
+    for (final r in _matches) {
+      paint(r, 1);
+    }
+    if (lineMark != null) paint(lineMark, 2);
+    if (_current >= 0 && _current < _matches.length) paint(_matches[_current], 3);
+
+    final out = <TextSpan>[];
+    for (final s in segs) {
+      var a = s.start;
+      while (a < s.end) {
+        final mark = marks[a];
+        var b = a + 1;
+        while (b < s.end && marks[b] == mark) {
+          b++;
+        }
+        TextStyle? st = s.style;
+        if (mark != 0) {
+          final bg = mark == 1
+              ? C.warn.withValues(alpha: .28)
+              : mark == 2
+                  ? C.accent.withValues(alpha: .28)
+                  : C.warn.withValues(alpha: .62);
+          st = (st ?? const TextStyle()).copyWith(backgroundColor: bg);
+        }
+        out.add(TextSpan(text: t.substring(a, b), style: st));
+        a = b;
+      }
+    }
+    return TextSpan(style: style, children: out);
   }
 }
 
@@ -1863,8 +2255,10 @@ class PyEditFormatter extends TextInputFormatter {
 
 // ───────── شاشة المحرر ─────────
 class ScriptScreen extends StatefulWidget {
-  const ScriptScreen({super.key, required this.script});
+  const ScriptScreen({super.key, required this.script, this.initialLine});
   final Script script;
+  // عند الفتح من سطر خطأ: رقم السطر الذي ينتقل إليه المحرر بعد التحميل
+  final int? initialLine;
 
   @override
   State<ScriptScreen> createState() => _ScriptScreenState();
@@ -1872,18 +2266,41 @@ class ScriptScreen extends StatefulWidget {
 
 class _ScriptScreenState extends State<ScriptScreen>
     with WidgetsBindingObserver {
+  // المحررات المفتوحة الآن (مسار السكربت ← حالته): كي لا يُفتح محرر ثانٍ لنفس الملف
+  static final Map<String, _ScriptScreenState> open =
+      <String, _ScriptScreenState>{};
+  static const _maxHits = 3000;
+
   final _code = CodeController('');
   final _focus = FocusNode();
   final _undo = UndoHistoryController();
-  Timer? _timer;
+  final _scroll = ScrollController();
+  final _fieldKey = GlobalKey();
+  final _viewKey = GlobalKey();
+  final _searchCtl = TextEditingController();
+  final _searchFocus = FocusNode();
+  Timer? _timer, _markTimer, _searchTimer;
   String? _lastSaved;
   bool _loading = true, _warned = false;
+  ModalRoute<dynamic>? route;
+
+  // البحث داخل المحرر
+  bool _searching = false;
+  List<TextRange> _hits = const <TextRange>[];
+  int _hit = -1;
 
   @override
   void initState() {
     super.initState();
+    open[widget.script.path] = this;
     WidgetsBinding.instance.addObserver(this);
     _load();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    route = ModalRoute.of(context);
   }
 
   // قراءة محتوى الملف الحقيقي داخل المحرر
@@ -1897,6 +2314,8 @@ class _ScriptScreenState extends State<ScriptScreen>
       _lastSaved = text;
       _code.addListener(_onChanged);
       setState(() => _loading = false);
+      final line = widget.initialLine;
+      if (line != null) jumpToLine(line, delay: const Duration(milliseconds: 380));
     } catch (_) {
       if (!mounted) return;
       final m = ScaffoldMessenger.of(context);
@@ -1914,6 +2333,11 @@ class _ScriptScreenState extends State<ScriptScreen>
     widget.script.code = t;
     _timer?.cancel();
     _timer = Timer(const Duration(milliseconds: 800), _save);
+    if (_code.hasLineMark) {
+      _markTimer?.cancel();
+      _code.setLineMark(null); // مواضع التظليل لم تعد صحيحة بعد التعديل
+    }
+    if (_searching && _searchCtl.text.isNotEmpty) _scheduleSearch(jump: false);
   }
 
   Future<void> _save() async {
@@ -1947,13 +2371,19 @@ class _ScriptScreenState extends State<ScriptScreen>
 
   @override
   void dispose() {
+    if (identical(open[widget.script.path], this)) open.remove(widget.script.path);
     WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
+    _markTimer?.cancel();
+    _searchTimer?.cancel();
     _flush();
     _code.removeListener(_onChanged);
     _code.dispose();
     _focus.dispose();
     _undo.dispose();
+    _scroll.dispose();
+    _searchCtl.dispose();
+    _searchFocus.dispose();
     super.dispose();
   }
 
@@ -1970,6 +2400,161 @@ class _ScriptScreenState extends State<ScriptScreen>
     Navigator.push(context, smooth(OutputScreen(script: widget.script)));
   }
 
+  // ───── الانتقال إلى سطر (من سطر خطأ في Traceback) ─────
+  // يضع المؤشر في بداية السطر، ويمرّره إلى منتصف الشاشة، ويظلّله ثانيتين تقريبًا.
+  // لا تُفتح لوحة المفاتيح. رقم أكبر من عدد الأسطر ينتقل إلى آخر سطر دون شرح.
+  void jumpToLine(int line, {Duration delay = const Duration(milliseconds: 300)}) {
+    Future<void>.delayed(delay, () async {
+      for (var n = 0; n < 20 && mounted && _loading; n++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      if (!mounted || _loading) return;
+      final text = _code.text;
+      final wanted = line < 1 ? 1 : line;
+      var start = 0;
+      var current = 1;
+      while (current < wanted) {
+        final nl = text.indexOf('\n', start);
+        if (nl < 0) break;
+        start = nl + 1;
+        current++;
+      }
+      var end = text.indexOf('\n', start);
+      if (end < 0) end = text.length;
+      _code.selection = TextSelection.collapsed(offset: start);
+      _code.setLineMark(end > start ? TextRange(start: start, end: end) : null);
+      _scrollToOffset(start);
+      _markTimer?.cancel();
+      _markTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted) _code.setLineMark(null);
+      });
+    });
+  }
+
+  // يجد حالة الحقل الداخلي للمحرر (للوصول إلى موضع المؤشر على الشاشة)
+  EditableTextState? _findEditable() {
+    EditableTextState? found;
+    void visit(Element el) {
+      if (found != null) return;
+      if (el is StatefulElement && el.state is EditableTextState) {
+        found = el.state as EditableTextState;
+        return;
+      }
+      el.visitChildren(visit);
+    }
+
+    final ctx = _fieldKey.currentContext;
+    if (ctx is Element) visit(ctx);
+    return found;
+  }
+
+  // يمرّر المحرر بحيث يصبح الموضع في منتصف المساحة الظاهرة (يراعي التفاف الأسطر الطويلة)
+  void _scrollToOffset(int offset) {
+    try {
+      final editable = _findEditable();
+      final view = _viewKey.currentContext?.findRenderObject();
+      if (editable == null || view is! RenderBox || !_scroll.hasClients) return;
+      final render = editable.renderEditable;
+      if (!render.hasSize) return;
+      final caret = render.getLocalRectForCaret(TextPosition(offset: offset));
+      final caretY = render.localToGlobal(caret.center).dy;
+      final centerY = view.localToGlobal(Offset(0, view.size.height / 2)).dy;
+      final pos = _scroll.position;
+      final target = (pos.pixels + caretY - centerY)
+          .clamp(pos.minScrollExtent, pos.maxScrollExtent)
+          .toDouble();
+      unawaited(_scroll.animateTo(
+        target,
+        duration: const Duration(milliseconds: 320),
+        curve: Curves.easeOutCubic,
+      ));
+    } catch (_) {
+      // التمرير تحسين فقط؛ لا نكسر المحرر إن تعذّر حسابه
+    }
+  }
+
+  // ───── البحث داخل المحرر (بحث فقط، بدون استبدال) ─────
+  void _toggleSearch() {
+    if (_searching) {
+      _closeSearch();
+      return;
+    }
+    setState(() => _searching = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _searchFocus.requestFocus();
+    });
+    if (_searchCtl.text.isNotEmpty) _runSearch(jump: false);
+  }
+
+  void _closeSearch() {
+    _searchTimer?.cancel();
+    _searchFocus.unfocus();
+    _code.setMatches(const <TextRange>[], -1);
+    setState(() {
+      _searching = false;
+      _hits = const <TextRange>[];
+      _hit = -1;
+    });
+  }
+
+  void _scheduleSearch({required bool jump}) {
+    _searchTimer?.cancel();
+    _searchTimer = Timer(Duration(milliseconds: jump ? 150 : 250), () {
+      if (mounted) _runSearch(jump: jump);
+    });
+  }
+
+  void _runSearch({required bool jump}) {
+    final q = _searchCtl.text;
+    if (!_searching || q.isEmpty) {
+      _code.setMatches(const <TextRange>[], -1);
+      setState(() {
+        _hits = const <TextRange>[];
+        _hit = -1;
+      });
+      return;
+    }
+    // غير حساس لحالة الأحرف؛ RegExp.escape يجعل الرموز الخاصة نصًا عاديًا
+    final hits = <TextRange>[];
+    try {
+      final re = RegExp(RegExp.escape(q), caseSensitive: false);
+      for (final m in re.allMatches(_code.text)) {
+        hits.add(TextRange(start: m.start, end: m.end));
+        if (hits.length >= _maxHits) break;
+      }
+    } catch (_) {}
+    var idx = -1;
+    if (hits.isNotEmpty) {
+      final caret = _code.selection.isValid ? _code.selection.start : 0;
+      idx = hits.indexWhere((h) => h.start >= caret);
+      if (idx < 0) idx = 0;
+    }
+    setState(() {
+      _hits = hits;
+      _hit = idx;
+    });
+    _code.setMatches(hits, idx);
+    if (jump) _selectHit(idx);
+  }
+
+  // يحدّد النتيجة ويمرّر إليها؛ تغيير التحديد فقط، فلا يدخل في سجل التراجع والإعادة
+  void _selectHit(int i) {
+    if (i < 0 || i >= _hits.length) return;
+    final h = _hits[i];
+    _code.selection = TextSelection(baseOffset: h.start, extentOffset: h.end);
+    _scrollToOffset(h.start);
+  }
+
+  void _stepHit(int delta) {
+    final n = _hits.length;
+    if (n == 0) return;
+    final base = _hit < 0 ? (delta > 0 ? -1 : 0) : _hit;
+    final next = (base + delta + n) % n;
+    setState(() => _hit = next);
+    _code.setMatches(_hits, next);
+    _selectHit(next);
+  }
+
   Widget _historyBtn(
           IconData icon, String tip, bool enabled, VoidCallback onTap) =>
       PressFx(
@@ -1984,6 +2569,59 @@ class _ScriptScreenState extends State<ScriptScreen>
         ),
       );
 
+  Widget _searchBar() {
+    final total = _hits.length;
+    final hasQuery = _searchCtl.text.isNotEmpty;
+    final counter = !hasQuery
+        ? ''
+        : total == 0
+            ? '0/0'
+            : '${_hit + 1}/$total${total >= _maxHits ? '+' : ''}';
+    final enabled = total > 0;
+    return Container(
+      height: 48,
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      padding: const EdgeInsets.only(right: 12, left: 2),
+      decoration: _box(C.surface),
+      child: Row(children: [
+        Expanded(
+          child: TextField(
+            contextMenuBuilder: arContextMenu,
+            controller: _searchCtl,
+            focusNode: _searchFocus,
+            onChanged: (_) => _scheduleSearch(jump: true),
+            onEditingComplete: () => _stepHit(1),
+            textInputAction: TextInputAction.search,
+            autocorrect: false,
+            enableSuggestions: false,
+            cursorColor: C.accent,
+            style: const TextStyle(fontSize: 15),
+            decoration: const InputDecoration.collapsed(
+              hintText: 'ابحث في السكربت',
+              hintStyle: TextStyle(color: C.dim),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 58,
+          child: Text(
+            counter,
+            textAlign: TextAlign.center,
+            textDirection: TextDirection.ltr,
+            style: TextStyle(
+                fontSize: 13,
+                color: hasQuery && total == 0 ? C.error : C.muted),
+          ),
+        ),
+        _historyBtn(Icons.keyboard_arrow_up_rounded, 'السابق', enabled,
+            () => _stepHit(-1)),
+        _historyBtn(Icons.keyboard_arrow_down_rounded, 'التالي', enabled,
+            () => _stepHit(1)),
+        _historyBtn(Icons.close_rounded, 'إغلاق البحث', true, _closeSearch),
+      ]),
+    );
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
         body: SafeArea(
@@ -1994,6 +2632,15 @@ class _ScriptScreenState extends State<ScriptScreen>
               mono: true,
               onBack: _leave,
               actions: [
+                PressFx(
+                  scale: .88,
+                  child: IconButton(
+                    tooltip: 'بحث',
+                    color: _searching ? C.accent : C.text,
+                    onPressed: _loading ? null : _toggleSearch,
+                    icon: const Icon(Icons.search_rounded),
+                  ),
+                ),
                 ValueListenableBuilder<UndoHistoryValue>(
                   valueListenable: _undo,
                   builder: (_, v, __) => Row(mainAxisSize: MainAxisSize.min, children: [
@@ -2003,6 +2650,7 @@ class _ScriptScreenState extends State<ScriptScreen>
                 ),
               ],
             ),
+            if (_searching) _searchBar(),
             Expanded(
                 child: _loading
                     ? const Center(
@@ -2033,6 +2681,8 @@ class _ScriptScreenState extends State<ScriptScreen>
           child: Directionality(
             textDirection: TextDirection.ltr,
             child: SingleChildScrollView(
+              key: _viewKey,
+              controller: _scroll,
               padding: const EdgeInsets.all(14),
               child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 ListenableBuilder(
@@ -2047,6 +2697,8 @@ class _ScriptScreenState extends State<ScriptScreen>
                 const SizedBox(width: 14),
                 Expanded(
                   child: TextField(
+                    key: _fieldKey,
+                    contextMenuBuilder: arContextMenu,
                     controller: _code,
                     focusNode: _focus,
                     undoController: _undo,
@@ -2101,6 +2753,10 @@ class _OutputScreenState extends State<OutputScreen> {
   StreamSubscription<BayanEvent>? _events;
   bool _stopRequested = false;
   bool _starting = false;
+  // بطاقات المكتبات الناقصة تحت الخطأ
+  final _missing = <MissingLib>[];
+  final _removing = <String>{};
+  StreamSubscription<int>? _installerSub;
 
   @override
   void initState() {
@@ -2110,12 +2766,14 @@ class _OutputScreenState extends State<OutputScreen> {
       _add('$error', 3);
       if (mounted) setState(() {});
     });
+    _installerSub = libInstaller.changes.listen(_onInstaller);
     WidgetsBinding.instance.addPostFrameCallback((_) => _startRun());
   }
 
   @override
   void dispose() {
     _events?.cancel();
+    _installerSub?.cancel();
     _stopRequested = true;
     unawaited(_runner.dispose());
     _input.dispose();
@@ -2141,6 +2799,9 @@ class _OutputScreenState extends State<OutputScreen> {
         break;
       case 'stderr':
         _appendOutput(e.text, 3);
+        break;
+      case 'missing':
+        _onMissing(e.text);
         break;
       case 'exit':
         final code = e.exitCode;
@@ -2204,6 +2865,7 @@ class _OutputScreenState extends State<OutputScreen> {
     setState(() {
       _lines.clear();
       _rawOutput.clear();
+      _missing.clear();
     });
     _add(r'$ python ' + widget.script.name, 1);
     try {
@@ -2259,6 +2921,180 @@ class _OutputScreenState extends State<OutputScreen> {
       await _runner.waitForFinish(timeout: const Duration(milliseconds: 450));
     } catch (_) {}
     if (mounted) Navigator.pop(context);
+  }
+
+  // ───── مكتبات ناقصة (F2) ─────
+  void _onInstaller(int _) {
+    if (!mounted || _missing.isEmpty) return;
+    for (final m in List<MissingLib>.of(_missing)) {
+      final job = libInstaller.jobFor(pkgKey(m.package));
+      if (job != null && job.state == JobState.done && _removing.add(m.package)) {
+        // بعد النجاح تختفي البطاقة ويبقى النص المطبوع فقط (بلا إعادة تشغيل تلقائية)
+        Timer(const Duration(milliseconds: 900), () {
+          _removing.remove(m.package);
+          if (!mounted) return;
+          setState(() => _missing.removeWhere((x) => x.package == m.package));
+        });
+      }
+    }
+  }
+
+  void _onMissing(String payload) {
+    final items = <MissingLib>[];
+    try {
+      final decoded = jsonDecode(payload);
+      if (decoded is List) {
+        for (final raw in decoded) {
+          if (raw is! Map) continue;
+          final pkg = raw['package']?.toString() ?? '';
+          final module = raw['module']?.toString() ?? pkg;
+          if (pkg.isNotEmpty) items.add(MissingLib(pkg, module));
+        }
+      }
+    } catch (_) {}
+    if (items.isEmpty) return;
+    setState(() {
+      _missing
+        ..clear()
+        ..addAll(items);
+    });
+    _scrollToEnd();
+    unawaited(_checkAvailability(items));
+  }
+
+  // هل توجد نسخة تعمل على أندرويد؟ إن لم توجد تقول البطاقة ذلك بدل زر يفشل
+  Future<void> _checkAvailability(List<MissingLib> items) async {
+    try {
+      final results =
+          await bayanPython.checkAvailability(items.map((m) => m.package).toList());
+      if (!mounted) return;
+      setState(() {
+        for (final r in results) {
+          for (final m in items) {
+            if (pkgKey(m.package) == pkgKey(r.name)) {
+              m.available = r.available;
+              m.reason = r.reason;
+              m.version = r.version;
+            }
+          }
+        }
+        for (final m in items) {
+          m.checking = false;
+        }
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        for (final m in items) {
+          m.checking = false;
+        }
+      });
+    }
+  }
+
+  void _scrollToEnd() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.animateTo(
+          _scroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 160),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  Widget _missingFooter() => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AnimatedSize(
+          duration: const Duration(milliseconds: 220),
+          alignment: Alignment.topCenter,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              for (final m in _missing) MissingLibCard(key: ValueKey(m.package), item: m),
+            ],
+          ),
+        ),
+      );
+
+  // ───── الضغط على سطر الخطأ يفتح المحرر عند ذلك السطر (F1) ─────
+  Future<bool> _confirmStopForEditor() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: C.surface,
+        title: const Text('السكربت ما زال يعمل'),
+        content: const Text('الانتقال إلى المحرر سيوقف السكربت الجاري. هل تريد المتابعة؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('إيقاف والانتقال')),
+        ],
+      ),
+    );
+    return ok == true;
+  }
+
+  Future<void> _openFrame(FrameRef frame) async {
+    final target = await store.scriptAtRelative(frame.relative);
+    if (!mounted) return;
+    if (target == null) {
+      _snack('الملف غير موجود');
+      return;
+    }
+    final nav = Navigator.of(context);
+    final editor = _ScriptScreenState.open[target.path];
+    if (editor != null && editor.mounted) {
+      // محرر هذا الملف مفتوح فعلًا في المكدس: نرجع إليه (pop) بدل فتح نسخة ثانية.
+      // الرجوع من الإخراج يوقف السكربت الجاري، فنسأل أولًا.
+      if (_runner.isRunning && !await _confirmStopForEditor()) return;
+      if (!mounted) return;
+      _stopRequested = true;
+      final route = editor.route;
+      if (route != null) {
+        nav.popUntil((r) => identical(r, route));
+      } else {
+        nav.pop();
+      }
+      editor.jumpToLine(frame.line);
+      return;
+    }
+    // سكربت آخر (أو لا محرر مفتوح له): نفتح محرره فوق الإخراج، والرجوع يعيدنا إليه
+    unawaited(nav.push(smooth<void>(ScriptScreen(script: target, initialLine: frame.line))));
+  }
+
+  Widget _frameLine(Line line, FrameRef frame) {
+    const tint = C.accentEdge;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Material(
+        color: C.accent.withValues(alpha: .12),
+        borderRadius: BorderRadius.circular(6),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => unawaited(_openFrame(frame)),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    line.text,
+                    style: mono.copyWith(
+                      color: tint,
+                      decoration: TextDecoration.underline,
+                      decorationColor: tint.withValues(alpha: .5),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                const Icon(Icons.open_in_new_rounded, size: 14, color: tint),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   void _copyOutput() {
@@ -2379,7 +3215,7 @@ class _OutputScreenState extends State<OutputScreen> {
             ),
           ),
           Expanded(
-            child: _lines.isEmpty
+            child: _lines.isEmpty && _missing.isEmpty
                 ? Center(
                     child: Text(
                       _runner.isRunning ? 'جاري تشغيل Python…' : 'اضغط "إعادة تشغيل" ليظهر الإخراج هنا',
@@ -2391,11 +3227,18 @@ class _OutputScreenState extends State<OutputScreen> {
                     child: ListView.builder(
                       controller: _scroll,
                       padding: const EdgeInsets.all(14),
-                      itemCount: _lines.length,
-                      itemBuilder: (_, i) => Text(
-                        _lines[i].text,
-                        style: mono.copyWith(color: _lineColor(_lines[i].kind)),
-                      ),
+                      itemCount: _lines.length + (_missing.isEmpty ? 0 : 1),
+                      itemBuilder: (_, i) {
+                        if (i >= _lines.length) return _missingFooter();
+                        final line = _lines[i];
+                        // سطر File "…", line N داخل Bayan 777 قابل للضغط
+                        final frame = line.kind == 3 ? parseFrame(line.text) : null;
+                        if (frame != null) return _frameLine(line, frame);
+                        return Text(
+                          line.text,
+                          style: mono.copyWith(color: _lineColor(line.kind)),
+                        );
+                      },
                     ),
                   ),
           ),
@@ -2408,6 +3251,7 @@ class _OutputScreenState extends State<OutputScreen> {
                   child: SizedBox(
                     height: 44,
                     child: TextField(
+                      contextMenuBuilder: arContextMenu,
                       controller: _input,
                       enabled: waiting,
                       onSubmitted: (_) => unawaited(_send()),

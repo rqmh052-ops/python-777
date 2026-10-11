@@ -247,6 +247,26 @@ class BayanPythonBridge(private val context: Context) :
                 }
             }
 
+            "packages.check" -> {
+                // هل توجد نسخة من كل مكتبة تعمل على أندرويد؟ (للقراءة فقط، لا يمس البيئة)
+                val names = call.argument<List<String>>("names")
+                if (names.isNullOrEmpty()) {
+                    complete(result, emptyList<Map<String, Any?>>())
+                    return
+                }
+                controlExecutor.execute {
+                    try {
+                        val py = ensurePython()
+                        val module = py.getModule("bayan_runtime")
+                        module.callAttr("_configure_android", Build.VERSION.SDK_INT, Build.SUPPORTED_ABIS.firstOrNull() ?: "")
+                        val value = module.callAttr("check_availability", org.json.JSONArray(names).toString()).toString()
+                        complete(result, jsonArrayToList(org.json.JSONArray(value)))
+                    } catch (t: Throwable) {
+                        fail(result, "packages_check", friendly(t))
+                    }
+                }
+            }
+
             "packages.install" -> {
                 val spec = call.argument<String>("spec")?.trim()
                 val jobId = call.argument<String>("jobId")?.trim()
@@ -417,6 +437,19 @@ class BayanPythonBridge(private val context: Context) :
                     "type" to "state",
                     "runId" to session.runId,
                     "text" to state,
+                )
+            )
+        }
+
+        // بايثون يستدعيها عند انتهاء التشغيل بـ ModuleNotFoundError: JSON بالمكتبات الناقصة
+        @Suppress("unused")
+        fun emitMissing(json: String) {
+            emit(
+                mapOf(
+                    "channel" to "run",
+                    "type" to "missing",
+                    "runId" to session.runId,
+                    "text" to json,
                 )
             )
         }

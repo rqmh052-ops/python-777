@@ -69,3 +69,23 @@
 
 ## الملفات المعدّلة في هذه الجولة
 `.github/workflows/build.yml`, `bayan_runtime.py`, `tools/prepare_android.py`, `tools/test_extra.py`, `tools/verify_apk.py` (جديد), `FIXES.md`
+
+
+---
+
+# المرحلة 1 من الإصدار القادم: F3 ثم F2 ثم F1 ثم F9 ثم F10
+
+- **F3 (شاشة المكتبات):** حُذفت بطاقة التقدم العلوية. لكل بطاقة منطقة تقدم ارتفاعها ثابت (22) محجوزة دائمًا،
+  وحالاتها: غير مثبّتة / في الانتظار / جارٍ التثبيت (شريط أخضر ونسبة تصاعدية) / تم التثبيت / فشل (سبب مختصر + تفاصيل).
+  النسبة: حل الاعتماديات 0–10%، التنزيل 10–80% موزّعًا حسب أحجام كل الـwheels، التثبيت والتحقق 80–100%.
+  التثبيتات المتعددة تدخل طابورًا (`LibInstaller` في python_runtime.dart) وتظهر «في الانتظار».
+  بايثون يرسل الآن حدث `wheel`/`wheel_cached` بحجم كل wheel قبل تنزيلها.
+- **F2 (بطاقات المكتبة الناقصة):** عند انتهاء التشغيل بـ`ModuleNotFoundError` يمسح بايثون كل `import` بـ`ast`
+  ويرسل المفقودات كلها دفعة واحدة عبر دالة Kotlin جديدة `emitMissing` (أُضيفت إلى `_RUN_CALLBACK_REQUIRED`
+  وإلى `REQUIRED` في verify_apk.py وإلى اختبار العقد). توفر النسخة على أندرويد يُفحص عبر `packages.check`.
+- **F1 (سطر الخطأ):** أسطر `File "…", line N` داخل `Bayan 777` قابلة للضغط. إن كان محرر الملف مفتوحًا نرجع إليه
+  ولا نفتح نسخة ثانية، وإلا يُفتح المحرر فوق الإخراج.
+- **F9:** بحث داخل المحرر (بدون استبدال). **F10:** قائمة النسخ/القص/اللصق/تحديد الكل بالعربية عبر `contextMenuBuilder`.
+
+الملفات المعدّلة: `main.dart`, `python_runtime.dart`, `store.dart`, `MainActivity.kt`, `bayan_runtime.py`,
+`tools/test_extra.py`, `tools/test_runtime.py`, `tools/verify_apk.py`, `FIXES.md`.

@@ -416,6 +416,26 @@ class ScriptStore {
     }
   }
 
+  // ───── سكربت من مسار نسبي داخل Bayan 777 (من سطر Traceback) ─────
+  // يرجع null إذا لم يعد الملف موجودًا. وحدة .py داخل مجلد فرعي ليست في القائمة،
+  // فنبني لها كائن Script مؤقتًا حتى يفتحها المحرر.
+  Future<Script?> scriptAtRelative(String rel) async {
+    final root = _dir?.path;
+    if (root == null || rel.isEmpty || rel.split('/').contains('..')) return null;
+    final path = '$root/$rel';
+    try {
+      final f = File(path);
+      if (!await f.exists()) return null;
+      for (final s in scripts.value) {
+        if (s.path == path) return s;
+      }
+      final stat = await f.stat();
+      return Script(name: rel, path: path, modified: stat.modified);
+    } catch (_) {
+      return null;
+    }
+  }
+
   // ───── القراءة والكتابة ─────
   Future<String> readCode(Script s) => _serial<String>(() async {
         final bytes = await File(s.path).readAsBytes();

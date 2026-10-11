@@ -7,10 +7,12 @@ under the private Bayan environment configured by the Android bridge.
 from __future__ import annotations
 
 import _thread
+import ast
 import builtins
 import csv
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -110,7 +112,7 @@ def _should_stop(callback: Any) -> bool:
 # deletes them in a release build, every run fails with the cryptic
 # "'y0' object has no attribute 'emitState'". Checking up front turns that
 # into a message that says what is wrong and how to fix it.
-_RUN_CALLBACK_REQUIRED = ("emitOutput", "emitError", "emitInput", "requestInput", "emitState", "emitExit")
+_RUN_CALLBACK_REQUIRED = ("emitOutput", "emitError", "emitInput", "requestInput", "emitState", "emitExit", "emitMissing")
 _PACKAGE_CALLBACK_REQUIRED = ("emitPackage",)
 
 _CALLBACK_HINT = (
@@ -549,6 +551,127 @@ def _print_user_traceback(exc: BaseException, file: Any) -> None:
         file.write(f"{type(exc).__name__}: {exc}\n")
 
 
+# ---------------------------------------------------------------------------
+# Missing-library detection (cards under the error in the output screen)
+# ---------------------------------------------------------------------------
+
+# import name -> name on PyPI, for the cases where they differ.
+_IMPORT_TO_DIST = {
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "bs4": "beautifulsoup4",
+    "yaml": "PyYAML",
+    "telegram": "python-telegram-bot",
+    "telebot": "pyTelegramBotAPI",
+    "dotenv": "python-dotenv",
+    "sklearn": "scikit-learn",
+    "dateutil": "python-dateutil",
+    "Crypto": "pycryptodome",
+    "serial": "pyserial",
+    "jwt": "PyJWT",
+}
+
+_TRY_NODES = tuple(t for t in (ast.Try, getattr(ast, "TryStar", None)) if t is not None)
+# An import inside `try: ... except <one of these>` is optional by design.
+_IMPORT_GUARD_NAMES = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+
+
+def _handler_names(node: ast.expr | None) -> set[str]:
+    if node is None:  # bare `except:`
+        return {"BaseException"}
+    items = node.elts if isinstance(node, ast.Tuple) else [node]
+    names: set[str] = set()
+    for item in items:
+        if isinstance(item, ast.Name):
+            names.add(item.id)
+        elif isinstance(item, ast.Attribute):
+            names.add(item.attr)
+    return names
+
+
+def _scan_imports(source: str) -> list[tuple[str, bool]]:
+    """Return (top-level module, inside try/except ImportError) for every absolute import."""
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return []
+    found: list[tuple[str, bool]] = []
+
+    def visit(node: ast.AST, guarded: bool) -> None:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                found.append((alias.name.split(".")[0], guarded))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:  # relative imports are local files
+                found.append((node.module.split(".")[0], guarded))
+        if _TRY_NODES and isinstance(node, _TRY_NODES):
+            catches = any(_handler_names(h.type) & _IMPORT_GUARD_NAMES for h in node.handlers)
+            for child in node.body:
+                visit(child, guarded or catches)
+            for handler in node.handlers:
+                for child in handler.body:
+                    visit(child, guarded)
+            for child in list(node.orelse) + list(node.finalbody):
+                visit(child, guarded)
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, guarded)
+
+    try:
+        visit(tree, False)
+    except RecursionError:
+        pass
+    return found
+
+
+def _missing_libraries(path: Path, source: str, exc: BaseException) -> list[dict[str, Any]]:
+    """Libraries the script needs but cannot import, the failing one first.
+
+    Only used when the run ended with ModuleNotFoundError, so that when three
+    libraries are missing the user sees three cards at once instead of fixing
+    them one failed run at a time.
+    """
+    stdlib = set(getattr(sys, "stdlib_module_names", ())) | {"__future__"}
+    script_dir = path.parent
+    failed = (getattr(exc, "name", None) or "").split(".")[0]
+    candidates: list[tuple[str, bool]] = []
+    if failed:
+        candidates.append((failed, True))
+    for root, guarded in _scan_imports(source):
+        if guarded and root != failed:
+            continue  # optional import that did not fail
+        candidates.append((root, root == failed))
+
+    out: list[dict[str, Any]] = []
+    seen_roots: set[str] = set()
+    seen_dists: set[str] = set()
+    for root, is_failed in candidates:
+        if not root or root in seen_roots:
+            continue
+        seen_roots.add(root)
+        if root in stdlib:
+            continue
+        if (script_dir / f"{root}.py").is_file() or (script_dir / root).is_dir():
+            continue  # a local module next to the script
+        try:
+            if importlib.util.find_spec(root) is not None:
+                continue  # importable (a submodule may be what is missing, not the library)
+        except Exception:
+            continue
+        dist = _IMPORT_TO_DIST.get(root, root)
+        norm = _norm_name(dist)
+        if norm in seen_dists:
+            continue
+        try:
+            if _installed_version(norm):
+                continue  # installing it again would not help
+        except Exception:
+            pass
+        seen_dists.add(norm)
+        out.append({"module": root, "package": dist, "failed": is_failed})
+    return out
+
+
 def run_script(script_path: str, callback: Any) -> int:
     """Execute one user script in the shared Bayan Python interpreter."""
     _, _, site, _ = _require_config()
@@ -578,6 +701,8 @@ def run_script(script_path: str, callback: Any) -> int:
     watchdog = _Watchdog(callback, hub)
     threads_before = set(threading.enumerate())
     exit_code = 0
+    source = ""
+    missing_payload = ""
     watchdog.start()
     callback.emitState("running")
 
@@ -635,6 +760,13 @@ def run_script(script_path: str, callback: Any) -> int:
     except BaseException as exc:
         exit_code = 1
         _print_user_traceback(exc, err)
+        if isinstance(exc, ModuleNotFoundError):
+            try:
+                missing = _missing_libraries(path, source, exc)
+                if missing:
+                    missing_payload = json.dumps(missing, ensure_ascii=False)
+            except Exception:
+                missing_payload = ""
     finally:
         try:
             sys.settrace(old_trace)
@@ -669,6 +801,11 @@ def run_script(script_path: str, callback: Any) -> int:
             hub.flush()
         except Exception:
             pass
+        if missing_payload:
+            try:
+                callback.emitMissing(missing_payload)
+            except Exception:
+                pass
         watchdog.finish()
         callback.emitExit(exit_code)
         callback.emitState("finished" if exit_code == 0 else ("stopped" if exit_code == 130 else "error"))
@@ -1250,17 +1387,25 @@ def _obtain_wheel(name: str, constraints: list[tuple[str, str]], callback: Any |
     filename = candidate["filename"]
     sha = (candidate.get("digests") or {}).get("sha256")
     path = _wheel_cache_path(name, version, filename, sha)
+    try:
+        wheel_size = int(candidate.get("size") or 0)
+    except (TypeError, ValueError):
+        wheel_size = 0
     if path.is_file() and path.stat().st_size > 0:
         if sha:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             if digest.lower() != sha.lower():
                 path.unlink()
             else:
+                if callback is not None:
+                    callback.emitPackage("wheel_cached", path.stat().st_size, 0, path.name)
                 return path, candidate
         else:
             try:
                 with zipfile.ZipFile(path) as zf:
                     zf.testzip()
+                if callback is not None:
+                    callback.emitPackage("wheel_cached", path.stat().st_size, 0, path.name)
                 return path, candidate
             except Exception:
                 path.unlink(missing_ok=True)
@@ -1271,7 +1416,10 @@ def _obtain_wheel(name: str, constraints: list[tuple[str, str]], callback: Any |
     if not url:
         raise RuntimeError("تعذر العثور على رابط wheel")
     if callback is not None:
-        callback.emitPackage("download_start", 0, 0, filename)
+        # Tells the UI the size of this wheel before it downloads, so the
+        # progress bar can weigh all wheels of one install against each other.
+        callback.emitPackage("wheel", wheel_size, 0, path.name)
+        callback.emitPackage("download_start", 0, 0, path.name)
     _download(url, path, callback, sha)
     try:
         with zipfile.ZipFile(path) as zf:
@@ -1531,6 +1679,45 @@ def catalog_status() -> str:
     with ThreadPoolExecutor(max_workers=min(6, len(CATALOG))) as pool:
         futures = [pool.submit(one, item) for item in CATALOG]
         results = [future.result() for future in futures]
+    return json.dumps(results, ensure_ascii=False)
+
+
+def _availability_for(name: str) -> dict[str, Any]:
+    """Is there a build of this library that runs on this Android/Python? (available: None = unknown)"""
+    try:
+        info = _latest_compatible_for(name)
+    except ValueError:
+        # Not on PyPI under this name; Chaquopy's repository may still have it.
+        try:
+            native = _chaquopy_wheel(name)
+        except Exception:
+            native = None
+        if native:
+            return {"name": name, "available": True, "version": native["version"], "reason": ""}
+        return {"name": name, "available": False, "version": None, "reason": "المكتبة غير موجودة في PyPI"}
+    except Exception as exc:
+        return {"name": name, "available": None, "version": None, "reason": str(exc)}
+    if info.get("compatible"):
+        return {"name": name, "available": True, "version": info.get("version"), "reason": ""}
+    return {"name": name, "available": False, "version": None, "reason": "لا توجد نسخة منها تعمل على أندرويد"}
+
+
+def check_availability(names_json: str) -> str:
+    """Availability of several libraries, looked up in parallel (PyPI first, then Chaquopy)."""
+    try:
+        raw = json.loads(names_json)
+    except Exception:
+        raw = []
+    names: list[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        text = str(item).strip()
+        if text and text not in names:
+            names.append(text)
+    names = names[:12]
+    if not names:
+        return "[]"
+    with ThreadPoolExecutor(max_workers=min(4, len(names))) as pool:
+        results = list(pool.map(_availability_for, names))
     return json.dumps(results, ensure_ascii=False)
 
 
