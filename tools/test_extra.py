@@ -457,6 +457,7 @@ def test_keep_rules_and_apk_check() -> None:
         rules = (app / "proguard-rules.pro").read_text(encoding="utf-8")
     pkg = re.search(r"^package\s+([\w.]+)", KOTLIN.read_text(encoding="utf-8"), re.M).group(1)
     assert f"{pkg}.BayanPythonBridge" in rules and "-keep" in rules, rules
+    assert f"{pkg}.LogStore" in rules, "2.5D1: LogStore needs the usual keep rule"
 
     verify = _load_tool("verify_apk")
     good = b"\x00".join(n.encode() for n in verify.REQUIRED)
@@ -1104,6 +1105,9 @@ def test_event_ring_limits_are_in_the_spec() -> None:
     assert "maxEvents: Int = 2000" in m.group(1) and "maxChars: Int = 512 * 1024" in m.group(1)
 
 
+LOGS_METHODS = {"logs.size", "logs.page", "logs.clear", "logs.move", "logs.trash", "logs.untrash", "logs.purge"}
+
+
 def _dart_invoked_methods(dart: str, class_name: str) -> set[str]:
     m = re.search(rf"\bclass\s+{class_name}\b[^{{]*\{{", dart)
     assert m, f"{class_name} not found in the Dart sources"
@@ -1140,6 +1144,11 @@ def test_dart_kotlin_method_channels_agree() -> None:
         assert called <= handled, f"{dart_class} calls {sorted(called - handled)} but Kotlin only handles {sorted(handled)}"
         assert f"MethodChannel('{channel}')" in dart.replace('"', "'"), channel
         assert f'"{channel}"' in kt, channel
+        if dart_class == "BayanPythonRuntime":
+            # 2.5D1: the persistent-log methods must exist on both sides, under exactly these names
+            assert LOGS_METHODS <= called, f"Dart is missing wrappers for {sorted(LOGS_METHODS - called)}"
+            assert LOGS_METHODS <= handled, f"Kotlin is missing branches for {sorted(LOGS_METHODS - handled)}"
+            assert {m for m in called if m.startswith("logs.")} == LOGS_METHODS
 
 
 def test_dart_sources_are_balanced() -> None:
@@ -1170,6 +1179,416 @@ def test_dart_permissions_screen_wiring() -> None:
     # every icon used must be one Flutter ships (spot check of the new ones)
     for icon in ("Icons.verified_user_outlined", "Icons.notifications_none", "Icons.battery_charging_full", "Icons.play_circle_outline"):
         assert icon in main, icon
+
+
+def test_sessions_plan_2_1g_invariants() -> None:
+    """Plan 2.1G: sessions outlive the output screen, keyed by script path, numbered, bounded."""
+    kt = KOTLIN.read_text(encoding="utf-8")
+    rt = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+    runner = (ROOT / "script_runner.dart").read_text(encoding="utf-8")
+    main_dart = (ROOT / "main.dart").read_text(encoding="utf-8")
+
+    handled = _kotlin_when_methods(kt, "BayanPythonBridge")
+    for method in ("runs.list", "runs.attach", "runs.stopAll", "runs.move", "runs.discard"):
+        assert method in handled, method
+    for dart_fn in ("runsList", "runsAttach", "runsStopAll", "runsMove", "runsDiscard"):
+        assert dart_fn in rt, dart_fn
+    assert "'textHash'" in rt and "textHash" in runner
+
+    assert "replayActiveRuns" not in kt, "events come from runs.attach only (no double replay)"
+    assert "sessions.clear()" not in kt and "sessions.remove(runId)" not in kt
+    assert "sessions[scriptPath] = session" in kt, "sessions are keyed by the script path"
+    assert "MAX_FINISHED_RUNS = 10" in kt
+    assert '"seq" to' in kt and '"scriptPath" to scriptPath' in kt
+    stop_all = _kotlin_function_body(kt, "stopAll")
+    assert "!it.finished" in stop_all, "stopAll must not touch finished sessions"
+
+    dispose = re.search(r"Future<void> dispose\(\) async \{(.*?)\n  \}\n", runner, re.S)
+    assert dispose and "stop(" not in dispose.group(1), "leaving the output screen must not stop the script"
+    assert "class RunHub" in runner and "class RunSlot" in runner
+    assert "إيقاف والانتقال" not in main_dart
+    assert "attachRunId:" in main_dart and "claimRunSlot(" in main_dart
+
+
+# ---------------------------------------------------------------------------
+# Plan 2.2G: output screen, editor button, tiles, rename/delete (cheap text guards)
+# ---------------------------------------------------------------------------
+def _dart_block(src: str, header: str) -> str:
+    """Body of the first function-body {...} after `header`.
+
+    Braces inside the parameter list (named parameters like `{bool x = true}`) are skipped:
+    the body starts at the first `{` found outside any parentheses. Brace matching is enough
+    for our sources (string interpolations are balanced).
+    """
+    start = src.index(header)
+    paren = 0
+    open_at = -1
+    for j in range(start, len(src)):
+        ch = src[j]
+        if ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren -= 1
+        elif ch == "{" and paren == 0:
+            open_at = j
+            break
+    assert open_at >= 0, f"no body after {header!r}"
+    depth = 0
+    for j in range(open_at, len(src)):
+        ch = src[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return src[open_at + 1 : j]
+    raise AssertionError(f"unbalanced block after {header!r}")
+
+
+def _fnv_fingerprint(text: str, *, signed: bool = False) -> str:
+    """Python mirror of textFingerprint() in script_runner.dart (FNV-1a 64 + length)."""
+    data = text.encode("utf-8")
+    h = 0xCBF29CE484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    if signed and h >= 1 << 63:  # Dart ints are signed 64-bit: same bits, negative value
+        h -= 1 << 64
+    return f"{len(data)}-{((h >> 32) & 0xFFFFFFFF):08x}{(h & 0xFFFFFFFF):08x}"
+
+
+def test_plan_2_2g_fingerprint_matches_dart_source() -> None:
+    runner = (ROOT / "script_runner.dart").read_text(encoding="utf-8")
+    body = _dart_block(runner, "String textFingerprint(String text)")
+    assert "0xcbf29ce484222325" in body and "0x100000001b3" in body, "standard FNV-1a 64 constants"
+    assert "utf8.encode(text)" in body and "bytes.length" in body
+    assert "toRadixString(16)" in body and "padLeft(8, '0')" in body, "hex from two 32-bit halves (no minus sign)"
+    assert "sha" not in runner.lower().split("class scriptrunner")[0], "no SHA/crypto dependency"
+    # published FNV-1a 64 test vectors
+    assert _fnv_fingerprint("a") == "1-af63dc4c8601ec8c"
+    assert _fnv_fingerprint("foobar") == "6-85944171f73967e8"
+    assert _fnv_fingerprint("") == "0-cbf29ce484222325"
+    # Dart's signed arithmetic must format identically (no '-' from negative values)
+    for text in ("", "a", "print('بيان')\n", "x = 1\r\ny = 2", "é" * 300, "سطر\n" * 500):
+        assert _fnv_fingerprint(text) == _fnv_fingerprint(text, signed=True)
+        assert "-" not in _fnv_fingerprint(text).split("-", 1)[1]
+    # one character apart -> different, and reverting -> equal again
+    base = "while True:\n    print(1)\n"
+    assert _fnv_fingerprint(base) != _fnv_fingerprint(base + " ")
+    assert _fnv_fingerprint(base) == _fnv_fingerprint("while True:\n    print(1)\n")
+
+
+def test_plan_2_2g_started_event_carries_text_hash() -> None:
+    """Without this the editor shows «تشغيل» right after a run until runs.list is re-read."""
+    kt = KOTLIN.read_text(encoding="utf-8")
+    rt = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+    runner = (ROOT / "script_runner.dart").read_text(encoding="utf-8")
+    run_branch = kt[kt.index('"run" -> {') : kt.index('"sendInput" -> {')]
+    assert 'call.argument<String>("textHash")' in run_branch
+    started = run_branch[run_branch.index('"type" to "started"') :][:400]
+    assert '"textHash" to textHash' in started, "started event must include the fingerprint"
+    assert "String? get textHash" in rt
+    on_event = _dart_block(runner, "void _onEvent(BayanEvent e)")
+    assert "textHash: e.textHash" in on_event
+
+
+def test_plan_2_2g_output_screen_keeps_script_alive() -> None:
+    main_dart = (ROOT / "main.dart").read_text(encoding="utf-8")
+    runner = (ROOT / "script_runner.dart").read_text(encoding="utf-8")
+    assert "final String? attachRunId;" in main_dart and "attach: true" not in main_dart
+    enter = _dart_block(main_dart, "Future<void> _enterSession(String runId)")
+    assert "_runner.attach(runId)" in enter and "_runner.start(" not in enter, "enter mode never starts a script"
+    assert "الأقدم غير متوفر في الذاكرة" in main_dart
+    out_state = main_dart[main_dart.index("class _OutputScreenState") :]
+    out_dispose = _dart_block(out_state, "void dispose()")
+    out_build = _dart_block(out_state, "Widget build(BuildContext context)")
+    for name, body in (("dispose", out_dispose), ("build/back", out_build)):
+        assert "stop(" not in body and "_stop" not in body and "runsStopAll" not in body, f"{name} must not stop the script"
+    assert "onBack: () => Navigator.pop(context)" in out_build
+    # tapping an error frame goes straight to the editor (no confirmation dialog)
+    assert "showDialog" not in _dart_block(out_state, "Future<void> _openFrame(FrameRef frame)")
+    assert "إيقاف والانتقال" not in main_dart
+    # «آخر تشغيل» is recorded by RunHub only (even with the output screen closed)
+    assert "markRun" not in main_dart and "store.markRun" in runner
+
+
+def test_plan_2_2g_editor_button_and_run_gate() -> None:
+    main_dart = (ROOT / "main.dart").read_text(encoding="utf-8")
+    editor = main_dart[main_dart.index("class _ScriptScreenState") : main_dart.index("class Line {")]
+    assert "Duration(milliseconds: 300)" in _dart_block(editor, "void _scheduleHash()")
+    assert "_scheduleHash();" in _dart_block(editor, "void _onChanged()")
+    assert "_hashTimer?.cancel();" in _dart_block(editor, "void dispose()")
+    enter = _dart_block(editor, "RunInfo? _enterableRun()")
+    assert "textHash" in enter and "_hashValue == saved" in enter
+    open_output = _dart_block(editor, "Future<void> _openOutput()")
+    assert open_output.index("_refreshHash();") < open_output.index("_enterableRun()"), "decide on the current text"
+    assert "attachRunId: session.runId" in open_output and "claimRunSlot(context, widget.script)" in open_output
+    assert "_canEnter ? 'دخول' : 'تشغيل'" in editor
+    gate = _dart_block(main_dart, "Future<bool> claimRunSlot(")
+    assert "إيقاف النسخة القديمة وتشغيل الجديدة؟" in gate and "سكربت آخر يعمل" in gate
+    assert "confirmOwnOldRun" in gate
+    restart = _dart_block(main_dart, "Future<void> _restart()")
+    assert "confirmOwnOldRun: false" in restart, "the restart button already is the user's decision to stop"
+
+
+def test_plan_2_2g_tiles_and_management() -> None:
+    main_dart = (ROOT / "main.dart").read_text(encoding="utf-8")
+    store = (ROOT / "store.dart").read_text(encoding="utf-8")
+    tile = main_dart[main_dart.index("class ScriptTile") : main_dart.index("String fmtElapsed")]
+    for text in ("يعمل منذ", "ينتظر إدخال", "انتهى بكود", "آخر تشغيل:", "valueListenable: runHub.clock"):
+        assert text in tile, text
+    dot = _dart_block(main_dart, "static Color colorOf(RunStatus? s)")
+    assert re.search(r"RunStatus\.running:\s*return C\.ok", dot)
+    assert re.search(r"RunStatus\.waiting:\s*return C\.warn", dot)
+    assert re.search(r"RunStatus\.error:\s*return C\.error", dot)
+    guard = _dart_block(main_dart, "bool _blockedWhileRunning(")
+    assert "أوقف السكربت أولًا" in guard and "isLive" in guard
+    rename = _dart_block(main_dart, "Future<void> renameScript(")
+    delete = _dart_block(main_dart, "Future<void> deleteScript(")
+    dup = _dart_block(main_dart, "Future<void> duplicateScript(")
+    assert rename.lstrip().startswith("if (_blockedWhileRunning(context, s)) return;")
+    assert delete.lstrip().startswith("if (_blockedWhileRunning(context, s)) return;")
+    assert "runHub.moved(oldPath, r.path)" in rename and "runHub.discarded(deletedPath)" in delete
+    # re-checked after the name dialog (a run could start meanwhile), before touching the file
+    assert rename.count("_blockedWhileRunning(context, s)") == 2
+    assert rename.index("_blockedWhileRunning(context, s)", 60) < rename.index("store.rename(")
+    assert rename.rindex("_blockedWhileRunning(context, s)") < rename.index("store.rename(")
+    assert "runHub" not in dup, "duplicating never copies a session"
+    assert "runHub" not in store and "RunHub" not in store, "store.dart is not part of this build"
+
+
+def test_plan_2_2g_kotlin_run_does_not_wipe_sessions() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    run_branch = kt[kt.index('"run" -> {') : kt.index('"sendInput" -> {')]
+    assert "clear()" not in run_branch and ".remove(" not in run_branch, "starting a script keeps other sessions"
+    assert "sessions[scriptPath] = session" in run_branch
+    assert "MAX_FINISHED_RUNS = 10" in kt
+
+
+# ---------------------------------------------------------------------------
+# 2.5D1: persistent output log (LogStore)
+# ---------------------------------------------------------------------------
+LOGS_SIGNATURES = {
+    "logs.size": {"scriptPath"},
+    "logs.page": {"scriptPath", "before", "maxBytes", "epoch"},
+    "logs.clear": {"scriptPath"},
+    "logs.move": {"from", "to"},
+    "logs.trash": {"scriptPath"},
+    "logs.untrash": {"scriptPath", "restoreAs"},
+    "logs.purge": {"scriptPath"},
+}
+FILE_API_TOKENS = ("FileOutputStream", "FileInputStream", "RandomAccessFile", "renameTo", "ByteArrayOutputStream", "listFiles", "appendText", "readBytes", "writeBytes")
+
+
+def _logstore_source(kt: str) -> str:
+    start = kt.index("class LogStore(")
+    return kt[start : kt.index("class BayanPythonBridge private constructor")]
+
+
+def _kotlin_branch(kt: str, method: str) -> str:
+    start = kt.index(f'"{method}" -> {{')
+    nxt = [kt.index(m, start + 1) for m in ('            "logs.', '            "packages.list"', "            else ->") if m in kt[start + 1 :]]
+    return kt[start : min(nxt)] if nxt else kt[start:]
+
+
+def test_logs_channel_signatures_match_between_dart_and_kotlin() -> None:
+    """Same method names AND same argument names on both sides (2.5D2 builds on these exact signatures)."""
+    kt = KOTLIN.read_text(encoding="utf-8")
+    dart = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+    assert set(LOGS_SIGNATURES) == LOGS_METHODS
+    for method, expected in LOGS_SIGNATURES.items():
+        branch = _kotlin_branch(kt, method)
+        kt_args = set(re.findall(r'call\.argument<\w+>\("(\w+)"\)', branch))
+        assert kt_args == expected, f"{method}: Kotlin reads {sorted(kt_args)}, expected {sorted(expected)}"
+
+        at = dart.index(f"'{method}'")
+        body = dart[at : dart.index("\n  }\n", at)]
+        dart_args = set(re.findall(r"'(\w+)':", body))
+        assert dart_args == expected, f"{method}: Dart sends {sorted(dart_args)}, expected {sorted(expected)}"
+    # logs.page reply fields are read by LogPage.fromJson under the same names
+    page_branch = _logstore_source(kt)
+    for field in ("text", "start", "end", "size", "hasMore", "epoch", "stale"):
+        assert f'"{field}" to' in page_branch, f"Kotlin does not send {field}"
+        assert f"'{field}'" in dart[dart.index("class LogPage") : dart.index("class BayanPythonRuntime")], f"LogPage does not read {field}"
+
+
+def test_log_disk_work_is_off_the_main_thread() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    store = _logstore_source(kt)
+
+    # one background writer thread owns every file operation
+    assert "Executors.newSingleThreadScheduledExecutor" in store
+    assert '"Bayan-LogWriter"' in store and "isDaemon = true" in store
+
+    # the entry points called from the main thread only queue in memory
+    for fn in ("enqueue", "addEvent", "startRun", "endRun", "record"):
+        body = _kotlin_function_body(store, fn)
+        for token in FILE_API_TOKENS + ("File(", ".delete(", ".exists(", ".length()", ".mkdirs("):
+            assert token not in body, f"LogStore.{fn} runs on the caller's thread and must not touch files ({token})"
+
+    # every public file operation goes through the writer thread (io { ... })
+    for fn in ("size", "page", "clear", "move", "trash", "untrash", "purge"):
+        m = re.search(rf"\bfun\s+{fn}\s*\(", store)
+        assert m, fn
+        assert "io(ok, err)" in store[m.start() : m.start() + 600], f"LogStore.{fn} must run through io(...)"
+    io_at = store.index("private fun <T> io(")
+    io_body = store[io_at : io_at + 700]
+    assert "worker.execute" in io_body
+    assert "flushPending()" in io_body, "readers must see the newest events"
+
+    # nothing outside LogStore (the bridge, the service, MainActivity) opens or writes log files itself
+    outside = re.sub(r"^import .*$", "", kt.replace(store, ""), flags=re.M)
+    for token in FILE_API_TOKENS:
+        assert token not in outside, f"{token} used outside LogStore"
+
+    # the bridge only calls the asynchronous API: result is delivered through complete()/fail()
+    for method in LOGS_METHODS:
+        branch = _kotlin_branch(kt, method)
+        assert re.search(r"logs\.\w+\(", branch), method
+        assert "complete(result, it)" in branch and "fail(result," in branch, method
+
+
+def test_log_file_key_is_the_script_key_used_for_pins_and_last_run() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    store = _logstore_source(kt)
+    st = (ROOT / "store.dart").read_text(encoding="utf-8")
+    dart = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+
+    # store.dart: pins and last-run are keyed by the lower-cased file name
+    assert "String _base(String path) => path.substring(path.lastIndexOf('/') + 1);" in st
+    assert len(re.findall(r"_base\(\w+\.path\)\.toLowerCase\(\)", st)) >= 3
+    assert "s.name.toLowerCase()" in st
+    # LogStore: the same derivation, in one place
+    assert "fun keyOf(scriptPath: String): String = scriptPath.substringAfterLast('/').lowercase()" in store
+    # every entry point derives its key with keyOf (no second scheme)
+    assert store.count("keyOf(") >= 12
+    # file name = key + ".jsonl" (and ".trash" / ".tmp" are suffixes of that name)
+    assert 'const val FILE_EXT = ".jsonl"' in store and "return safe + FILE_EXT" in store
+    assert "fileNameOf(key) + TRASH_EXT" in store
+    # logs live in the app's internal files dir under /logs, not inside "Bayan 777"
+    assert 'File(context.filesDir, "logs")' in kt
+    assert "Bayan 777" not in store
+    # Dart never builds log file names
+    assert ".jsonl" not in dart
+
+
+def test_log_format_and_limits_match_the_spec() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    store = _logstore_source(kt)
+    for const in (
+        "MAX_BYTES = 20L * 1024 * 1024",
+        "TARGET_BYTES = 16L * 1024 * 1024",
+        "FLUSH_BYTES = 32 * 1024",
+        "FLUSH_DELAY_MS = 1000L",
+        'TRIM_NOTE = "… حُذف الأقدم"',
+        'TRASH_EXT = ".trash"',
+    ):
+        assert const in store, const
+    # the three line shapes, with their exact field names
+    assert 'START_PREFIX = "{\\"run\\":"' in store
+    assert '"\\",\\"start\\":"' in store and '",\\"auto\\":"' in store
+    assert '"{\\"t\\":"' in store and '",\\"k\\":\\""' in store and '",\\"s\\":\\""' in store
+    assert '"{\\"end\\":\\""' in store and '"\\",\\"t\\":"' in store and '",\\"code\\":"' in store
+    # event kinds
+    record = _kotlin_function_body(store, "record")
+    for needle in ('"stdout" -> addEvent(scriptPath, t, "o", text)', '"stderr", "error" -> addEvent(scriptPath, t, "e", text)', '"input" -> addEvent(scriptPath, t, "i", text)', '"started" ->', '"exit" ->'):
+        assert needle in record, needle
+    assert '"auto"' not in record and "startRun(scriptPath, runId, startedAt, false)" in record, "auto is for build 3 only"
+    # lone surrogates survive the JSON round trip; control characters are escaped
+    assert "Character.isHighSurrogate" in store and "Character.isLowSurrogate" in store and "appendUnicodeEscape" in store
+    # append-only: the start line is never rewritten when the run ends
+    assert "FileOutputStream(file, true)" in store
+    # trimming keeps whole lines and writes a replacement file, never edits in place
+    trim = _kotlin_function_body(store, "trimNow")
+    assert "'\\n'" in trim and "tempFor(key)" in trim and "renameTo" in trim and "TRIM_NOTE" in trim
+    assert "act.startLine" in trim, "the running run keeps its start line when its oldest lines are cut"
+    # reading: chunks from the end, never the whole file
+    page = _kotlin_function_body(store, "pageNow")
+    assert "readFully" in page and "readText" not in store and "readBytes" not in store
+    # a line longer than the window must widen it (never return an empty chunk that leaves `before` unchanged)
+    assert "for (i in 0 until bytes.size - 1)" in page and "window *= 2" in page
+    # duplicates: one end line per run, and the pending buffer is flushed on run end
+    assert "current.runId != item.runId" in store
+    assert "worker.execute { flushPending() }" in _kotlin_function_body(store, "endRun")
+
+
+def test_log_untrash_can_restore_to_conflict_free_restored_name() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    dart = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+    store = _logstore_source(kt)
+    body = _kotlin_function_body(store, "untrashNow")
+    assert "trashFor(key)" in body and "fileFor(restoreKey)" in body
+    assert "if (!held.exists() || file.exists()) return false" in body
+    assert 'call.argument<String>("restoreAs")' in _kotlin_branch(kt, "logs.untrash")
+    assert "'restoreAs': restoreAs" in dart
+
+
+def test_bridge_logs_every_event_once_and_independently_of_the_ui() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    emit = _kotlin_function_body(kt, "emit")
+    # the single recording point sits in the same main-thread block that numbers and stores events,
+    # before (and regardless of) delivery to the UI sink
+    assert kt.count("logs.record(") == 1 and "logs.record(" in emit
+    assert emit.index("session.ring.add(out)") < emit.index("logs.record(") < emit.index("eventSink?.success(out)")
+    assert "val now = System.currentTimeMillis()" in emit
+    # the in-memory store from 2C is untouched
+    assert "val ring = EventRing()" in kt and "session.ring.add(out)" in emit and "fun snapshot()" in kt
+    # typed input is logged as typed, before any later output
+    send = kt[kt.index('"sendInput" -> {') : kt.index('"stop" -> {')]
+    assert 'logs.addEvent(session.scriptPath, System.currentTimeMillis(), "i", value)' in send
+    assert send.index("session.input.offer(value)") < send.index("logs.addEvent(")
+    # end-of-run safety net is posted (keeps its order behind queued events); duplicates are dropped by LogStore
+    run = kt[kt.index('"run" -> {') : kt.index('"sendInput" -> {')]
+    assert "logs.endRun(session.scriptPath, runId" in run and "main.post {" in run
+    # the store is created with the bridge (it outlives MainActivity) and cleans leftovers at start
+    assert re.search(r'private val logs = LogStore\(File\(context\.filesDir, "logs"\)\)\.also \{ it\.start\(\) \}', kt)
+    start = _kotlin_function_body(_logstore_source(kt), "start")
+    assert "TRASH_EXT" in start and "TEMP_EXT" in start and "try {" in start and "catch (t: Throwable)" in start
+    assert "FILE_EXT" not in start, "regular logs must never be deleted at startup"
+    # MainActivity itself still only attaches/detaches
+    activity = kt[kt.index("class MainActivity") : kt.index("class EventRing")]
+    assert "logs" not in activity
+
+
+def test_plan_2d_log_screen_and_lifecycle_wiring() -> None:
+    """2D exposes the persisted log and keeps it aligned with rename/delete/undo."""
+    main = (ROOT / "main.dart").read_text(encoding="utf-8")
+    runtime = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+    assert "class LogScreen extends StatefulWidget" in main
+    assert "LogScreen(script: s)" in main and "label: 'سجل الإخراج'" in main
+    for needle in ("logsSize", "logsPage", "logsClear", "logsMove", "logsTrash", "logsUntrash", "logsPurge"):
+        assert needle in runtime, f"missing Dart logs wrapper: {needle}"
+    assert "bayanPython.logsMove(from: oldPath, to: r.path)" in main
+    assert "bayanPython.logsTrash(deletedPath)" in main
+    assert "bayanPython.logsUntrash(" in main and "restoreAs: r.path" in main
+    assert "controller.closed.then" in main and "bayanPython.logsPurge(deletedPath)" in main
+    assert "if (!logRestored)" in main, "failed log restore must clean up the temporary trash log"
+    assert "تمت استعادة الملف لكن تعذّر استعادة سجل الإخراج" in main
+    assert "تعذّرت استعادة الملف" in main, "log failure must not be misreported as file-restore failure"
+    assert "مسح الشاشة" in main and "مسح السجل" in main
+    assert "SelectionArea(" in main and "arSelectionContextMenu" in main
+    assert "appendOutputEventLines(_lines, text, kind)" in main
+    assert "_copyLimit = 400000" in main and "maxBytes: 1024 * 1024" in main
+
+
+def test_fixes_md_documents_build_2_5d1() -> None:
+    fixes = (ROOT / "FIXES.md").read_text(encoding="utf-8")
+    assert "# البناء 2.5D1" in fixes
+    for needle in ("LogStore", "logs.page", "JSONL", "Bayan-LogWriter", "نتائج الفحوص وقت مرحلة 2.5D1"):
+        assert needle in fixes, needle
+
+
+def test_fixes_md_documents_build_2d() -> None:
+    fixes = (ROOT / "FIXES.md").read_text(encoding="utf-8")
+    assert "# البناء 2د" in fixes
+    for needle in ("LogScreen", "400,000", "20 MB", "مسح الشاشة", "SelectionArea", "قتل التطبيق"):
+        assert needle in fixes, needle
+
+
+def test_fixes_md_documents_build_2c() -> None:
+    fixes = (ROOT / "FIXES.md").read_text(encoding="utf-8")
+    assert "# البناء 2ج" in fixes
+    for needle in ("attachRunId", "textHash", "أوقف السكربت أولًا", "FNV"):
+        assert needle in fixes, needle
 
 
 def main() -> None:

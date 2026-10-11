@@ -197,6 +197,8 @@ def write_proguard_rules(app_dir: Path) -> None:
 -keep class {APP_PACKAGE}.BayanScriptService {{ *; }}
 -keep class {APP_PACKAGE}.BayanSystem {{ *; }}
 -keep class {APP_PACKAGE}.EventRing {{ *; }}
+-keep class {APP_PACKAGE}.LogStore {{ *; }}
+-keep class {APP_PACKAGE}.LogStore$* {{ *; }}
 -keepattributes InnerClasses,EnclosingMethod,Signature,*Annotation*
 -keep class com.chaquo.python.** {{ *; }}
 -dontwarn com.chaquo.python.**
