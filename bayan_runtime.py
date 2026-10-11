@@ -509,10 +509,15 @@ def _join_user_threads(before: set, callback: Any) -> None:
             for t in threading.enumerate()
             if t is not me and t not in before and not t.daemon and t.is_alive()
         ]
-        if not alive:
-            return
+        # Ask about Stop AFTER listing the threads and BEFORE returning. A thread that
+        # dies because Stop was pressed (StopRequested) can vanish between two polls;
+        # with the old order the list came back empty and the run ended with 0
+        # instead of 130. The flag never goes back to False during a run, so if a
+        # thread died because of Stop, this poll is guaranteed to see it.
         if _should_stop(callback):
             raise StopRequested()
+        if not alive:
+            return
         alive[0].join(0.1)
 
 
