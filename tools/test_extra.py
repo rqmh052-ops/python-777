@@ -330,6 +330,7 @@ class RunCb:
     def requestInput(self, prompt): return self.inputs.pop(0) if self.inputs else ""
     def emitState(self, state): self.events.append(("state", state))
     def emitExit(self, code): self.events.append(("exit", code))
+    def emitMissing(self, payload): self.events.append(("missing", payload))
 
 
 def run(source: str, cb: RunCb, root: Path, name: str = "t.py") -> int:
@@ -591,6 +592,143 @@ def test_script_environment_details() -> None:
         assert run(script, cb, root) == 0
         time.sleep(0.3)
         assert not [th for th in threading.enumerate() if th.name == "bayan-daemon-test"], "daemon thread outlived the run"
+
+
+# ---------------------------------------------------------------------------
+# 6. Missing-library cards (F2), availability check, progress events (F3)
+# ---------------------------------------------------------------------------
+def test_required_lists_match_kotlin_and_verify() -> None:
+    """A callback Python needs must exist in Kotlin AND be checked after R8 (verify_apk)."""
+    kt = KOTLIN.read_text(encoding="utf-8")
+    run_methods = kotlin_class_methods(kt, "RunCallback")
+    pkg_methods = kotlin_class_methods(kt, "PackageCallback")
+    verify = _load_tool("verify_apk")
+    for name in mod._RUN_CALLBACK_REQUIRED:
+        assert name in run_methods, f"RunCallback.{name} missing in MainActivity.kt"
+        assert name in verify.REQUIRED, f"{name} missing from tools/verify_apk.py REQUIRED"
+    for name in mod._PACKAGE_CALLBACK_REQUIRED:
+        assert name in pkg_methods, f"PackageCallback.{name} missing in MainActivity.kt"
+        assert name in verify.REQUIRED, f"{name} missing from tools/verify_apk.py REQUIRED"
+    rules = (ROOT / "tools" / "prepare_android.py").read_text(encoding="utf-8")
+    assert "BayanPythonBridge$*" in rules, "proguard rule must cover the inner callback classes"
+
+
+def test_import_name_to_package_name() -> None:
+    table = {
+        "cv2": "opencv-python", "PIL": "Pillow", "bs4": "beautifulsoup4", "yaml": "PyYAML",
+        "telegram": "python-telegram-bot", "telebot": "pyTelegramBotAPI", "dotenv": "python-dotenv",
+        "sklearn": "scikit-learn", "dateutil": "python-dateutil", "Crypto": "pycryptodome",
+        "serial": "pyserial", "jwt": "PyJWT",
+    }
+    assert mod._IMPORT_TO_DIST == table
+
+
+def _missing_of(source: str, root: Path, files: dict[str, str] | None = None) -> tuple[int, list[dict], str]:
+    for name, text in (files or {}).items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    cb = RunCb()
+    code = run(source, cb, root, "main script.py")
+    payloads = [json.loads(v) for k, v in cb.events if k == "missing"]
+    err = "".join(t for k, t in cb.out if k == "stderr")
+    return code, (payloads[0] if payloads else []), err
+
+
+def test_missing_libraries_cards() -> None:
+    with tempfile.TemporaryDirectory(prefix="bayan-missing-") as td:
+        root = Path(td) / "مجلد بمسافات"
+        root.mkdir()
+        mod.configure(str(Path(td) / "env"))
+        # an import name whose PyPI name differs (like cv2 -> opencv-python), with a fake name
+        # so the test does not depend on what happens to be installed in this Python
+        mod._IMPORT_TO_DIST["zzbayan_mapped"] = "zz-mapped-dist"
+
+        # three missing libraries at once, the failing one first; stdlib, local files,
+        # relative imports and try/except ImportError (that did not fail) are ignored
+        source = (
+            "import os, json\n"
+            "import helper_local\n"
+            "import zzbayan_alpha.sub\n"
+            "from zzbayan_beta import thing\n"
+            "try:\n"
+            "    import zzbayan_optional\n"
+            "except ImportError:\n"
+            "    zzbayan_optional = None\n"
+            "import zzbayan_mapped\n"
+            "from . import sibling\n"
+        )
+        code, missing, err = _missing_of(source, root, {"helper_local.py": "X = 1\n"})
+        assert code == 1 and "ModuleNotFoundError" in err, err
+        names = [m["package"] for m in missing]
+        assert names[0] == "zzbayan_alpha" and missing[0]["failed"] is True, missing
+        assert set(names) == {"zzbayan_alpha", "zzbayan_beta", "zz-mapped-dist"}, missing
+        assert next(m for m in missing if m["package"] == "zz-mapped-dist")["module"] == "zzbayan_mapped"
+        assert all(m["failed"] is False for m in missing[1:])
+
+        # an optional import that IS the one that failed is shown
+        code, missing, _ = _missing_of(
+            "try:\n    import zzbayan_gamma\nexcept ImportError:\n    raise\n", root
+        )
+        assert [m["package"] for m in missing] == ["zzbayan_gamma"], missing
+
+        # other errors never produce cards, and neither does a clean run
+        cb = RunCb()
+        run("raise ValueError('x')\n", cb, root, "other.py")
+        assert not [1 for k, _ in cb.events if k == "missing"]
+        cb = RunCb()
+        run("print('ok')\n", cb, root, "clean.py")
+        assert not [1 for k, _ in cb.events if k == "missing"]
+
+        # a missing submodule of an importable library is not a missing library
+        (root / "pkgdir").mkdir(exist_ok=True)
+        (root / "pkgdir" / "__init__.py").write_text("", encoding="utf-8")
+        cb = RunCb()
+        run("import pkgdir.nothing_here\n", cb, root, "sub.py")
+        assert not [1 for k, _ in cb.events if k == "missing"]
+        mod._IMPORT_TO_DIST.pop("zzbayan_mapped", None)
+
+
+def test_availability_check() -> None:
+    saved = (mod._latest_compatible_for, mod._chaquopy_wheel)
+    try:
+        def fake(name: str):
+            if name == "good":
+                return {"version": "1.0", "size": 5, "compatible": True}
+            if name == "native-only":
+                return {"version": None, "size": 0, "compatible": False}
+            if name == "ghost":
+                raise ValueError("not found")
+            raise RuntimeError("offline")
+
+        mod._latest_compatible_for = fake
+        mod._chaquopy_wheel = lambda name, *a, **k: None
+        res = {r["name"]: r for r in json.loads(mod.check_availability(json.dumps(["good", "native-only", "ghost", "net", "good"])))}
+        assert set(res) == {"good", "native-only", "ghost", "net"}
+        assert res["good"]["available"] is True and res["good"]["version"] == "1.0"
+        assert res["native-only"]["available"] is False and res["native-only"]["reason"]
+        assert res["ghost"]["available"] is False
+        assert res["net"]["available"] is None, "a network error must not claim the library is unavailable"
+        assert mod.check_availability("not json") == "[]"
+    finally:
+        mod._latest_compatible_for, mod._chaquopy_wheel = saved
+
+
+def test_wheel_events_for_progress_bar() -> None:
+    def body(root: Path) -> None:
+        w = write_wheel(root, "evt-lib", "1.0.0", {"evt_lib/__init__.py": "V = 1\n"})
+        info = file_info(w)
+        info["size"] = w.stat().st_size
+        cb = Cb()
+        res = install("evt-lib", {"evt-lib": {"releases": {"1.0.0": [info]}}}, cb)
+        assert res["ok"] is True, res
+        stages = [e[0] for e in cb.events]
+        assert "wheel" in stages or "wheel_cached" in stages, stages
+        first = next(e for e in cb.events if e[0] in ("wheel", "wheel_cached"))
+        assert first[1] == info["size"], first
+        assert stages.index(first[0]) < stages.index("dependencies") < stages.index("done")
+
+    with_env(body)
 
 
 def main() -> None:

@@ -21,6 +21,7 @@ REQUIRED = [
     "emitInput",
     "emitExit",
     "emitError",
+    "emitMissing",
     "requestInput",
     "shouldStop",
     "BayanPythonBridge$RunCallback",

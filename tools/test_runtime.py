@@ -46,6 +46,9 @@ class Callback:
     def emitExit(self, code: int) -> None:
         self.events.append(("exit", code))
 
+    def emitMissing(self, payload: str) -> None:
+        self.events.append(("missing", payload))
+
     def emitPackage(self, *values) -> None:
         self.events.append(("package", *values))
 
