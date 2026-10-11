@@ -142,7 +142,7 @@ def main() -> None:
         assert ("exit", 130) in loop_cb.events
 
         # Build three tiny real wheels and test dependency resolution, cache,
-        # repeated installation, and independent removal.
+        # repeated installation, and removal with its orphaned companions.
         dep_wheel = make_wheel(root, "bayan-dep", "1.2.0", "VALUE=7\n")
         root_wheel_v1 = make_wheel(
             root,
@@ -187,10 +187,13 @@ def main() -> None:
             assert mod._installed_version("bayan-root") == "1.0.0"
             install_site_module_check(env, "bayan_root", 42)
 
+            # The dependency was only pulled in for bayan-root, so it goes with it
+            # (a companion that something else needs is covered in test_extra.py).
             removed = json.loads(mod.remove_package("bayan-root"))
             assert removed["ok"] is True
             assert mod._installed_version("bayan-root") is None
-            assert mod._installed_version("bayan-dep") == "1.2.0"
+            assert mod._installed_version("bayan-dep") is None
+            assert [c["name"] for c in removed["alsoRemoved"]] == ["bayan-dep"], removed
             mod._clear_site_modules()
             sys.modules.pop("bayan_root", None)
             try:

@@ -194,6 +194,9 @@ def write_proguard_rules(app_dir: Path) -> None:
 # renames the classes ("'y0' object has no attribute 'emitState'").
 -keep class {APP_PACKAGE}.BayanPythonBridge {{ *; }}
 -keep class {APP_PACKAGE}.BayanPythonBridge$* {{ *; }}
+-keep class {APP_PACKAGE}.BayanScriptService {{ *; }}
+-keep class {APP_PACKAGE}.BayanSystem {{ *; }}
+-keep class {APP_PACKAGE}.EventRing {{ *; }}
 -keepattributes InnerClasses,EnclosingMethod,Signature,*Annotation*
 -keep class com.chaquo.python.** {{ *; }}
 -dontwarn com.chaquo.python.**
@@ -230,6 +233,72 @@ def report_versions() -> None:
         print(f"  gradle: {m.group(1) if m else '?'}")
 
 
+# العمل في الخلفية (البناء 2ب). كلها أذونات عادية تُمنح تلقائيًا عدا POST_NOTIFICATIONS (أندرويد 13+)
+# التي تُطلب من المستخدم في شاشة الترحيب.
+BACKGROUND_PERMISSIONS = [
+    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>',
+    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>',
+    '<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>',
+    '<uses-permission android:name="android.permission.WAKE_LOCK"/>',
+    '<uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>',
+]
+
+SERVICE_NAME = "BayanScriptService"
+SPECIAL_USE_SUBTYPE = (
+    "Keeps Python scripts that the user started manually (for example Telegram bots) "
+    "running in the background until the user stops them"
+)
+
+
+def service_block() -> str:
+    # الاسم كاملًا (لا ".BayanScriptService") حتى لا يعتمد على namespace الذي يولّده flutter create
+    return f"""
+        <service
+            android:name="{APP_PACKAGE}.{SERVICE_NAME}"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="{SPECIAL_USE_SUBTYPE}" />
+        </service>
+"""
+
+
+def add_script_service(text: str) -> str:
+    """يضيف تعريف الخدمة الأمامية (specialUse) داخل <application>. آمن عند التكرار."""
+    if SERVICE_NAME in text:
+        return text
+    end = text.rfind("</application>")
+    if end < 0:
+        raise RuntimeError("</application> مفقود في AndroidManifest.xml")
+    return text[:end] + service_block() + "    " + text[end:]
+
+
+NOTIFICATION_ICON = """<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M5,7 L11,12 L5,17 M13,17 L19,17"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>
+"""
+
+
+def write_notification_icon(app_dir: Path | None = None) -> Path:
+    """أيقونة إشعار الخدمة (أبيض على شفاف كما يشترط شريط الحالة). يقرؤها الكود بالاسم ic_bayan_notify."""
+    base = app_dir if app_dir is not None else ANDROID / "app"
+    target = base / "src" / "main" / "res" / "drawable" / "ic_bayan_notify.xml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(NOTIFICATION_ICON, encoding="utf-8")
+    return target
+
+
 def patch_manifest() -> None:
     path = ANDROID / "app" / "src" / "main" / "AndroidManifest.xml"
     if not path.exists():
@@ -245,7 +314,7 @@ def patch_manifest() -> None:
         '<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>',
         '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>',
         '<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>',
-    ]
+    ] + BACKGROUND_PERMISSIONS
     missing = [p for p in permissions if p not in text]
     if missing:
         insert = "\n    " + "\n    ".join(missing) + "\n"
@@ -253,6 +322,7 @@ def patch_manifest() -> None:
 
     if "android:requestLegacyExternalStorage=" not in text:
         text = text.replace("<application", '<application android:requestLegacyExternalStorage="true"', 1)
+    text = add_script_service(text)
     path.write_text(text, encoding="utf-8")
 
 
@@ -296,6 +366,7 @@ def main() -> None:
     print_final_app_build()
     report_versions()
     patch_manifest()
+    write_notification_icon()
     install_native_sources()
     print("Bayan Android/Chaquopy configuration prepared successfully")
     print(f"Chaquopy={CHAQUOPY}, Python={PYTHON}, ABI={ABIS}")

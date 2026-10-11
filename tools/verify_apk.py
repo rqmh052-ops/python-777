@@ -26,6 +26,9 @@ REQUIRED = [
     "shouldStop",
     "BayanPythonBridge$RunCallback",
     "BayanPythonBridge$PackageCallback",
+    # البناء 2ب: الخدمة الأمامية وقناة النظام (المانيفست يشير إلى الخدمة بالاسم)
+    "BayanScriptService",
+    "BayanSystem",
 ]
 
 

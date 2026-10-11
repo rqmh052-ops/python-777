@@ -731,6 +731,447 @@ def test_wheel_events_for_progress_bar() -> None:
     with_env(body)
 
 
+# ---------------------------------------------------------------------------
+# Build 2A: tracebacks without Chaquopy noise, companion libraries
+# ---------------------------------------------------------------------------
+def _chaquopy_like(fn_name: str, filename: str, message: str = "No module named 'zzbayan_none'"):
+    """A function whose frame looks like the ones Chaquopy adds to import errors."""
+    ns: dict = {}
+    exec(compile(f"def hook():\n    raise ModuleNotFoundError({message!r}, name='zzbayan_none')\n", filename, "exec"), ns)
+    hook = ns["hook"]
+    hook.__code__ = hook.__code__.replace(co_name=fn_name, co_qualname=fn_name)
+    return hook
+
+
+def _printed_traceback(call) -> str:
+    import io
+
+    buf = io.StringIO()
+    try:
+        call()
+    except BaseException as exc:  # noqa: BLE001 - this is exactly what the runner does
+        mod._print_user_traceback(exc, buf)
+    return buf.getvalue()
+
+
+def test_traceback_hides_chaquopy_frames() -> None:
+    hook = _chaquopy_like("java.chaquopy.import_override", "import.pxi")
+    user = compile("hook()\n", "/data/Bayan 777/ن.py", "exec")
+    text = _printed_traceback(lambda: exec(user, {"hook": hook}))
+    assert "import.pxi" not in text and "java.chaquopy" not in text, text
+    assert 'ن.py", line 1' in text and "ModuleNotFoundError: No module named" in text, text
+
+    # either signal alone is enough (file name OR function name)
+    by_file = _printed_traceback(lambda: exec(user, {"hook": _chaquopy_like("other_name", "/x/y/import.pxi")}))
+    by_name = _printed_traceback(lambda: exec(user, {"hook": _chaquopy_like("java.chaquopy.anything", "other.py")}))
+    # (the printed source line of this very test mentions the names, so look at the frame headers)
+    assert 'import.pxi", line' not in by_file and ", in other_name" not in by_file, by_file
+    assert ", in java.chaquopy" not in by_name and 'other.py", line' not in by_name, by_name
+    assert "ModuleNotFoundError" in by_file and "ModuleNotFoundError" in by_name
+
+    # chained exceptions are cleaned too, and the chain text is kept
+    chained = compile(
+        "try:\n    hook()\nexcept ModuleNotFoundError as e:\n    raise RuntimeError('wrapped') from e\n",
+        "/data/Bayan 777/chain.py", "exec")
+    text = _printed_traceback(lambda: exec(chained, {"hook": hook}))
+    assert "java.chaquopy" not in text and "import.pxi" not in text, text
+    assert "RuntimeError: wrapped" in text and "direct cause" in text, text
+
+    # a user frame in site-packages or a user function with a similar name stays
+    keep = _chaquopy_like("chaquopy_helper", "my_import.pxi_notes.py")
+    text = _printed_traceback(lambda: exec(user, {"hook": keep}))
+    assert ", in chaquopy_helper" in text, text
+
+
+def test_other_errors_keep_their_traceback_exactly() -> None:
+    import io
+    import traceback as tb_module
+
+    def boom() -> None:
+        exec(compile("print(zzbayan_missing_name)\n", "/data/Bayan 777/e.py", "exec"), {})
+
+    caught: BaseException | None = None
+    try:
+        boom()
+    except BaseException as exc:  # noqa: BLE001
+        caught = exc
+    assert caught is not None
+    buf = io.StringIO()
+    mod._print_user_traceback(caught, buf)
+    expected = "".join(tb_module.format_exception(type(caught), caught, caught.__traceback__))
+    assert buf.getvalue() == expected and "NameError" in expected, (buf.getvalue(), expected)
+
+    syntax = _printed_traceback(lambda: compile("x = (\n", "/data/Bayan 777/s.py", "exec"))
+    assert "SyntaxError" in syntax and "s.py" in syntax, syntax
+
+
+def _marker_site_lookup(root: Path, spec: list[tuple[str, str, list[str]]]) -> dict:
+    lookup: dict = {}
+    for name, version, requires in spec:
+        wheel = write_wheel(root, name, version, {f"{name.replace('-', '_')}/__init__.py": "V = 1\n"}, requires)
+        lookup.setdefault(name, {"releases": {}})["releases"][version] = [file_info(wheel)]
+    return lookup
+
+
+def _has_marker(norm: str) -> bool:
+    found = mod._distribution_record(norm)
+    return bool(found and (found[0] / "REQUESTED").is_file())
+
+
+def _packages_by_name() -> dict[str, dict]:
+    return {p["name"]: p for p in mod._current_packages()}
+
+
+def test_requested_marker_and_companion_fields() -> None:
+    def body(root: Path) -> None:
+        lookup = _marker_site_lookup(root, [
+            # the markers/extras below must be ignored, or the plan would ask for names missing from the lookup
+            ("mk-root", "1.0", ["mk-a", "mk-b>=1", 'mk-extra; extra == "socks"', 'mk-win; sys_platform == "win32"']),
+            ("mk-a", "1.0", ["mk-c"]),
+            ("mk-b", "1.0", []),
+            ("mk-c", "1.0", []),
+        ])
+        res = install("mk-root", lookup)
+        assert res["ok"] is True, res
+        assert _has_marker("mk-root")
+        assert not any(_has_marker(n) for n in ("mk-a", "mk-b", "mk-c")), "companions must not be marked"
+        pk = _packages_by_name()
+        assert {n: p["requested"] for n, p in pk.items()} == {"mk-root": True, "mk-a": False, "mk-b": False, "mk-c": False}
+        assert pk["mk-root"]["requires"] == ["mk-a", "mk-b"], pk["mk-root"]
+        assert pk["mk-root"]["requiredBy"] == []
+        assert pk["mk-a"]["requiredBy"] == ["mk-root"] and pk["mk-a"]["requires"] == ["mk-c"]
+        assert pk["mk-c"]["requiredBy"] == ["mk-a"]
+        json.dumps(mod._current_packages())  # the channel carries it as JSON
+
+        # asking for a companion explicitly later makes it a requested library too
+        again = install("mk-a", lookup)
+        assert again["ok"] and again.get("already") is True, again
+        assert _has_marker("mk-a")
+        assert _packages_by_name()["mk-a"]["requested"] is True
+        assert _packages_by_name()["mk-c"]["requested"] is False
+
+    with_env(body)
+
+
+def test_pre_marker_libraries_are_classified_by_dependencies() -> None:
+    def body(root: Path) -> None:
+        lookup = _marker_site_lookup(root, [
+            ("lg-root", "1.0", ["lg-dep"]), ("lg-dep", "1.0", []),
+            ("cy-a", "1.0", ["cy-b"]), ("cy-b", "1.0", ["cy-a"]),
+            ("cy-top", "1.0", ["cy-a"]),
+        ])
+
+        def strip_markers() -> None:
+            for marker in mod._SITE.glob("*.dist-info/REQUESTED"):
+                marker.unlink()
+
+        assert install("lg-root", lookup)["ok"]
+        strip_markers()  # what an install made before this feature looks like
+        pk = _packages_by_name()
+        assert pk["lg-root"]["requested"] is True and pk["lg-dep"]["requested"] is False, pk
+
+        # a dependency cycle nobody else uses must stay visible (and removable)
+        assert install("cy-a", lookup)["ok"]
+        strip_markers()
+        pk = _packages_by_name()
+        assert pk["cy-a"]["requested"] is True and pk["cy-b"]["requested"] is True, pk
+
+        # the same cycle reached from a real root is just companions of that root
+        assert install("cy-top", lookup)["ok"]
+        strip_markers()
+        pk = _packages_by_name()
+        assert pk["cy-top"]["requested"] is True
+        assert pk["cy-a"]["requested"] is False and pk["cy-b"]["requested"] is False, pk
+
+        # a dist-info without METADATA is ignored
+        ghost = mod._SITE / "ghost_lib-1.0.dist-info"
+        ghost.mkdir()
+        (ghost / "RECORD").write_text("", encoding="utf-8")
+        assert "ghost_lib" not in {n.replace("-", "_") for n in _packages_by_name()}
+
+        # removing the root takes the whole cycle with it (no infinite loop)
+        out = json.loads(mod.remove_package("cy-top"))
+        assert out["ok"], out
+        assert {c["name"] for c in out["alsoRemoved"]} == {"cy-a", "cy-b"}, out
+
+    with_env(body)
+
+
+def test_remove_takes_orphaned_companions_only() -> None:
+    def body(root: Path) -> None:
+        lookup = _marker_site_lookup(root, [
+            ("rm-top1", "1.0", ["rm-shared", "rm-only1"]),
+            ("rm-only1", "1.0", ["rm-deep1"]),
+            ("rm-deep1", "1.0", []),
+            ("rm-shared", "1.0", []),
+            ("rm-top2", "1.0", ["rm-shared"]),
+        ])
+        assert install("rm-top1", lookup)["ok"] and install("rm-top2", lookup)["ok"]
+
+        out = json.loads(mod.remove_package("rm-top1"))
+        assert out["ok"], out
+        assert sorted(c["name"] for c in out["alsoRemoved"]) == ["rm-deep1", "rm-only1"], out
+        assert set(_packages_by_name()) == {"rm-top2", "rm-shared"}, "a companion another library needs must stay"
+        assert not (mod._SITE / "rm_only1").exists() and not (mod._SITE / "rm_deep1").exists()
+
+        out = json.loads(mod.remove_package("rm-top2"))
+        assert out["ok"] and [c["name"] for c in out["alsoRemoved"]] == ["rm-shared"], out
+        assert mod._current_packages() == []
+        assert not list(mod._SITE.glob("*.dist-info")), "the marker must not keep a dist-info folder alive"
+
+        missing = json.loads(mod.remove_package("rm-top1"))
+        assert missing["ok"] is False
+
+    with_env(body)
+
+
+def test_explicitly_requested_companion_survives_removal() -> None:
+    def body(root: Path) -> None:
+        lookup = _marker_site_lookup(root, [
+            ("ex-root", "1.0", ["ex-a", "ex-b"]),
+            ("ex-a", "1.0", ["ex-c"]),
+            ("ex-b", "1.0", []),
+            ("ex-c", "1.0", []),
+        ])
+        assert install("ex-root", lookup)["ok"]
+        assert install("ex-a", lookup)["ok"]  # the user asks for ex-a on its own as well
+        out = json.loads(mod.remove_package("ex-root"))
+        assert out["ok"] and [c["name"] for c in out["alsoRemoved"]] == ["ex-b"], out
+        pk = _packages_by_name()
+        assert set(pk) == {"ex-a", "ex-c"}, pk
+        assert pk["ex-a"]["requested"] is True and pk["ex-c"]["requested"] is False
+
+    with_env(body)
+
+
+def test_marker_does_not_outlive_the_library() -> None:
+    def body(root: Path) -> None:
+        lookup = _marker_site_lookup(root, [
+            ("st-root", "1.0", []),
+            ("st-holder", "1.0", ["st-root"]),
+        ])
+        assert install("st-root", lookup)["ok"] and _has_marker("st-root")
+        assert json.loads(mod.remove_package("st-root"))["ok"]
+        assert not list(mod._SITE.glob("*.dist-info/REQUESTED")), "stale marker left behind"
+        # now it only arrives as a companion: it must not look user-requested
+        assert install("st-holder", lookup)["ok"]
+        pk = _packages_by_name()
+        assert pk["st-holder"]["requested"] is True and pk["st-root"]["requested"] is False, pk
+        assert not _has_marker("st-root")
+
+    with_env(body)
+
+
+def test_marker_survives_upgrade_and_failed_upgrade() -> None:
+    def body(root: Path) -> None:
+        bad = write_wheel(root, "up-root", "2.0", {"up_root/__init__.py": "raise RuntimeError('broken')\n"}, ["up-dep>=2"])
+        good_v1 = write_wheel(root, "up-root", "1.0", {"up_root/__init__.py": "V = 1\n"}, ["up-dep<2"])
+        good_v3 = write_wheel(root, "up-root", "3.0", {"up_root/__init__.py": "V = 3\n"}, ["up-dep>=2"])
+        dep1 = write_wheel(root, "up-dep", "1.0", {"up_dep/__init__.py": "V = 1\n"})
+        dep2 = write_wheel(root, "up-dep", "2.0", {"up_dep/__init__.py": "V = 2\n"})
+        lookup = {
+            "up-root": {"releases": {"1.0": [file_info(good_v1)], "2.0": [file_info(bad)], "3.0": [file_info(good_v3)]}},
+            "up-dep": {"releases": {"1.0": [file_info(dep1)], "2.0": [file_info(dep2)]}},
+        }
+        assert install("up-root==1.0", lookup)["ok"]
+        assert _has_marker("up-root") and not _has_marker("up-dep")
+
+        failed = install("up-root==2.0", lookup)  # raises on import -> rolled back
+        assert failed["ok"] is False, failed
+        assert mod._installed_version("up-root") == "1.0"
+        assert _has_marker("up-root"), "rollback must give the marker back"
+        assert not _has_marker("up-dep")
+
+        assert install("up-dep==1.0", lookup)["ok"]  # the user also asks for the dependency itself
+        assert _has_marker("up-dep")
+        assert install("up-root==3.0", lookup)["ok"]
+        assert mod._installed_version("up-root") == "3.0" and mod._installed_version("up-dep") == "2.0"
+        assert _has_marker("up-root") and _has_marker("up-dep"), "upgrades keep the marker"
+
+    with_env(body)
+
+
+def test_kotlin_sends_list_fields_to_dart() -> None:
+    """packages.list now carries arrays (requiresBy/requires); Flutter's codec rejects org.json.JSONArray."""
+    kt = KOTLIN.read_text(encoding="utf-8")
+    assert "is org.json.JSONArray" in kt and "fun jsonValue" in kt, "nested JSON arrays must become Lists"
+    assert "map[key] = jsonValue(obj.opt(key))" in kt
+
+
+# ---------------------------------------------------------------------------
+# 8. Background work and permissions (build 2B)
+# ---------------------------------------------------------------------------
+SAMPLE_MANIFEST = """<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:label="py_runner"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity android:name=".MainActivity" android:exported="true" />
+        <meta-data android:name="flutterEmbedding" android:value="2" />
+    </application>
+</manifest>
+"""
+
+
+def test_background_manifest_and_icon() -> None:
+    """The foreground service is declared as specialUse (with the Play subtype property) and the
+    permissions it needs exist. Patching twice must not duplicate anything."""
+    import xml.dom.minidom as minidom
+
+    prep = _load_tool("prepare_android")
+    with tempfile.TemporaryDirectory(prefix="bayan-manifest-") as td:
+        root = Path(td)
+        manifest = root / "app" / "src" / "main" / "AndroidManifest.xml"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(SAMPLE_MANIFEST, encoding="utf-8")
+        prep.ANDROID = root
+        prep.patch_manifest()
+        prep.patch_manifest()
+        icon = prep.write_notification_icon(root / "app")
+
+        text = manifest.read_text(encoding="utf-8")
+        doc = minidom.parseString(text.encode("utf-8"))
+        perms = [n.getAttribute("android:name") for n in doc.getElementsByTagName("uses-permission")]
+        for name in (
+            "FOREGROUND_SERVICE",
+            "FOREGROUND_SERVICE_SPECIAL_USE",
+            "POST_NOTIFICATIONS",
+            "WAKE_LOCK",
+            "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        ):
+            assert perms.count(f"android.permission.{name}") == 1, (name, perms)
+
+        services = doc.getElementsByTagName("service")
+        assert len(services) == 1, "the service must be declared exactly once"
+        svc = services[0]
+        pkg = re.search(r"^package\s+([\w.]+)", KOTLIN.read_text(encoding="utf-8"), re.M).group(1)
+        assert svc.getAttribute("android:name") == f"{pkg}.BayanScriptService"
+        assert svc.getAttribute("android:foregroundServiceType") == "specialUse"
+        assert svc.getAttribute("android:exported") == "false"
+        props = {n.getAttribute("android:name"): n.getAttribute("android:value") for n in svc.getElementsByTagName("property")}
+        assert props.get("android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"), props
+        assert svc.parentNode.tagName == "application", "service must live inside <application>"
+
+        minidom.parseString(icon.read_bytes())  # well-formed vector drawable
+        assert icon.name == "ic_bayan_notify.xml" and icon.parent.name == "drawable"
+
+
+def _kotlin_function_body(source: str, name: str) -> str:
+    m = re.search(rf"\bfun\s+{name}\s*\([^)]*\)[^{{=]*\{{", source)
+    assert m, f"fun {name} not found"
+    depth, i = 1, m.end()
+    while depth and i < len(source):
+        depth += {"{": 1, "}": -1}.get(source[i], 0)
+        i += 1
+    return source[m.end() : i]
+
+
+def test_background_kotlin_shape() -> None:
+    """Closing the screen must not stop scripts; the bridge outlives MainActivity; the service is specialUse."""
+    kt = KOTLIN.read_text(encoding="utf-8")
+    assert re.search(r"class\s+BayanPythonBridge\s+private\s+constructor", kt), "bridge must be a process-wide object"
+    assert "fun get(context: Context)" in kt and "fun peek()" in kt
+
+    on_destroy = _kotlin_function_body(kt, "onDestroy")
+    activity_part = kt[kt.index("class MainActivity") : kt.index("class EventRing")]
+    for forbidden in ("stopAll", "stopped = true", ".close()", "shutdownNow"):
+        assert forbidden not in activity_part, f"MainActivity must only detach the UI ({forbidden})"
+    assert "detach(" in on_destroy, "onDestroy must detach the UI from the bridge"
+    assert "shutdownNow" not in kt, "executors must live as long as the process"
+    assert "closed" not in re.sub(r"//.*", "", kt), "the old `closed` flag would cancel installs when the UI closes"
+
+    # PackageCallback.shouldStop no longer follows the UI
+    pkg = kt[kt.index("inner class PackageCallback") :]
+    assert re.search(r"fun shouldStop\(\): Boolean = false", pkg)
+
+    svc = kt[kt.index("class BayanScriptService") : kt.index("class BayanSystem")]
+    assert "FOREGROUND_SERVICE_TYPE_SPECIAL_USE" in svc
+    assert "START_NOT_STICKY" in svc
+    assert "ACTION_STOP_ALL" in svc and "stopAll()" in svc
+    assert "PARTIAL_WAKE_LOCK" in svc and "release()" in svc
+    assert "FLAG_IMMUTABLE" in svc, "PendingIntents must be immutable on Android 12+"
+    assert "STOP_FOREGROUND_REMOVE" in svc
+    # the service must ask the bridge, not keep its own copy of the run list
+    assert "activeRuns()" in svc
+    # WifiLock only where it still does something (Android 9 and older)
+    assert "VERSION_CODES.Q" in svc and "WIFI_MODE_FULL_HIGH_PERF" in svc
+
+
+def test_event_ring_limits_are_in_the_spec() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    m = re.search(r"class EventRing\(([^)]*)\)", kt)
+    assert m, "EventRing missing"
+    assert "maxEvents: Int = 2000" in m.group(1) and "maxChars: Int = 512 * 1024" in m.group(1)
+
+
+def _dart_invoked_methods(dart: str, class_name: str) -> set[str]:
+    m = re.search(rf"\bclass\s+{class_name}\b[^{{]*\{{", dart)
+    assert m, f"{class_name} not found in the Dart sources"
+    depth, i = 1, m.end()
+    while depth and i < len(dart):
+        depth += {"{": 1, "}": -1}.get(dart[i], 0)
+        i += 1
+    body = dart[m.end() : i]
+    return set(re.findall(r"invokeMethod<[^>]*>\(\s*'([\w.]+)'", body))
+
+
+def _kotlin_when_methods(kt: str, class_name: str) -> set[str]:
+    start = re.search(rf"\bclass\s+{class_name}\b[^{{]*\{{", kt)
+    assert start, class_name
+    depth, i = 1, start.end()
+    while depth and i < len(kt):
+        depth += {"{": 1, "}": -1}.get(kt[i], 0)
+        i += 1
+    body = kt[start.end() : i]
+    return set(re.findall(r'^\s*"([\w.]+)"\s*->', body, re.M))
+
+
+def test_dart_kotlin_method_channels_agree() -> None:
+    """Every method Dart invokes must have a branch in Kotlin (a typo here only fails on the phone)."""
+    kt = KOTLIN.read_text(encoding="utf-8")
+    dart = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+    for dart_class, kotlin_class, channel in (
+        ("BayanPythonRuntime", "BayanPythonBridge", "bayan/python"),
+        ("BayanSystem", "BayanSystem", "bayan/system"),
+    ):
+        called = _dart_invoked_methods(dart, dart_class)
+        handled = _kotlin_when_methods(kt, kotlin_class)
+        assert called, f"no invokeMethod calls found in {dart_class}"
+        assert called <= handled, f"{dart_class} calls {sorted(called - handled)} but Kotlin only handles {sorted(handled)}"
+        assert f"MethodChannel('{channel}')" in dart.replace('"', "'"), channel
+        assert f'"{channel}"' in kt, channel
+
+
+def test_dart_sources_are_balanced() -> None:
+    """No Dart SDK in CI before `flutter analyze`: catch missing brackets early and cheaply."""
+    bal = _load_tool("dart_balance")
+    for name in ("main.dart", "store.dart", "python_runtime.dart", "script_runner.dart"):
+        errors = bal.check((ROOT / name).read_text(encoding="utf-8"))
+        assert not errors, f"{name}: {errors[:5]}"
+    assert bal.check("void f() { var x = [1, 2; }"), "the checker must reject unbalanced code"
+    assert not bal.check("void f() { var s = '${a({1: 2})}'; // )\n}")
+
+
+def test_dart_permissions_screen_wiring() -> None:
+    """The drawer entry, welcome flag and the screen are connected (a renamed identifier breaks analyze)."""
+    main = (ROOT / "main.dart").read_text(encoding="utf-8")
+    store = (ROOT / "store.dart").read_text(encoding="utf-8")
+    rt = (ROOT / "python_runtime.dart").read_text(encoding="utf-8")
+    assert "class PermissionsScreen" in main and "PermissionsScreen(welcome: true)" in main
+    assert re.search(r"AppDrawer\([^)]*onPermissions: _openPermissions", main, re.S)
+    assert "required this.onPermissions" in main
+    assert "'فحص الصلاحيات'" in main
+    assert "getFlag(_welcomeFlag)" in main and "setFlag(_welcomeFlag, true)" in main
+    assert "bool getFlag(String key)" in store and "Future<void> setFlag(" in store
+    assert "package:permission_handler/permission_handler.dart" in rt
+    for member in ("status()", "requestBattery()", "openAutoStart()", "requestNotifications()"):
+        assert member in rt, member
+        assert f"bayanSystem.{member.split('(')[0]}" in main, member
+    # every icon used must be one Flutter ships (spot check of the new ones)
+    for icon in ("Icons.verified_user_outlined", "Icons.notifications_none", "Icons.battery_charging_full", "Icons.play_circle_outline"):
+        assert icon in main, icon
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in tests:
