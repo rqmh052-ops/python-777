@@ -25,6 +25,17 @@ class BayanEvent {
   String get channel => raw['channel']?.toString() ?? '';
   String get type => raw['type']?.toString() ?? '';
   String get runId => raw['runId']?.toString() ?? '';
+  // رقم تسلسلي داخل الجلسة (0 = حدث بلا ترقيم) ومسار السكربت في حدث «started»
+  int get seq => (raw['seq'] as num?)?.toInt() ?? 0;
+  String get scriptPath => raw['scriptPath']?.toString() ?? '';
+  // بصمة نص السكربت وقت التشغيل (في حدث «started» فقط)، أو null
+  String? get textHash {
+    final value = raw['textHash']?.toString();
+    return (value == null || value.isEmpty) ? null : value;
+  }
+
+  // حدث أُعيد من مخزن الجلسة عند الدخول (وليس بثًّا حيًّا)
+  bool get isReplay => raw['replay'] == true;
   String get jobId => raw['jobId']?.toString() ?? '';
   String get text => raw['text']?.toString() ?? '';
   String get packageName => raw['package']?.toString() ?? '';
@@ -236,6 +247,126 @@ class BayanSystem {
 
 const bayanSystem = BayanSystem();
 
+enum RunStatus { running, waiting, finished, stopped, error }
+
+RunStatus runStatusFrom(String? raw) {
+  switch (raw) {
+    case 'waiting':
+      return RunStatus.waiting;
+    case 'finished':
+      return RunStatus.finished;
+    case 'stopped':
+      return RunStatus.stopped;
+    case 'error':
+      return RunStatus.error;
+    default:
+      return RunStatus.running;
+  }
+}
+
+/// ملخص جلسة كما يعيده Kotlin (runs.list / runs.attach).
+class RunSummary {
+  const RunSummary({
+    required this.runId,
+    required this.scriptPath,
+    required this.status,
+    required this.startedAt,
+    this.endedAt,
+    this.exitCode,
+    this.textHash,
+  });
+
+  final String runId;
+  final String scriptPath;
+  final RunStatus status;
+  final DateTime startedAt;
+  final DateTime? endedAt;
+  final int? exitCode;
+  final String? textHash;
+
+  bool get isLive => status == RunStatus.running || status == RunStatus.waiting;
+
+  factory RunSummary.fromJson(Map<String, dynamic> json) {
+    final started = (json['startedAt'] as num?)?.toInt() ?? 0;
+    final ended = (json['endedAt'] as num?)?.toInt() ?? 0;
+    final code = (json['exitCode'] as num?)?.toInt();
+    final hash = json['textHash']?.toString();
+    return RunSummary(
+      runId: json['runId']?.toString() ?? '',
+      scriptPath: json['scriptPath']?.toString() ?? '',
+      status: runStatusFrom(json['status']?.toString()),
+      startedAt: DateTime.fromMillisecondsSinceEpoch(started),
+      endedAt: ended > 0 ? DateTime.fromMillisecondsSinceEpoch(ended) : null,
+      // -1 في Kotlin يعني أن التشغيل لم ينتهِ بعد
+      exitCode: (code == null || code < 0) ? null : code,
+      textHash: (hash == null || hash.isEmpty) ? null : hash,
+    );
+  }
+}
+
+/// ما تعيده runs.attach: ملخص الجلسة + أحداثها المحفوظة + آخر رقم تسلسلي.
+class RunSnapshot {
+  const RunSnapshot({
+    required this.summary,
+    required this.events,
+    required this.lastSeq,
+    required this.truncated,
+  });
+
+  final RunSummary summary;
+  final List<BayanEvent> events;
+  final int lastSeq;
+
+  /// true: أُسقطت أحداث أقدم من المخزن (الحد 2000 حدث أو 512 ألف حرف).
+  final bool truncated;
+}
+
+/// ما تعيده logs.page: قطعة من أسطر JSONL كاملة من سجل الإخراج الدائم (2.5D1).
+/// كل القراءة والقص في Kotlin (LogStore)؛ هذا الصنف يحمل الرد كما هو.
+class LogPage {
+  const LogPage({
+    required this.text,
+    required this.start,
+    required this.end,
+    required this.size,
+    required this.hasMore,
+    required this.epoch,
+    required this.stale,
+  });
+
+  /// أسطر JSONL كاملة (سطر لكل حدث، مفصولة بـ \n). لا يُفسَّر شيء منها هنا.
+  final String text;
+
+  /// موضع أول بايت وآخر بايت (بعده) من هذه القطعة داخل الملف. للصفحة الأقدم: before = start.
+  final int start;
+  final int end;
+
+  /// حجم السجل بالبايت وقت القراءة.
+  final int size;
+
+  /// true: يوجد أقدم من هذه القطعة (start > 0).
+  final bool hasMore;
+
+  /// يتغير عند قص السجل أو مسحه أو نقله؛ يُمرَّر في الطلب التالي ليُكشف التغيّر.
+  final int epoch;
+
+  /// true: تغيّر الملف منذ epoch المرسل، فالمواضع القديمة لا تصلح. ابدأ من النهاية من جديد.
+  final bool stale;
+
+  factory LogPage.fromJson(Map<String, dynamic> json) {
+    int n(String key) => (json[key] as num?)?.toInt() ?? 0;
+    return LogPage(
+      text: json['text']?.toString() ?? '',
+      start: n('start'),
+      end: n('end'),
+      size: n('size'),
+      hasMore: json['hasMore'] == true,
+      epoch: n('epoch'),
+      stale: json['stale'] == true,
+    );
+  }
+}
+
 class BayanPythonRuntime {
   BayanPythonRuntime._() {
     _eventsController = StreamController<BayanEvent>.broadcast();
@@ -276,10 +407,15 @@ class BayanPythonRuntime {
     await _methodChannel.invokeMethod<dynamic>('init');
   }
 
-  Future<void> run({required String runId, required String scriptPath}) async {
+  Future<void> run({
+    required String runId,
+    required String scriptPath,
+    String? textHash,
+  }) async {
     await _methodChannel.invokeMethod<dynamic>('run', <String, dynamic>{
       'runId': runId,
       'scriptPath': scriptPath,
+      'textHash': textHash,
     });
   }
 
@@ -294,6 +430,131 @@ class BayanPythonRuntime {
     await _methodChannel.invokeMethod<dynamic>('stop', <String, dynamic>{
       'runId': runId,
     });
+  }
+
+  // ───── الجلسات (runs.*) ─────
+  Future<List<RunSummary>> runsList() async {
+    final dynamic raw = await _methodChannel.invokeMethod<dynamic>('runs.list');
+    if (raw is! List) return const <RunSummary>[];
+    return raw
+        .whereType<Map>()
+        .map((e) => RunSummary.fromJson(Map<String, dynamic>.from(e)))
+        .toList(growable: false);
+  }
+
+  /// null: لا توجد جلسة بهذا الرقم (حُذفت أو لم تعد موجودة).
+  Future<RunSnapshot?> runsAttach(String runId) async {
+    final dynamic raw = await _methodChannel
+        .invokeMethod<dynamic>('runs.attach', <String, dynamic>{'runId': runId});
+    if (raw is! Map) return null;
+    final map = Map<String, dynamic>.from(raw);
+    final events = <BayanEvent>[];
+    final rawEvents = map['events'];
+    if (rawEvents is List) {
+      for (final e in rawEvents) {
+        if (e is Map) events.add(BayanEvent(Map<String, dynamic>.from(e)));
+      }
+    }
+    return RunSnapshot(
+      summary: RunSummary.fromJson(map),
+      events: events,
+      lastSeq: (map['lastSeq'] as num?)?.toInt() ?? 0,
+      truncated: map['truncated'] == true,
+    );
+  }
+
+  Future<void> runsStopAll() async {
+    await _methodChannel.invokeMethod<dynamic>('runs.stopAll');
+  }
+
+  Future<bool> runsMove({required String from, required String to}) async {
+    final dynamic ok = await _methodChannel.invokeMethod<dynamic>(
+        'runs.move', <String, dynamic>{'from': from, 'to': to});
+    return ok == true;
+  }
+
+  Future<bool> runsDiscard(String scriptPath) async {
+    final dynamic ok = await _methodChannel.invokeMethod<dynamic>(
+        'runs.discard', <String, dynamic>{'scriptPath': scriptPath});
+    return ok == true;
+  }
+
+  // ───── سجل الإخراج الدائم (logs.*) ─────
+  // كل العمل في Kotlin (LogStore). المعامل scriptPath مسار السكربت أو اسمه؛
+  // مفتاح السجل اسم الملف بحروف صغيرة، وهو نفسه مفتاح التثبيت و«آخر تشغيل».
+
+  /// حجم السجل بالبايت (0 إن لم يوجد).
+  Future<int> logsSize(String scriptPath) async {
+    final dynamic raw = await _methodChannel
+        .invokeMethod<dynamic>('logs.size', <String, dynamic>{'scriptPath': scriptPath});
+    return (raw as num?)?.toInt() ?? 0;
+  }
+
+  /// قطعة أسطر كاملة تنتهي عند [before] (null = نهاية السجل) وتمتد للخلف نحو [maxBytes].
+  /// مرّر [epoch] من الرد السابق؛ إن عاد stale == true فابدأ من النهاية من جديد.
+  Future<LogPage> logsPage(
+    String scriptPath, {
+    int? before,
+    int? maxBytes,
+    int? epoch,
+  }) async {
+    final dynamic raw = await _methodChannel.invokeMethod<dynamic>(
+        'logs.page', <String, dynamic>{
+      'scriptPath': scriptPath,
+      'before': before,
+      'maxBytes': maxBytes,
+      'epoch': epoch,
+    });
+    if (raw is! Map) {
+      return const LogPage(
+        text: '',
+        start: 0,
+        end: 0,
+        size: 0,
+        hasMore: false,
+        epoch: 0,
+        stale: false,
+      );
+    }
+    return LogPage.fromJson(Map<String, dynamic>.from(raw));
+  }
+
+  /// يمسح السجل، ويبقي سطر بداية التشغيل الجاري إن كان السكربت يعمل.
+  Future<bool> logsClear(String scriptPath) async {
+    final dynamic ok = await _methodChannel
+        .invokeMethod<dynamic>('logs.clear', <String, dynamic>{'scriptPath': scriptPath});
+    return ok == true;
+  }
+
+  /// ينقل السجل عند إعادة التسمية (لا سجل للمصدر: لا شيء ليُنقل ويعود true).
+  Future<bool> logsMove({required String from, required String to}) async {
+    final dynamic ok = await _methodChannel.invokeMethod<dynamic>(
+        'logs.move', <String, dynamic>{'from': from, 'to': to});
+    return ok == true;
+  }
+
+  /// يحجز السجل باسم مؤقت ليمكن «تراجع». false إن لم يوجد سجل.
+  Future<bool> logsTrash(String scriptPath) async {
+    final dynamic ok = await _methodChannel
+        .invokeMethod<dynamic>('logs.trash', <String, dynamic>{'scriptPath': scriptPath});
+    return ok == true;
+  }
+
+  /// يعيد السجل المحجوز. false إن لم يوجد، أو وُجد سجل جديد بالاسم نفسه.
+  Future<bool> logsUntrash(String scriptPath, {String? restoreAs}) async {
+    final dynamic ok = await _methodChannel.invokeMethod<dynamic>(
+        'logs.untrash', <String, dynamic>{
+      'scriptPath': scriptPath,
+      'restoreAs': restoreAs,
+    });
+    return ok == true;
+  }
+
+  /// يحذف السجل المحجوز نهائيًا عند انتهاء مهلة التراجع.
+  Future<bool> logsPurge(String scriptPath) async {
+    final dynamic ok = await _methodChannel
+        .invokeMethod<dynamic>('logs.purge', <String, dynamic>{'scriptPath': scriptPath});
+    return ok == true;
   }
 
   Future<List<InstalledPackage>> listInstalled() async {

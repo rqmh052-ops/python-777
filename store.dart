@@ -619,11 +619,15 @@ class ScriptStore {
       });
 
   // ───── آخر تشغيل ─────
-  Future<void> markRun(Script s) => _serial<void>(() async {
+  // at: وقت نهاية التشغيل (للمصالحة عند فتح التطبيق). لا يرجع بـ«آخر تشغيل» إلى الوراء.
+  Future<void> markRun(Script s, {DateTime? at}) => _serial<void>(() async {
         try {
-          final now = DateTime.now();
+          final now = at ?? DateTime.now();
           final runs = _runMap();
-          runs[s.name.toLowerCase()] = now.millisecondsSinceEpoch;
+          final key = s.name.toLowerCase();
+          final prev = runs[key];
+          if (prev != null && prev >= now.millisecondsSinceEpoch) return;
+          runs[key] = now.millisecondsSinceEpoch;
           await _saveRuns(runs);
           s.lastRun = now;
           _publishNow();

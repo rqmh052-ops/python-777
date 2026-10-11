@@ -26,8 +26,15 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.RandomAccessFile
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class MainActivity : FlutterActivity() {
     private var attachedEngine: FlutterEngine? = null
@@ -56,6 +63,10 @@ class EventRing(private val maxEvents: Int = 2000, private val maxChars: Int = 5
     private val items = java.util.ArrayDeque<Map<String, Any?>>()
     private var chars = 0
 
+    /** صحيح إذا أُسقطت أحداث أقدم بسبب الحد (الواجهة تعرض تنبيه «قُطع الأقدم»). */
+    var truncated = false
+        private set
+
     private fun weight(event: Map<String, Any?>): Int =
         64 + ((event["text"] as? String)?.length ?: 0)
 
@@ -64,11 +75,586 @@ class EventRing(private val maxEvents: Int = 2000, private val maxChars: Int = 5
         chars += weight(event)
         while (items.size > 1 && (items.size > maxEvents || chars > maxChars)) {
             val dropped = items.pollFirst() ?: break
+            truncated = true
             chars -= weight(dropped)
         }
     }
 
     fun snapshot(): List<Map<String, Any?>> = ArrayList(items)
+}
+
+/**
+ * سجل الإخراج الدائم على القرص (2.5D1). ملف JSONL لكل سكربت داخل filesDir/logs.
+ *
+ * التنسيق (لا يتغير في 2.5D2):
+ *   بداية:  {"run":"<runId>","start":<ms>,"auto":false}
+ *   حدث:    {"t":<ms>,"k":"o|e|i|s","s":"<نص>"}   o إخراج، e أخطاء، i إدخال (الطلب ثم ما كتبه المستخدم)، s ملاحظة نظام
+ *   نهاية:  {"end":"<runId>","t":<ms>,"code":<int>}
+ * الكتابة بالإضافة فقط، ونصوص الدفعات تُحفظ كما وصلت (دون تحويلها إلى أسطر).
+ *
+ * الخيوط: الاستقبال (startRun / addEvent / endRun) يضيف إلى مخزن صغير في الذاكرة ويعود فورًا،
+ * وكل عمل الملفات (الكتابة والقص والقراءة والنقل والحذف) يجري على خيط واحد خلفي
+ * "Bayan-LogWriter"، فلا يُمسّ القرص من الخيط الرئيسي ولا يتداخل عمل ملف مع آخر.
+ */
+class LogStore(private val dir: File) {
+    companion object {
+        private const val TAG = "BayanLogStore"
+
+        /** سقف الملف الواحد، وعند تجاوزه يُقصّ إلى TARGET_BYTES (لتجنب القص عند كل كتابة). */
+        const val MAX_BYTES = 20L * 1024 * 1024
+        const val TARGET_BYTES = 16L * 1024 * 1024
+
+        /** التفريغ: كل ثانية، أو عند 32KB، أو عند نهاية التشغيل. */
+        const val FLUSH_BYTES = 32 * 1024
+        const val FLUSH_DELAY_MS = 1000L
+
+        /** دفعة أكبر من هذا تُحفظ على عدة أحداث متتالية (المحتوى والترتيب كما هما) كي يبقى حجم السطر محدودًا. */
+        const val MAX_EVENT_CHARS = 64 * 1024
+
+        const val PAGE_DEFAULT_BYTES = 256 * 1024
+        const val PAGE_MIN_BYTES = 4 * 1024
+        const val PAGE_MAX_BYTES = 1024 * 1024
+        private const val LINE_SCAN_LIMIT = 8L * 1024 * 1024
+
+        const val TRIM_NOTE = "… حُذف الأقدم"
+        const val FILE_EXT = ".jsonl"
+        const val TRASH_EXT = ".trash"
+        const val TEMP_EXT = ".tmp"
+        private const val MAX_NAME_BYTES = 235
+        private const val START_PREFIX = "{\"run\":"
+
+        private const val ITEM_EVENT = 0
+        private const val ITEM_START = 1
+        private const val ITEM_END = 2
+
+        /**
+         * مفتاح السكربت: اسم الملف بحروف صغيرة. هو نفسه مفتاح التثبيت و«آخر تشغيل» في store.dart
+         * (`_base(path).toLowerCase()`)، فتتبع السجلات السكربت عند إعادة التسمية.
+         */
+        fun keyOf(scriptPath: String): String = scriptPath.substringAfterLast('/').lowercase()
+
+        /** اسم ملف آمن من المفتاح (يقصّر الأسماء الطويلة جدًا بصورة ثابتة). */
+        fun fileNameOf(key: String): String {
+            var safe = key.replace('/', '_').replace('\u0000', '_')
+            if (safe.isEmpty() || safe == "." || safe == "..") safe = "_$safe"
+            if (safe.toByteArray(Charsets.UTF_8).size > MAX_NAME_BYTES) {
+                var cut = minOf(safe.length, 60)
+                if (cut > 0 && Character.isHighSurrogate(safe[cut - 1])) cut--
+                safe = safe.substring(0, cut) + "~" + (key.hashCode().toLong() and 0xFFFFFFFFL).toString(16)
+            }
+            return safe + FILE_EXT
+        }
+
+        private val HEX = "0123456789abcdef".toCharArray()
+
+        /** يهرّب النص لـ JSON. الأحرف النائبة (surrogates) غير المزدوجة تُكتب \\uXXXX كي لا تضيع عند الترميز. */
+        fun escapeJson(text: String, out: StringBuilder) {
+            var i = 0
+            val n = text.length
+            while (i < n) {
+                val c = text[i]
+                when {
+                    c == '"' -> out.append("\\\"")
+                    c == '\\' -> out.append("\\\\")
+                    c == '\n' -> out.append("\\n")
+                    c == '\r' -> out.append("\\r")
+                    c == '\t' -> out.append("\\t")
+                    c == '\b' -> out.append("\\b")
+                    c == '\u000C' -> out.append("\\f")
+                    c < ' ' || c == '\u2028' || c == '\u2029' -> appendUnicodeEscape(out, c)
+                    Character.isHighSurrogate(c) -> {
+                        if (i + 1 < n && Character.isLowSurrogate(text[i + 1])) {
+                            out.append(c).append(text[i + 1])
+                            i++
+                        } else {
+                            appendUnicodeEscape(out, c)
+                        }
+                    }
+                    Character.isLowSurrogate(c) -> appendUnicodeEscape(out, c)
+                    else -> out.append(c)
+                }
+                i++
+            }
+        }
+
+        private fun appendUnicodeEscape(out: StringBuilder, c: Char) {
+            val v = c.code
+            out.append("\\u")
+                .append(HEX[(v shr 12) and 0xF])
+                .append(HEX[(v shr 8) and 0xF])
+                .append(HEX[(v shr 4) and 0xF])
+                .append(HEX[v and 0xF])
+        }
+
+        fun startLine(runId: String, startedAt: Long, auto: Boolean): String {
+            val sb = StringBuilder(64)
+            sb.append(START_PREFIX).append('"')
+            escapeJson(runId, sb)
+            sb.append("\",\"start\":").append(startedAt)
+                .append(",\"auto\":").append(if (auto) "true" else "false")
+                .append("}\n")
+            return sb.toString()
+        }
+
+        fun eventLine(t: Long, kind: String, text: String): String {
+            val sb = StringBuilder(text.length + 40)
+            sb.append("{\"t\":").append(t)
+                .append(",\"k\":\"").append(kind)
+                .append("\",\"s\":\"")
+            escapeJson(text, sb)
+            sb.append("\"}\n")
+            return sb.toString()
+        }
+
+        fun endLine(runId: String, t: Long, code: Int): String {
+            val sb = StringBuilder(64)
+            sb.append("{\"end\":\"")
+            escapeJson(runId, sb)
+            sb.append("\",\"t\":").append(t)
+                .append(",\"code\":").append(code)
+                .append("}\n")
+            return sb.toString()
+        }
+    }
+
+    private class Item(val key: String, val type: Int, val runId: String?, val bytes: ByteArray)
+
+    /** تشغيل جارٍ لسكربت: سطر بدايته وعدد البايتات من أول سطر البداية إلى نهاية الملف. يُلمس من خيط الكتابة فقط. */
+    private class ActiveRun(val runId: String, val startLine: ByteArray, var since: Long)
+
+    private val worker: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "Bayan-LogWriter").apply { isDaemon = true }
+        }
+
+    private val lock = Any()
+    private var pending = ArrayList<Item>()
+    private var pendingBytes = 0
+    private var timerArmed = false
+    private var thresholdQueued = false
+
+    // الأعضاء التالية تُلمس من خيط الكتابة فقط
+    private val active = HashMap<String, ActiveRun>()
+    private val checkedKeys = HashSet<String>()
+    private val epochs = HashMap<String, Long>()
+
+    // ───── الاستقبال (من أي خيط، بلا أي عمل على القرص) ─────
+
+    /** عند التهيئة: يحذف بقايا ".trash" (حذف لم يُتراجع عنه) وملفات القص المؤقتة ".tmp". السجلات العادية لا تُمسّ. */
+    fun start() {
+        worker.execute {
+            try {
+                dir.mkdirs()
+                dir.listFiles()?.forEach { file ->
+                    val name = file.name
+                    if (name.endsWith(TRASH_EXT) || name.endsWith(TEMP_EXT)) {
+                        try {
+                            if (!file.delete()) Log.w(TAG, "could not delete leftover ${file.name}")
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "leftover cleanup failed for ${file.name}: ${t.message}")
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "startup cleanup failed: ${t.message}")
+            }
+        }
+    }
+
+    fun startRun(scriptPath: String, runId: String, startedAt: Long, auto: Boolean) {
+        enqueue(Item(keyOf(scriptPath), ITEM_START, runId, startLine(runId, startedAt, auto).toByteArray(Charsets.UTF_8)))
+    }
+
+    /** kind: o | e | i | s. النص يُحفظ كما وصل (الدفعة الضخمة جدًا فقط تُقسَّم دون تغيير محتواها). */
+    fun addEvent(scriptPath: String, t: Long, kind: String, text: String) {
+        if (text.isEmpty() && kind != "i") return
+        val key = keyOf(scriptPath)
+        var from = 0
+        do {
+            var to = minOf(text.length, from + MAX_EVENT_CHARS)
+            if (to < text.length && to > from && Character.isHighSurrogate(text[to - 1])) to--
+            enqueue(Item(key, ITEM_EVENT, null, eventLine(t, kind, text.substring(from, to)).toByteArray(Charsets.UTF_8)))
+            from = to
+        } while (from < text.length)
+    }
+
+    /** يربط حدث الجسر بسطر السجل. start/exit يصنعان سطري البداية والنهاية، والباقي أحداث o/e/i. */
+    fun record(scriptPath: String, runId: String, startedAt: Long, type: String, text: String, exitCode: Int, t: Long) {
+        when (type) {
+            "started" -> startRun(scriptPath, runId, startedAt, false)
+            "stdout" -> addEvent(scriptPath, t, "o", text)
+            "stderr", "error" -> addEvent(scriptPath, t, "e", text)
+            "input" -> addEvent(scriptPath, t, "i", text)
+            "exit" -> endRun(scriptPath, runId, t, exitCode)
+        }
+    }
+
+    /** يُكتب مرة واحدة لكل تشغيل (النداء المكرر يُتجاهل عند الكتابة) ويُفرَّغ فورًا. */
+    fun endRun(scriptPath: String, runId: String, t: Long, code: Int) {
+        enqueue(Item(keyOf(scriptPath), ITEM_END, runId, endLine(runId, t, code).toByteArray(Charsets.UTF_8)))
+        worker.execute { flushPending() }
+    }
+
+    private fun enqueue(item: Item) {
+        var flushNow = false
+        var arm = false
+        synchronized(lock) {
+            pending.add(item)
+            pendingBytes += item.bytes.size
+            if (pendingBytes >= FLUSH_BYTES && !thresholdQueued) {
+                thresholdQueued = true
+                flushNow = true
+            }
+            if (!timerArmed) {
+                timerArmed = true
+                arm = true
+            }
+        }
+        if (flushNow) worker.execute { flushPending() }
+        if (arm) {
+            worker.schedule(
+                Runnable {
+                    synchronized(lock) { timerArmed = false }
+                    flushPending()
+                },
+                FLUSH_DELAY_MS,
+                TimeUnit.MILLISECONDS,
+            )
+        }
+    }
+
+    // ───── طرق القناة (كلها غير متزامنة: تعمل على خيط الكتابة وتعيد النتيجة بنداء) ─────
+
+    fun size(scriptPath: String, ok: (Long) -> Unit, err: (Throwable) -> Unit) =
+        io(ok, err) { sizeNow(keyOf(scriptPath)) }
+
+    fun page(
+        scriptPath: String,
+        before: Long?,
+        maxBytes: Int,
+        epoch: Long?,
+        ok: (Map<String, Any?>) -> Unit,
+        err: (Throwable) -> Unit,
+    ) = io(ok, err) { pageNow(keyOf(scriptPath), before, maxBytes, epoch) }
+
+    fun clear(scriptPath: String, ok: (Boolean) -> Unit, err: (Throwable) -> Unit) =
+        io(ok, err) { clearNow(keyOf(scriptPath)) }
+
+    fun move(fromPath: String, toPath: String, ok: (Boolean) -> Unit, err: (Throwable) -> Unit) =
+        io(ok, err) { moveNow(keyOf(fromPath), keyOf(toPath)) }
+
+    fun trash(scriptPath: String, ok: (Boolean) -> Unit, err: (Throwable) -> Unit) =
+        io(ok, err) { trashNow(keyOf(scriptPath)) }
+
+    fun untrash(
+        scriptPath: String,
+        restoreAs: String?,
+        ok: (Boolean) -> Unit,
+        err: (Throwable) -> Unit,
+    ) = io(ok, err) { untrashNow(keyOf(scriptPath), keyOf(restoreAs ?: scriptPath)) }
+
+    fun purge(scriptPath: String, ok: (Boolean) -> Unit, err: (Throwable) -> Unit) =
+        io(ok, err) { purgeNow(keyOf(scriptPath)) }
+
+    /** يفرّغ المخزن أولًا (فيرى القارئ آخر ما سُجّل) ثم ينفّذ المهمة، كل ذلك على خيط الكتابة. */
+    private fun <T> io(ok: (T) -> Unit, err: (Throwable) -> Unit, task: () -> T) {
+        worker.execute {
+            val value = try {
+                flushPending()
+                task()
+            } catch (t: Throwable) {
+                Log.w(TAG, "log operation failed: ${t.message}")
+                err(t)
+                return@execute
+            }
+            ok(value)
+        }
+    }
+
+    // ───── من هنا فصاعدًا: خيط الكتابة فقط ─────
+
+    private fun fileFor(key: String): File = File(dir, fileNameOf(key))
+    private fun trashFor(key: String): File = File(dir, fileNameOf(key) + TRASH_EXT)
+    private fun tempFor(key: String): File = File(dir, fileNameOf(key) + TEMP_EXT)
+    private fun epochOf(key: String): Long = epochs[key] ?: 0L
+    private fun bumpEpoch(key: String) {
+        epochs[key] = epochOf(key) + 1
+    }
+
+    private fun flushPending() {
+        val batch = synchronized(lock) {
+            val taken = pending
+            pending = ArrayList()
+            pendingBytes = 0
+            thresholdQueued = false
+            taken
+        }
+        if (batch.isEmpty()) return
+
+        // تجميع الدفعة لكل ملف مع حفظ الترتيب داخل الملف، وتحديث حالة التشغيل الجاري
+        val groups = LinkedHashMap<String, ByteArrayOutputStream>()
+        val syncKeys = HashSet<String>()
+        for (item in batch) {
+            when (item.type) {
+                ITEM_START -> active[item.key] = ActiveRun(item.runId ?: "", item.bytes, item.bytes.size.toLong())
+                ITEM_END -> {
+                    val current = active[item.key]
+                    // نهاية مكررة (مسار آخر للحدث نفسه) أو لتشغيل غير الجاري: تُتجاهل
+                    if (current == null || current.runId != item.runId) continue
+                    active.remove(item.key)
+                    syncKeys.add(item.key)
+                }
+                else -> active[item.key]?.let { it.since += item.bytes.size }
+            }
+            groups.getOrPut(item.key) { ByteArrayOutputStream() }.write(item.bytes)
+        }
+        for ((key, buffer) in groups) {
+            try {
+                appendToFile(key, buffer.toByteArray(), key in syncKeys)
+            } catch (t: Throwable) {
+                // فشل كتابة ملف واحد (قرص ممتلئ مثلًا) لا يوقف بقية السجلات ولا السكربت
+                Log.w(TAG, "append failed for $key: ${t.message}")
+            }
+        }
+    }
+
+    private fun appendToFile(key: String, bytes: ByteArray, sync: Boolean) {
+        dir.mkdirs()
+        val file = fileFor(key)
+        ensureTerminated(key, file)
+        FileOutputStream(file, true).use { out ->
+            out.write(bytes)
+            out.flush()
+            if (sync) out.fd.sync()
+        }
+        val size = file.length()
+        if (size > MAX_BYTES) trimNow(key, file, size)
+    }
+
+    /** إن انقطعت الكتابة في منتصف سطر (قتل التطبيق) نُنهي ذلك السطر قبل الإضافة فلا يلتصق به سطر جديد. */
+    private fun ensureTerminated(key: String, file: File) {
+        if (!checkedKeys.add(key)) return
+        if (!file.exists() || file.length() == 0L) return
+        RandomAccessFile(file, "rw").use { raf ->
+            raf.seek(raf.length() - 1)
+            if (raf.read() != '\n'.code) raf.write('\n'.code)
+        }
+    }
+
+    /**
+     * يقصّ الأقدم عند تجاوز MAX_BYTES إلى نحو TARGET_BYTES، عند حد سطر كامل.
+     * إن وقع القص داخل تشغيل: تُضاف في أول الملف ملاحظة «… حُذف الأقدم»، ومعها سطر بداية التشغيل
+     * الجاري إن كان سطره قد حُذف، فلا يُحذف التشغيل الجاري ولا تختل بنية الملف.
+     */
+    private fun trimNow(key: String, file: File, size: Long) {
+        val cutFrom = size - TARGET_BYTES
+        if (cutFrom <= 0L) return
+        val temp = tempFor(key)
+        RandomAccessFile(file, "r").use { raf ->
+            // أول بداية سطر عند الموضع cutFrom أو بعده
+            var keepFrom = -1L
+            var pos = cutFrom - 1
+            val block = ByteArray(8192)
+            raf.seek(pos)
+            while (keepFrom < 0 && pos < size) {
+                val n = raf.read(block)
+                if (n <= 0) break
+                for (i in 0 until n) {
+                    if (block[i] == '\n'.code.toByte()) {
+                        keepFrom = pos + i + 1
+                        break
+                    }
+                }
+                pos += n
+            }
+            if (keepFrom < 0L || keepFrom >= size) {
+                Log.w(TAG, "trim skipped for $key: no line boundary found")
+                return
+            }
+            val retained = size - keepFrom
+
+            val head = ByteArray(START_PREFIX.length)
+            raf.seek(keepFrom)
+            val got = raf.read(head)
+            val startsAtRun = got == head.size && String(head, Charsets.UTF_8) == START_PREFIX
+
+            val act = active[key]
+            val startDropped = act != null && act.since > retained
+            val prefix = ByteArrayOutputStream()
+            if (!startsAtRun) {
+                if (startDropped && act != null) prefix.write(act.startLine)
+                prefix.write(eventLine(System.currentTimeMillis(), "s", TRIM_NOTE).toByteArray(Charsets.UTF_8))
+            }
+
+            FileOutputStream(temp, false).use { out ->
+                out.write(prefix.toByteArray())
+                raf.seek(keepFrom)
+                var left = retained
+                val copy = ByteArray(64 * 1024)
+                while (left > 0) {
+                    val n = raf.read(copy, 0, minOf(copy.size.toLong(), left).toInt())
+                    if (n <= 0) throw IOException("unexpected end of $key while trimming")
+                    out.write(copy, 0, n)
+                    left -= n
+                }
+                out.flush()
+                out.fd.sync()
+            }
+            if (!startsAtRun && startDropped && act != null) {
+                act.since = prefix.size().toLong() + retained
+            }
+        }
+        if (!temp.renameTo(file)) {
+            file.delete()
+            if (!temp.renameTo(file)) {
+                temp.delete()
+                throw IOException("could not replace $key after trimming")
+            }
+        }
+        bumpEpoch(key)
+    }
+
+    private fun sizeNow(key: String): Long {
+        val file = fileFor(key)
+        return if (file.exists()) file.length() else 0L
+    }
+
+    /**
+     * يقرأ قطعة من أسطر كاملة تنتهي عند الموضع before (null = نهاية الملف) وتمتد للخلف نحو maxBytes.
+     * لا يحمّل الملف كاملًا. المواضع بالبايت من أول الملف وتتغير عند القص أو المسح، لذلك يعاد epoch؛
+     * إن مرّر العميل epoch قديمًا يعود الرد بـ stale=true ليبدأ من النهاية من جديد.
+     */
+    private fun pageNow(key: String, before: Long?, maxBytes: Int, epoch: Long?): Map<String, Any?> {
+        val file = fileFor(key)
+        val current = epochOf(key)
+        val size = if (file.exists()) file.length() else 0L
+
+        fun reply(text: String, start: Long, end: Long, stale: Boolean): Map<String, Any?> = mapOf(
+            "text" to text,
+            "start" to start,
+            "end" to end,
+            "size" to size,
+            "hasMore" to (start > 0L && !stale),
+            "epoch" to current,
+            "stale" to stale,
+        )
+
+        if (epoch != null && epoch != current) return reply("", size, size, true)
+        val end = (before ?: size).coerceIn(0L, size)
+        if (size == 0L || end == 0L) return reply("", 0L, 0L, false)
+
+        val limit = maxBytes.coerceIn(PAGE_MIN_BYTES, PAGE_MAX_BYTES).toLong()
+        return RandomAccessFile(file, "r").use { raf ->
+            // end يجب أن يكون بداية سطر (أو نهاية الملف)
+            if (end < size) {
+                raf.seek(end - 1)
+                if (raf.read() != '\n'.code) return@use reply("", end, end, true)
+            }
+            var window = limit
+            var result: Map<String, Any?>? = null
+            while (result == null) {
+                val from = maxOf(0L, end - window)
+                // نقرأ بايتًا إضافيًا قبل النافذة لنعرف إن كانت تبدأ عند حد سطر
+                val readFrom = if (from > 0L) from - 1 else 0L
+                val bytes = ByteArray((end - readFrom).toInt())
+                raf.seek(readFrom)
+                raf.readFully(bytes)
+                if (from == 0L) {
+                    result = reply(String(bytes, Charsets.UTF_8), 0L, end, false)
+                } else {
+                    // أول نهاية سطر قبل البايت الأخير (الأخير هو نهاية آخر سطر): بعدها سطر كامل واحد على الأقل
+                    var newline = -1
+                    for (i in 0 until bytes.size - 1) {
+                        if (bytes[i] == '\n'.code.toByte()) {
+                            newline = i
+                            break
+                        }
+                    }
+                    if (newline >= 0) {
+                        val text = String(bytes, newline + 1, bytes.size - newline - 1, Charsets.UTF_8)
+                        result = reply(text, readFrom + newline + 1, end, false)
+                    } else if (window >= LINE_SCAN_LIMIT) {
+                        result = reply(String(bytes, Charsets.UTF_8), readFrom, end, false)
+                    } else {
+                        window *= 2
+                    }
+                }
+            }
+            result ?: reply("", 0L, 0L, false)
+        }
+    }
+
+    /** يمسح السجل. إن كان للسكربت تشغيل جارٍ يبقى سطر بدايته، ويستمر التسجيل بعد المسح. */
+    private fun clearNow(key: String): Boolean {
+        val file = fileFor(key)
+        val act = active[key]
+        if (file.exists() && !file.delete()) {
+            FileOutputStream(file, false).use { }
+        }
+        if (act != null) {
+            dir.mkdirs()
+            FileOutputStream(file, false).use { out ->
+                out.write(act.startLine)
+                out.flush()
+            }
+            act.since = act.startLine.size.toLong()
+        }
+        checkedKeys.remove(key)
+        bumpEpoch(key)
+        return true
+    }
+
+    /** ينقل سجل from إلى to عند إعادة التسمية. لا سجل للمصدر: لا شيء ليُنقل (صحيح). يحلّ السجل المنقول محل سجل قديم بالاسم الجديد. */
+    private fun moveNow(from: String, to: String): Boolean {
+        if (from == to) return true
+        val source = fileFor(from)
+        val target = fileFor(to)
+        checkedKeys.remove(from)
+        checkedKeys.remove(to)
+        bumpEpoch(from)
+        bumpEpoch(to)
+        active.remove(from)?.let { active[to] = it }
+        if (!source.exists()) return true
+        if (target.exists() && !target.delete()) return false
+        return source.renameTo(target)
+    }
+
+    /** يحجز السجل باسم ".trash" ليمكن التراجع. false إن لم يوجد سجل. */
+    private fun trashNow(key: String): Boolean {
+        val file = fileFor(key)
+        if (!file.exists()) return false
+        val held = trashFor(key)
+        if (held.exists() && !held.delete()) return false
+        val moved = file.renameTo(held)
+        if (moved) {
+            active.remove(key)
+            checkedKeys.remove(key)
+            bumpEpoch(key)
+        }
+        return moved
+    }
+
+    /** يعيد السجل المحجوز. false إن لم يوجد، أو وُجد سجل جديد بالاسم نفسه (لا نكتب فوقه). */
+    private fun untrashNow(key: String, restoreKey: String): Boolean {
+        val held = trashFor(key)
+        val file = fileFor(restoreKey)
+        if (!held.exists() || file.exists()) return false
+        val moved = held.renameTo(file)
+        if (moved) {
+            checkedKeys.remove(key)
+            checkedKeys.remove(restoreKey)
+            bumpEpoch(key)
+            bumpEpoch(restoreKey)
+        }
+        return moved
+    }
+
+    /** يحذف السجل المحجوز نهائيًا. صحيح إن لم يبقَ شيء محجوز. */
+    private fun purgeNow(key: String): Boolean {
+        val held = trashFor(key)
+        if (held.exists()) held.delete()
+        return !held.exists()
+    }
 }
 
 class BayanPythonBridge private constructor(private val context: Context) :
@@ -85,6 +671,9 @@ class BayanPythonBridge private constructor(private val context: Context) :
 
         fun peek(): BayanPythonBridge? = instance
 
+        /** عدد الجلسات المنتهية المحتفظ بها (الأقدم تُحذف جلستها كاملة). */
+        const val MAX_FINISHED_RUNS = 10
+
         const val BUSY_MESSAGE =
             "هناك سكربت يعمل الآن، وقد يكون في الخلفية. أوقفه من إشعار «مشغّل بايثون» (زر «إيقاف الكل») ثم أعد المحاولة"
     }
@@ -98,9 +687,13 @@ class BayanPythonBridge private constructor(private val context: Context) :
     private val controlExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "Bayan-Python-Control").apply { isDaemon = true }
     }
+    // المفتاح: مسار السكربت. لكل سكربت جلسة واحدة (الأخيرة)، وتشغيل جديد لنفس السكربت يستبدلها.
     private val sessions = mutableMapOf<String, RunSession>()
     private val sessionsLock = Any()
     private var environmentReady = false
+
+    // سجل الإخراج الدائم (2.5D1): يعيش مع الجسر، فيستمر التسجيل والواجهة مغلقة. كل عمل الملفات على خيطه الخلفي.
+    private val logs = LogStore(File(context.filesDir, "logs")).also { it.start() }
 
     // الأعضاء التالية تُلمس من الخيط الرئيسي فقط
     private var eventSink: EventChannel.EventSink? = null
@@ -131,36 +724,56 @@ class BayanPythonBridge private constructor(private val context: Context) :
         eventSink = null
     }
 
+    // لا إعادة بث تلقائية: الواجهة تجلب أحداث الجلسة بنفسها عبر runs.attach
+    // وترقيم الأحداث (seq) يمنع تكرار حدث أو ضياعه بين الجلب والبث الحي.
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         eventSink = events
-        replayActiveRuns()
     }
 
     override fun onCancel(arguments: Any?) {
         eventSink = null
     }
 
-    // واجهة جديدة (بعد إغلاق الأكتيفيتي) تستلم أحداث السكربتات الشغّالة من البداية
-    private fun replayActiveRuns() {
-        val sink = eventSink ?: return
-        val active = synchronized(sessionsLock) { sessions.values.filter { !it.finished } }
-        for (session in active) {
-            for (event in session.ring.snapshot()) {
-                sink.success(event + ("replay" to true))
+    private fun emit(values: Map<String, Any?>) {
+        val now = System.currentTimeMillis()
+        // الترقيم والتخزين والتسليم على الخيط الرئيسي معًا، فيتطابق ما في المخزن مع ما بُثّ حيًا
+        main.post {
+            var out = values
+            if (values["channel"] == "run") {
+                val id = values["runId"] as? String
+                val session = if (id != null) sessionByRunId(id) else null
+                if (session != null) {
+                    session.seq += 1
+                    out = values + ("seq" to session.seq)
+                    session.ring.add(out)
+                    // مسار واحد للتسجيل الدائم: هنا فقط، مرة لكل حدث، سواء كانت الواجهة متصلة أم لا
+                    logs.record(
+                        session.scriptPath,
+                        session.runId,
+                        session.startedAt,
+                        values["type"] as? String ?: "",
+                        values["text"] as? String ?: "",
+                        (values["exitCode"] as? Number)?.toInt() ?: session.exitCode,
+                        now,
+                    )
+                }
             }
+            eventSink?.success(out)
         }
     }
 
-    private fun emit(values: Map<String, Any?>) {
-        // التخزين والتسليم على الخيط الرئيسي معًا حتى لا يتكرر حدث بين الإعادة والبث الحي
-        main.post {
-            if (values["channel"] == "run") {
-                val id = values["runId"] as? String
-                if (id != null) {
-                    synchronized(sessionsLock) { sessions[id] }?.ring?.add(values)
-                }
-            }
-            eventSink?.success(values)
+    private fun sessionByRunId(runId: String): RunSession? = synchronized(sessionsLock) {
+        sessions.values.firstOrNull { it.runId == runId }
+    }
+
+    // يُستدعى داخل sessionsLock. يبقي آخر MAX_FINISHED_RUNS جلسة منتهية فقط.
+    private fun pruneFinishedLocked() {
+        val done = sessions.values.filter { it.finished }.sortedBy { it.endedAt }
+        var extra = done.size - MAX_FINISHED_RUNS
+        for (old in done) {
+            if (extra <= 0) break
+            sessions.remove(old.scriptPath)
+            extra--
         }
     }
 
@@ -190,8 +803,9 @@ class BayanPythonBridge private constructor(private val context: Context) :
     /** زر «إيقاف الكل» في الإشعار. */
     fun stopAll() {
         synchronized(sessionsLock) {
-            sessions.values.forEach {
+            sessions.values.filter { !it.finished }.forEach {
                 it.stopped = true
+                it.waiting = false
                 it.input.offer("")
             }
         }
@@ -245,6 +859,8 @@ class BayanPythonBridge private constructor(private val context: Context) :
             "run" -> {
                 val runId = call.argument<String>("runId")
                 val scriptPath = call.argument<String>("scriptPath")
+                // بصمة النص تُخزَّن كما هي (نص فقط)، وKotlin لا يفهمها
+                val textHash = call.argument<String>("textHash")
                 if (runId.isNullOrBlank() || scriptPath.isNullOrBlank()) {
                     fail(result, "bad_arguments", "بيانات التشغيل ناقصة")
                     return
@@ -256,11 +872,21 @@ class BayanPythonBridge private constructor(private val context: Context) :
                         fail(result, "busy", BUSY_MESSAGE)
                         return
                     }
-                    sessions.clear()
-                    session = RunSession(runId, scriptPath)
-                    sessions[runId] = session
+                    session = RunSession(runId, scriptPath, textHash)
+                    // جلسة هذا السكربت القديمة (المنتهية) تُستبدل، وجلسات غيره تبقى
+                    sessions[scriptPath] = session
+                    pruneFinishedLocked()
                 }
-                emit(mapOf("channel" to "run", "type" to "started", "runId" to runId))
+                emit(
+                    mapOf(
+                        "channel" to "run",
+                        "type" to "started",
+                        "runId" to runId,
+                        "scriptPath" to scriptPath,
+                        // الواجهة تقارن بها نص المحرر فور البدء (زر «دخول») بلا انتظار runs.list
+                        "textHash" to textHash,
+                    )
+                )
                 // الخدمة الأمامية تبدأ هنا (الواجهة ظاهرة فالبدء مسموح) وتبقي العملية حيّة
                 BayanScriptService.ensureStarted(context)
                 pythonExecutor.execute {
@@ -270,6 +896,7 @@ class BayanPythonBridge private constructor(private val context: Context) :
                         module.callAttr("run_script", scriptPath, session.callback)
                     } catch (t: Throwable) {
                         if (!session.finished) {
+                            session.end(1)
                             emitError(runId, friendly(t))
                             emit(
                                 mapOf(
@@ -281,9 +908,14 @@ class BayanPythonBridge private constructor(private val context: Context) :
                             )
                         }
                     } finally {
-                        session.finished = true
-                        synchronized(sessionsLock) { sessions.remove(runId) }
-                        main.post { BayanScriptService.onRunsChanged() }
+                        // الجلسة تبقى بعد الانتهاء (إخراجها وحالتها) إلى أن تُستبدل أو تُقصى بالحد
+                        session.end(null)
+                        synchronized(sessionsLock) { pruneFinishedLocked() }
+                        main.post {
+                            // شبكة أمان: سطر النهاية يُكتب مرة واحدة، فإن لم يصل حدث exit يُكتب هنا (المكرر يُتجاهل)
+                            logs.endRun(session.scriptPath, runId, System.currentTimeMillis(), session.exitCode)
+                            BayanScriptService.onRunsChanged()
+                        }
                     }
                 }
                 complete(result, true)
@@ -296,12 +928,15 @@ class BayanPythonBridge private constructor(private val context: Context) :
                     fail(result, "bad_arguments", "معرف التشغيل ناقص")
                     return
                 }
-                val session = synchronized(sessionsLock) { sessions[runId] }
+                val session = sessionByRunId(runId)
                 if (session == null || session.finished) {
                     complete(result, false)
                     return
                 }
+                session.waiting = false
                 session.input.offer(value)
+                // ما كتبه المستخدم يُسجَّل كما كُتب، قبل أي إخراج يليه (هذا الاستدعاء على الخيط الرئيسي)
+                logs.addEvent(session.scriptPath, System.currentTimeMillis(), "i", value)
                 complete(result, true)
             }
 
@@ -311,14 +946,168 @@ class BayanPythonBridge private constructor(private val context: Context) :
                     fail(result, "bad_arguments", "معرف التشغيل ناقص")
                     return
                 }
-                val session = synchronized(sessionsLock) { sessions[runId] }
-                if (session == null) {
+                val session = sessionByRunId(runId)
+                if (session == null || session.finished) {
                     complete(result, false)
                     return
                 }
                 session.stopped = true
+                session.waiting = false
                 session.input.offer("")
                 complete(result, true)
+            }
+
+            // ───── ج6: طرق الجلسات ─────
+            "runs.list" -> {
+                val list = synchronized(sessionsLock) { sessions.values.map { it.summary() } }
+                complete(result, list)
+            }
+
+            "runs.attach" -> {
+                val runId = call.argument<String>("runId")
+                if (runId.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "معرف التشغيل ناقص")
+                    return
+                }
+                val session = sessionByRunId(runId)
+                if (session == null) {
+                    complete(result, null)
+                    return
+                }
+                // هذا الاستدعاء والتخزين في emit على الخيط الرئيسي نفسه، فاللقطة ورقم lastSeq متطابقان
+                val reply = session.summary() + mapOf(
+                    "events" to session.ring.snapshot(),
+                    "lastSeq" to session.seq,
+                    "truncated" to session.ring.truncated,
+                )
+                complete(result, reply)
+            }
+
+            "runs.stopAll" -> {
+                stopAll()
+                complete(result, true)
+            }
+
+            "runs.move" -> {
+                val fromPath = call.argument<String>("from")
+                val toPath = call.argument<String>("to")
+                if (fromPath.isNullOrBlank() || toPath.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                val moved = synchronized(sessionsLock) {
+                    val session = sessions[fromPath]
+                    val clash = sessions[toPath]
+                    if (session == null || (clash != null && !clash.finished)) {
+                        false
+                    } else {
+                        sessions.remove(fromPath)
+                        session.scriptPath = toPath
+                        sessions[toPath] = session
+                        true
+                    }
+                }
+                complete(result, moved)
+                if (moved) main.post { BayanScriptService.onRunsChanged() }
+            }
+
+            "runs.discard" -> {
+                val path = call.argument<String>("scriptPath")
+                if (path.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                // تُحذف المنتهية فقط. السكربت الشغّال لا نمسه
+                val discarded = synchronized(sessionsLock) {
+                    val session = sessions[path]
+                    if (session != null && session.finished) {
+                        sessions.remove(path)
+                        true
+                    } else {
+                        false
+                    }
+                }
+                complete(result, discarded)
+            }
+
+            // ───── 2.5D1: سجل الإخراج الدائم (logs.*) — كلها غير متزامنة وتعمل على خيط LogStore ─────
+            // المعامل scriptPath مسار السكربت (أو اسمه): المفتاح اسم الملف بحروف صغيرة.
+            // logs.size   {scriptPath} -> Long (بايت، 0 إن لم يوجد سجل)
+            "logs.size" -> {
+                val path = call.argument<String>("scriptPath")
+                if (path.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                logs.size(path, { complete(result, it) }, { fail(result, "logs_size", friendly(it)) })
+            }
+
+            // logs.page   {scriptPath, before?: Long, maxBytes?: Int, epoch?: Long}
+            //   -> {text, start, end, size, hasMore, epoch, stale}
+            //   text: أسطر JSONL كاملة (القطعة تنتهي عند before وتمتد للخلف)، before = null يعني نهاية الملف.
+            //   stale = true: تغيّر الملف (قص/مسح/نقل) منذ epoch المرسل، فابدأ من النهاية من جديد.
+            "logs.page" -> {
+                val path = call.argument<String>("scriptPath")
+                if (path.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                val before = call.argument<Number>("before")?.toLong()
+                val maxBytes = call.argument<Number>("maxBytes")?.toInt() ?: LogStore.PAGE_DEFAULT_BYTES
+                val epoch = call.argument<Number>("epoch")?.toLong()
+                logs.page(path, before, maxBytes, epoch, { complete(result, it) }, { fail(result, "logs_page", friendly(it)) })
+            }
+
+            // logs.clear  {scriptPath} -> Boolean (يبقي سطر بداية التشغيل الجاري ويواصل التسجيل)
+            "logs.clear" -> {
+                val path = call.argument<String>("scriptPath")
+                if (path.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                logs.clear(path, { complete(result, it) }, { fail(result, "logs_clear", friendly(it)) })
+            }
+
+            // logs.move   {from, to} -> Boolean (false: تعذر النقل؛ لا سجل للمصدر يعني لا شيء ليُنقل فيعود true)
+            "logs.move" -> {
+                val fromPath = call.argument<String>("from")
+                val toPath = call.argument<String>("to")
+                if (fromPath.isNullOrBlank() || toPath.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                logs.move(fromPath, toPath, { complete(result, it) }, { fail(result, "logs_move", friendly(it)) })
+            }
+
+            // logs.trash  {scriptPath} -> Boolean (true: حُجز السجل باسم ".trash"؛ false: لا سجل)
+            "logs.trash" -> {
+                val path = call.argument<String>("scriptPath")
+                if (path.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                logs.trash(path, { complete(result, it) }, { fail(result, "logs_trash", friendly(it)) })
+            }
+
+            // logs.untrash {scriptPath, restoreAs?} -> Boolean (false: لا سجل محجوز، أو وُجد سجل جديد بالاسم المستعاد فلا نكتب فوقه)
+            "logs.untrash" -> {
+                val path = call.argument<String>("scriptPath")
+                val restoreAs = call.argument<String>("restoreAs")
+                if (path.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                logs.untrash(path, restoreAs, { complete(result, it) }, { fail(result, "logs_untrash", friendly(it)) })
+            }
+
+            // logs.purge  {scriptPath} -> Boolean (true: لم يبقَ سجل محجوز)
+            "logs.purge" -> {
+                val path = call.argument<String>("scriptPath")
+                if (path.isNullOrBlank()) {
+                    fail(result, "bad_arguments", "مسار السكربت ناقص")
+                    return
+                }
+                logs.purge(path, { complete(result, it) }, { fail(result, "logs_purge", friendly(it)) })
             }
 
             "packages.list" -> {
@@ -536,6 +1325,7 @@ class BayanPythonBridge private constructor(private val context: Context) :
 
         @Suppress("unused")
         fun emitInput(prompt: String) {
+            session.waiting = true
             emit(
                 mapOf(
                     "channel" to "run",
@@ -551,6 +1341,7 @@ class BayanPythonBridge private constructor(private val context: Context) :
             if (session.stopped) return null
             return try {
                 session.input.take().also {
+                    session.waiting = false
                     if (session.stopped) return null
                 }
             } catch (_: InterruptedException) {
@@ -585,8 +1376,7 @@ class BayanPythonBridge private constructor(private val context: Context) :
 
         @Suppress("unused")
         fun emitExit(code: Int) {
-            session.exitCode = code
-            session.finished = true
+            session.end(code)
             emit(
                 mapOf(
                     "channel" to "run",
@@ -623,15 +1413,49 @@ class BayanPythonBridge private constructor(private val context: Context) :
         }
     }
 
-    inner class RunSession(val runId: String, val scriptPath: String) {
+    inner class RunSession(val runId: String, initialPath: String, val textHash: String?) {
+        @Volatile var scriptPath: String = initialPath
         @Volatile var stopped = false
+        @Volatile var waiting = false
         @Volatile var finished = false
         @Volatile var exitCode = -1
+        @Volatile var endedAt = 0L
         val startedAt: Long = System.currentTimeMillis()
-        val displayName: String = scriptPath.substringAfterLast('/')
+        val displayName: String get() = scriptPath.substringAfterLast('/')
         val input = LinkedBlockingQueue<String>()
         val ring = EventRing()
         val callback = RunCallback(this)
+
+        // عدّاد ترقيم الأحداث. يُلمس من الخيط الرئيسي فقط (داخل emit وrun.attach)
+        var seq = 0
+
+        /** running | waiting | finished | stopped | error — تُحسب من الحالة الفعلية، لا من نيّة الإيقاف. */
+        val status: String
+            get() = when {
+                !finished -> if (waiting) "waiting" else "running"
+                exitCode == 0 -> "finished"
+                exitCode == 130 -> "stopped"
+                else -> "error"
+            }
+
+        /** ينهي الجلسة مرة واحدة فقط. code == null يبقي رمز الخروج كما هو. */
+        @Synchronized
+        fun end(code: Int?) {
+            if (finished) return
+            if (code != null) exitCode = code
+            endedAt = System.currentTimeMillis()
+            finished = true
+        }
+
+        fun summary(): Map<String, Any?> = mapOf(
+            "runId" to runId,
+            "scriptPath" to scriptPath,
+            "status" to status,
+            "startedAt" to startedAt,
+            "endedAt" to endedAt,
+            "exitCode" to exitCode,
+            "textHash" to textHash,
+        )
     }
 }
 

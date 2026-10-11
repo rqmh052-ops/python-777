@@ -167,6 +167,23 @@ Widget arContextMenu(BuildContext context, EditableTextState editable) {
   );
 }
 
+/// قائمة التحديد العربية للنصوص القابلة للتحديد خارج حقول الكتابة.
+Widget arSelectionContextMenu(
+    BuildContext context, SelectableRegionState selectableRegionState) {
+  final items = <ContextMenuButtonItem>[];
+  for (final item in selectableRegionState.contextMenuButtonItems) {
+    if (item.type == ContextMenuButtonType.copy) {
+      items.add(item.copyWith(label: 'نسخ'));
+    } else if (item.type == ContextMenuButtonType.selectAll) {
+      items.add(item.copyWith(label: 'تحديد الكل'));
+    }
+  }
+  return AdaptiveTextSelectionToolbar.buttonItems(
+    anchors: selectableRegionState.contextMenuAnchors,
+    buttonItems: items,
+  );
+}
+
 // يعيد بناء الواجهة كلما تغيّر طابور تثبيت المكتبات
 class InstallerBuilder extends StatelessWidget {
   const InstallerBuilder({super.key, required this.builder});
@@ -762,6 +779,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _boot() async {
     await store.init();
     if (!mounted) return;
+    unawaited(runHub.init());
     if (!store.getFlag(_welcomeFlag)) {
       // الترحيب يشمل إذن الملفات، فلا نعرض نافذته المنفصلة في هذه المرة
       _asked = true;
@@ -784,7 +802,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) store.onResume();
+    if (state == AppLifecycleState.resumed) {
+      store.onResume();
+      unawaited(runHub.refresh());
+    }
   }
 
   @override
@@ -986,8 +1007,14 @@ class ScriptTile extends StatelessWidget {
   final Script script;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => ListenableBuilder(
+        listenable: runHub,
+        builder: (context, _) => _tile(context),
+      );
+
+  Widget _tile(BuildContext context) {
     final run = script.lastRun;
+    final info = runHub.infoFor(script.path);
     return Material(
       color: C.surface,
       clipBehavior: Clip.antiAlias,
@@ -1012,6 +1039,8 @@ class ScriptTile extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Row(children: [
+                      RunDot(status: info?.status),
+                      const SizedBox(width: 8),
                       Flexible(
                         child: Text(script.name,
                             textDirection: TextDirection.ltr,
@@ -1026,11 +1055,7 @@ class ScriptTile extends StatelessWidget {
                     const SizedBox(height: 2),
                     Text('آخر تعديل: ${relativeTime(script.modified)}',
                         style: const TextStyle(fontSize: 12, color: C.muted)),
-                    Text(
-                        run == null
-                            ? 'لم يُشغّل بعد'
-                            : 'آخر تشغيل: ${relativeTime(run)}',
-                        style: const TextStyle(fontSize: 12, color: C.muted)),
+                    _statusLine(info, run),
                   ]),
             ),
             const Icon(Icons.chevron_left,
@@ -1040,6 +1065,134 @@ class ScriptTile extends StatelessWidget {
       ),
     );
   }
+
+  // أخضر «يعمل منذ 02:15» (مؤقت حي) · عنبري «ينتظر إدخال» · أحمر «انتهى بكود N»
+  // · رمادي «آخر تشغيل: …» (انتهى بنجاح أو أُوقف أو لم يُشغّل). سطر واحد دائمًا.
+  Widget _statusLine(RunInfo? info, DateTime? lastRun) {
+    if (info != null && info.status == RunStatus.running) {
+      return ValueListenableBuilder<int>(
+        valueListenable: runHub.clock,
+        builder: (context, tick, child) => Text(
+          'يعمل منذ ${fmtElapsed(DateTime.now().difference(info.startedAt))}',
+          style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)),
+        ),
+      );
+    }
+    if (info != null && info.status == RunStatus.waiting) {
+      return Text('ينتظر إدخال',
+          style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)));
+    }
+    if (info != null && info.status == RunStatus.error) {
+      final code = info.exitCode;
+      return Text(code == null ? 'انتهى بخطأ' : 'انتهى بكود $code',
+          style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)));
+    }
+    return Text(
+        lastRun == null ? 'لم يُشغّل بعد' : 'آخر تشغيل: ${relativeTime(lastRun)}',
+        style: const TextStyle(fontSize: 12, color: C.muted));
+  }
+}
+
+String fmtElapsed(Duration d) {
+  final total = d.inSeconds < 0 ? 0 : d.inSeconds;
+  final h = total ~/ 3600;
+  final m = (total % 3600) ~/ 60;
+  final sec = total % 60;
+  String two(int n) => n.toString().padLeft(2, '0');
+  return h > 0 ? '$h:${two(m)}:${two(sec)}' : '${two(m)}:${two(sec)}';
+}
+
+/// نقطة حال السكربت: أخضر يعمل، عنبري ينتظر إدخالًا، أحمر انتهى بخطأ،
+/// ورمادي في بقية الحالات (انتهى بنجاح أو موقوف، وأغمق إن لم تكن له جلسة).
+class RunDot extends StatelessWidget {
+  const RunDot({super.key, required this.status});
+  final RunStatus? status;
+
+  static Color colorOf(RunStatus? s) {
+    switch (s) {
+      case RunStatus.running:
+        return C.ok;
+      case RunStatus.waiting:
+        return C.warn;
+      case RunStatus.error:
+        return C.error;
+      case RunStatus.finished:
+      case RunStatus.stopped:
+        return C.dim;
+      case null:
+        return C.outline;
+    }
+  }
+
+  static String labelOf(RunStatus? s) {
+    switch (s) {
+      case RunStatus.running:
+        return 'يعمل';
+      case RunStatus.waiting:
+        return 'ينتظر إدخالًا';
+      case RunStatus.finished:
+        return 'انتهى';
+      case RunStatus.error:
+        return 'انتهى بخطأ';
+      case RunStatus.stopped:
+        return 'موقوف';
+      case null:
+        return 'لا توجد جلسة';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+        label: labelOf(status),
+        child: Container(
+          width: 9,
+          height: 9,
+          decoration: BoxDecoration(shape: BoxShape.circle, color: colorOf(status)),
+        ),
+      );
+}
+
+/// كل تشغيل جديد يمر من هنا (سكربت واحد في كل مرة الآن).
+/// true = المكان فارغ ويمكن بدء التشغيل.
+/// - يعمل سكربت آخر: نافذة «سكربت آخر يعمل» (إيقافه وتشغيل هذا؟).
+/// - تعمل نسخة قديمة من هذا السكربت نفسه (نصه تغيّر): نافذة «إيقاف النسخة القديمة وتشغيل الجديدة؟».
+/// confirmOwnOldRun = false لزر «إعادة تشغيل» في شاشة الإخراج: المستخدم طلب الإيقاف بنفسه.
+Future<bool> claimRunSlot(BuildContext context, Script script,
+    {bool confirmOwnOldRun = true}) async {
+  final other = runSlot.occupant;
+  if (other == null) return true;
+  final sameScript = other.scriptPath == script.path;
+  if (!sameScript || confirmOwnOldRun) {
+    final otherName =
+        other.scriptPath.substring(other.scriptPath.lastIndexOf('/') + 1);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: C.surface,
+        title: Text(sameScript
+            ? 'إيقاف النسخة القديمة وتشغيل الجديدة؟'
+            : 'سكربت آخر يعمل'),
+        content: Text(sameScript
+            ? 'النسخة السابقة من هذا السكربت ما زالت تعمل بالنص القديم.'
+            : 'يعمل الآن $otherName. إيقافه وتشغيل هذا؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('إلغاء')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('إيقاف وتشغيل')),
+        ],
+      ),
+    );
+    if (ok != true) return false;
+  }
+  final freed = await runSlot.release();
+  if (!freed && context.mounted) {
+    _toast(context,
+        'السكربت الذي يعمل لم يتوقف بعد (قد يكون عالقًا في عملية شبكة أو ملف). حاول بعد قليل، أو أوقفه من إشعار «مشغّل بايثون»');
+  }
+  return freed;
 }
 
 // ───────── إدارة السكربتات: تثبيت / إعادة تسمية / نسخ / حذف ─────────
@@ -1084,6 +1237,13 @@ void scriptActions(BuildContext context, Script s) {
                     togglePin(context, s);
                   }),
               ActionRow(
+                  icon: Icons.receipt_long_outlined,
+                  label: 'سجل الإخراج',
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    Navigator.of(context).push(smooth<void>(LogScreen(script: s)));
+                  }),
+              ActionRow(
                   icon: Icons.edit_outlined,
                   label: 'إعادة تسمية',
                   onTap: () {
@@ -1111,6 +1271,14 @@ void scriptActions(BuildContext context, Script s) {
   );
 }
 
+/// سكربت يعمل الآن (أو ينتظر إدخالًا) لا يُعاد تسميته ولا يُحذف: الجلسة مرتبطة بمساره.
+/// true = ممنوع (تظهر الرسالة إن كانت الشاشة ما زالت قائمة).
+bool _blockedWhileRunning(BuildContext context, Script s) {
+  if (runHub.infoFor(s.path)?.isLive != true) return false;
+  if (context.mounted) _toast(context, 'أوقف السكربت أولًا');
+  return true;
+}
+
 Future<void> togglePin(BuildContext context, Script s) async {
   try {
     await store.setPinned(s, !s.pinned);
@@ -1120,6 +1288,7 @@ Future<void> togglePin(BuildContext context, Script s) async {
 }
 
 Future<void> renameScript(BuildContext context, Script s) async {
+  if (_blockedWhileRunning(context, s)) return;
   final ctl = TextEditingController(text: s.name);
   final result = await showDialog<String>(
     context: context,
@@ -1146,8 +1315,24 @@ Future<void> renameScript(BuildContext context, Script s) async {
     ),
   );
   if (result == null || result.isEmpty) return;
+  // قد يبدأ التشغيل أثناء النافذة المفتوحة: نعيد الفحص قبل التنفيذ
+  if (_blockedWhileRunning(context, s)) return;
+  final oldPath = s.path;
   try {
     final r = await store.rename(s, result);
+    if (r != null && r.path != oldPath) {
+      unawaited(runHub.moved(oldPath, r.path));
+      try {
+        final moved = await bayanPython.logsMove(from: oldPath, to: r.path);
+        if (!moved && context.mounted) {
+          _toast(context, 'تمت إعادة التسمية لكن تعذّر نقل سجل الإخراج');
+        }
+      } catch (_) {
+        if (context.mounted) {
+          _toast(context, 'تمت إعادة التسمية لكن تعذّر نقل سجل الإخراج');
+        }
+      }
+    }
     if (!context.mounted) return;
     if (r == null) {
       _toast(context, 'اسم غير صالح');
@@ -1169,7 +1354,9 @@ Future<void> duplicateScript(BuildContext context, Script s) async {
 }
 
 Future<void> deleteScript(BuildContext context, Script s) async {
+  if (_blockedWhileRunning(context, s)) return;
   final m = ScaffoldMessenger.of(context);
+  final deletedPath = s.path;
   DeletedScript? d;
   try {
     d = await store.delete(s);
@@ -1179,27 +1366,75 @@ Future<void> deleteScript(BuildContext context, Script s) async {
     return;
   }
   if (d == null) return;
+  unawaited(runHub.discarded(deletedPath));
+
+  // نحجز السجل بعد نجاح حذف الملف، حتى لا تُفقد السجلات إن فشل الحذف نفسه.
+  var logTrashed = false;
+  var logTrashFailed = false;
+  try {
+    logTrashed = await bayanPython.logsTrash(deletedPath);
+  } catch (_) {
+    logTrashFailed = true;
+  }
+
   final gone = d;
   m.clearSnackBars();
-  m.showSnackBar(SnackBar(
-    content: Text('تم حذف ${gone.name}'),
+  final controller = m.showSnackBar(SnackBar(
+    content: Text(logTrashFailed
+        ? 'تم حذف ${gone.name} (تعذّر نقل سجل الإخراج مؤقتًا)'
+        : 'تم حذف ${gone.name}'),
     action: SnackBarAction(
       label: 'تراجع',
       onPressed: () async {
+        late final Script r;
         try {
-          final r = await store.restore(gone);
-          if (r.name != gone.name) {
-            m.clearSnackBars();
-            m.showSnackBar(
-                SnackBar(content: Text('تمت الاستعادة باسم ${r.name}')));
-          }
+          r = await store.restore(gone);
         } catch (_) {
-          m.clearSnackBars();
-          m.showSnackBar(const SnackBar(content: Text('تعذّرت الاستعادة')));
+          if (logTrashed) {
+            try {
+              await bayanPython.logsPurge(deletedPath);
+            } catch (_) {}
+          }
+          if (context.mounted) {
+            m.clearSnackBars();
+            m.showSnackBar(const SnackBar(content: Text('تعذّرت استعادة الملف')));
+          }
+          return;
+        }
+
+        // فشل استعادة السجل لا يعني أن استعادة ملف السكربت نفسها فشلت.
+        if (logTrashed) {
+          var logRestored = false;
+          try {
+            logRestored = await bayanPython.logsUntrash(
+              deletedPath,
+              restoreAs: r.path,
+            );
+          } catch (_) {}
+          if (!logRestored) {
+            try {
+              await bayanPython.logsPurge(deletedPath);
+            } catch (_) {}
+            if (context.mounted) {
+              _toast(context, 'تمت استعادة الملف لكن تعذّر استعادة سجل الإخراج');
+            }
+          }
+        }
+        if (r.name != gone.name && context.mounted) {
+          _toast(context, 'تمت الاستعادة باسم ${r.name}');
         }
       },
     ),
   ));
+  // يُحذف الملف المؤقت عند انقضاء الإشعار أو إغلاقه، ويُترك فقط عند ضغط «تراجع».
+  unawaited(controller.closed.then((reason) async {
+    if (!logTrashed || reason == SnackBarClosedReason.action) return;
+    try {
+      await bayanPython.logsPurge(deletedPath);
+    } catch (_) {
+      // تنظيف .trash عند بدء التطبيق يغطي أي فشل عابر هنا.
+    }
+  }));
 }
 
 // ───────── القائمة الجانبية ─────────
@@ -2843,7 +3078,7 @@ class _ScriptScreenState extends State<ScriptScreen>
   final _viewKey = GlobalKey();
   final _searchCtl = TextEditingController();
   final _searchFocus = FocusNode();
-  Timer? _timer, _markTimer, _searchTimer;
+  Timer? _timer, _markTimer, _searchTimer, _hashTimer;
   String? _lastSaved;
   bool _loading = true, _warned = false;
   ModalRoute<dynamic>? route;
@@ -2857,6 +3092,7 @@ class _ScriptScreenState extends State<ScriptScreen>
   void initState() {
     super.initState();
     open[widget.script.path] = this;
+    runHub.addListener(_onHub);
     WidgetsBinding.instance.addObserver(this);
     _load();
   }
@@ -2876,6 +3112,7 @@ class _ScriptScreenState extends State<ScriptScreen>
           text: text, selection: TextSelection.collapsed(offset: text.length));
       widget.script.code = text;
       _lastSaved = text;
+      _refreshHash();
       _code.addListener(_onChanged);
       setState(() => _loading = false);
       final line = widget.initialLine;
@@ -2897,6 +3134,7 @@ class _ScriptScreenState extends State<ScriptScreen>
     widget.script.code = t;
     _timer?.cancel();
     _timer = Timer(const Duration(milliseconds: 800), _save);
+    _scheduleHash();
     if (_code.hasLineMark) {
       _markTimer?.cancel();
       _code.setLineMark(null); // مواضع التظليل لم تعد صحيحة بعد التعديل
@@ -2936,10 +3174,12 @@ class _ScriptScreenState extends State<ScriptScreen>
   @override
   void dispose() {
     if (identical(open[widget.script.path], this)) open.remove(widget.script.path);
+    runHub.removeListener(_onHub);
     WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
     _markTimer?.cancel();
     _searchTimer?.cancel();
+    _hashTimer?.cancel();
     _flush();
     _code.removeListener(_onChanged);
     _code.dispose();
@@ -2956,11 +3196,55 @@ class _ScriptScreenState extends State<ScriptScreen>
     Navigator.pop(context);
   }
 
-  // التشغيل يفتح شاشة إخراج مستقلة
+  void _onHub() {
+    if (mounted) setState(() {});
+  }
+
+  // بصمة النص الحالي في المحرر. تُحسب بعد توقف الكتابة بحوالي 300ms (لا مع كل حرف)،
+  // وفورًا عند التحميل وعند الضغط على الزر الأسفل.
+  String? _hashText, _hashValue;
+
+  void _refreshHash() {
+    final text = widget.script.code;
+    if (identical(_hashText, text) && _hashValue != null) return;
+    _hashText = text;
+    _hashValue = textFingerprint(text);
+  }
+
+  void _scheduleHash() {
+    _hashTimer?.cancel();
+    _hashTimer = Timer(const Duration(milliseconds: 300), () {
+      if (!mounted) return;
+      setState(_refreshHash);
+    });
+  }
+
+  // جلسة هذا السكربت (شغّالة أو منتهية محتفظ بإخراجها) إذا كان نص المحرر حرفيًا نص تشغيلها،
+  // وإلا null. تعديل حرف واحد يقطعها، والتراجع عن التعديل يعيدها.
+  RunInfo? _enterableRun() {
+    final info = runHub.infoFor(widget.script.path);
+    final saved = info?.textHash;
+    if (info == null || saved == null) return null;
+    return _hashValue == saved ? info : null;
+  }
+
+  bool get _canEnter => _enterableRun() != null;
+
+  // «دخول» يفتح الجلسة القائمة. «تشغيل» تشغيل جديد يمر من بوابة RunSlot
   Future<void> _openOutput() async {
     await _save();
     if (!mounted) return;
     _focus.unfocus();
+    _hashTimer?.cancel();
+    _refreshHash(); // القرار على النص الحالي بالضبط، لا على بصمة قديمة ما زال مؤقتها ينتظر
+    final session = _enterableRun();
+    if (session != null) {
+      Navigator.push(context,
+          smooth(OutputScreen(script: widget.script, attachRunId: session.runId)));
+      return;
+    }
+    if (!await claimRunSlot(context, widget.script)) return;
+    if (!mounted) return;
     Navigator.push(context, smooth(OutputScreen(script: widget.script)));
   }
 
@@ -3226,8 +3510,10 @@ class _ScriptScreenState extends State<ScriptScreen>
               child: Row(children: [
                 Expanded(
                     child: PButton(
-                        label: 'تشغيل',
-                        icon: Icons.play_arrow_rounded,
+                        label: _canEnter ? 'دخول' : 'تشغيل',
+                        icon: _canEnter
+                            ? Icons.login_rounded
+                            : Icons.play_arrow_rounded,
                         onPressed: _loading ? null : _openOutput)),
               ]),
             ),
@@ -3292,6 +3578,32 @@ class Line {
   final int kind;
 }
 
+/// يحوّل دفعات stdout/stderr إلى أسطر بالمنطق نفسه في الإخراج الحي والسجل الدائم.
+void appendOutputEventLines(List<Line> lines, String text, int kind,
+    {int maxLines = 5000}) {
+  if (text.isEmpty) return;
+  final normalized = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+  // ادمج مع آخر سطر من النوع نفسه، لكن اجمع أحرف الدفعة في StringBuffer لتفادي نسخ
+  // السلسلة مع كل حرف (خصوصًا عند قراءة دفعات السجل الكبيرة أو السطر الواحد الطويل).
+  final buffer = StringBuffer();
+  if (lines.isNotEmpty && lines.last.kind == kind) {
+    buffer.write(lines.removeLast().text);
+  }
+  for (var i = 0; i < normalized.length; i++) {
+    final ch = normalized[i];
+    if (ch == '\n') {
+      lines.add(Line(buffer.toString(), kind));
+      buffer.clear();
+    } else {
+      buffer.write(ch);
+    }
+  }
+  lines.add(Line(buffer.toString(), kind));
+  if (lines.length > maxLines) {
+    lines.removeRange(0, lines.length - maxLines);
+  }
+}
+
 Color _lineColor(int k) => k == 1
     ? C.dim
     : k == 2
@@ -3300,9 +3612,539 @@ Color _lineColor(int k) => k == 1
             ? C.error
             : C.text;
 
-class OutputScreen extends StatefulWidget {
-  const OutputScreen({super.key, required this.script});
+// سجل JSONL كما وصل من LogStore. تُتجاهل الأسطر غير المكتملة/التالفة بدل تعطيل الشاشة.
+class _StoredLogRecord {
+  const _StoredLogRecord({
+    required this.type,
+    this.runId = '',
+    this.timeMs = 0,
+    this.kind = '',
+    this.text = '',
+    this.code,
+  });
+
+  final String type; // start / event / end
+  final String runId;
+  final int timeMs;
+  final String kind;
+  final String text;
+  final int? code;
+
+  static List<_StoredLogRecord> parsePage(String text) {
+    final result = <_StoredLogRecord>[];
+    for (final line in text.split('\n')) {
+      if (line.trim().isEmpty) continue;
+      try {
+        final decoded = jsonDecode(line);
+        if (decoded is! Map) continue;
+        final m = Map<String, dynamic>.from(decoded);
+        if (m['run'] is String && m['start'] is num) {
+          result.add(_StoredLogRecord(
+            type: 'start',
+            runId: m['run'].toString(),
+            timeMs: (m['start'] as num).toInt(),
+          ));
+        } else if (m['end'] is String && m['t'] is num) {
+          result.add(_StoredLogRecord(
+            type: 'end',
+            runId: m['end'].toString(),
+            timeMs: (m['t'] as num).toInt(),
+            code: (m['code'] as num?)?.toInt(),
+          ));
+        } else if (m['k'] is String && m['t'] is num && m['s'] is String) {
+          result.add(_StoredLogRecord(
+            type: 'event',
+            timeMs: (m['t'] as num).toInt(),
+            kind: m['k'].toString(),
+            text: m['s'].toString(),
+          ));
+        }
+      } catch (_) {
+        // قتل التطبيق في منتصف الكتابة قد ترك سطرًا ناقصًا؛ السجل التالي يبقى قابلًا للقراءة.
+      }
+    }
+    return result;
+  }
+}
+
+class _LogDisplayItem {
+  const _LogDisplayItem.line(this.text, this.kind)
+      : isHeader = false,
+        subtitle = '',
+        headerColor = C.muted;
+  const _LogDisplayItem.header(this.text, this.subtitle, this.headerColor)
+      : isHeader = true,
+        kind = 0;
+
+  final String text;
+  final int kind;
+  final bool isHeader;
+  final String subtitle;
+  final Color headerColor;
+}
+
+String _logDate(int milliseconds) {
+  final t = DateTime.fromMillisecondsSinceEpoch(milliseconds);
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}:${two(t.second)}';
+}
+
+String _logDuration(int startMs, int endMs) {
+  final total = ((endMs - startMs) / 1000).floor().clamp(0, 1 << 31);
+  final hours = total ~/ 3600;
+  final minutes = (total % 3600) ~/ 60;
+  final seconds = total % 60;
+  if (hours > 0) return '${hours}س ${minutes}د ${seconds}ث';
+  if (minutes > 0) return '${minutes}د ${seconds}ث';
+  return '${seconds}ث';
+}
+
+class LogScreen extends StatefulWidget {
+  const LogScreen({super.key, required this.script});
   final Script script;
+
+  @override
+  State<LogScreen> createState() => _LogScreenState();
+}
+
+class _LogScreenState extends State<LogScreen> {
+  static const int _pageBytes = 256 * 1024;
+  static const int _copyLimit = 400000;
+
+  final _scroll = ScrollController();
+  List<_StoredLogRecord> _records = <_StoredLogRecord>[];
+  int _sizeBytes = 0;
+  int? _epoch;
+  int? _before;
+  bool _hasMore = false;
+  bool _loading = true;
+  bool _loadingOlder = false;
+  bool _readyToPaginate = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scroll.addListener(_onScroll);
+    unawaited(_loadLatest());
+  }
+
+  @override
+  void dispose() {
+    _scroll.removeListener(_onScroll);
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  String get _sizeLabel =>
+      '${(_sizeBytes / (1024 * 1024)).toStringAsFixed(1)} من 20 MB';
+
+  void _onScroll() {
+    if (!_readyToPaginate || !_scroll.hasClients || _loading || _loadingOlder || !_hasMore) return;
+    if (_scroll.position.pixels < 100) unawaited(_loadOlder());
+  }
+
+  void _scrollToLatest() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scroll.hasClients) return;
+      _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      _readyToPaginate = true;
+    });
+  }
+
+  Future<void> _loadLatest({bool showLoading = true}) async {
+    if (!mounted) return;
+    if (showLoading) {
+      setState(() {
+        _loading = true;
+        _readyToPaginate = false;
+      });
+    }
+    try {
+      final page = await bayanPython.logsPage(widget.script.path, maxBytes: _pageBytes);
+      if (!mounted) return;
+      setState(() {
+        _records = _StoredLogRecord.parsePage(page.text);
+        _sizeBytes = page.size;
+        _epoch = page.epoch;
+        _before = page.start;
+        _hasMore = page.hasMore && page.start > 0;
+        _loading = false;
+      });
+      _scrollToLatest();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loading = false);
+      _snack('تعذّر قراءة سجل الإخراج: ${errText(e)}');
+    }
+  }
+
+  Future<void> _loadOlder() async {
+    if (!_hasMore || _loadingOlder || _loading || _before == null) return;
+    final oldPixels = _scroll.hasClients ? _scroll.position.pixels : 0.0;
+    final oldMax = _scroll.hasClients ? _scroll.position.maxScrollExtent : 0.0;
+    setState(() => _loadingOlder = true);
+    try {
+      final page = await bayanPython.logsPage(
+        widget.script.path,
+        before: _before,
+        maxBytes: _pageBytes,
+        epoch: _epoch,
+      );
+      if (!mounted) return;
+      if (page.stale) {
+        setState(() => _loadingOlder = false);
+        await _loadLatest();
+        _snack('تغيّر السجل؛ تم تحديثه من أحدث البيانات');
+        return;
+      }
+      final older = _StoredLogRecord.parsePage(page.text);
+      setState(() {
+        _records = <_StoredLogRecord>[...older, ..._records];
+        _sizeBytes = page.size;
+        _epoch = page.epoch;
+        _before = page.start;
+        _hasMore = page.hasMore && page.start > 0;
+        _loadingOlder = false;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scroll.hasClients) return;
+        final extra = _scroll.position.maxScrollExtent - oldMax;
+        _scroll.jumpTo((oldPixels + extra)
+            .clamp(0.0, _scroll.position.maxScrollExtent)
+            .toDouble());
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _loadingOlder = false);
+      _snack('تعذّر تحميل السجل الأقدم: ${errText(e)}');
+    }
+  }
+
+  Future<void> _refresh() async => _loadLatest();
+
+  Future<void> _clearLog() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: C.surface,
+        title: const Text('مسح السجل'),
+        content: Text(
+          'سيُمسح سجل الإخراج الدائم (${_sizeLabel}). لا يمكن التراجع عن هذا المسح.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('مسح السجل')),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      final ok = await bayanPython.logsClear(widget.script.path);
+      if (!mounted) return;
+      if (!ok) _snack('تعذّر مسح السجل');
+      await _loadLatest();
+    } catch (e) {
+      if (mounted) _snack('تعذّر مسح السجل: ${errText(e)}');
+    }
+  }
+
+  void _snack(String message) {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    messenger.showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  List<_LogDisplayItem> _displayItems() {
+    final starts = <String, _StoredLogRecord>{};
+    final ends = <String, _StoredLogRecord>{};
+    for (final r in _records) {
+      if (r.type == 'start') starts[r.runId] = r;
+      if (r.type == 'end') ends[r.runId] = r;
+    }
+
+    final output = <_LogDisplayItem>[];
+    var i = 0;
+    while (i < _records.length) {
+      final r = _records[i];
+      if (r.type == 'start') {
+        final end = ends[r.runId];
+        String status;
+        Color color;
+        int endMs;
+        String codeText;
+        if (end != null) {
+          endMs = end.timeMs;
+          final code = end.code ?? -1;
+          status = code == 0 ? 'انتهى' : code == 130 ? 'موقوف' : 'خطأ';
+          color = code == 0 ? C.ok : code == 130 ? C.warn : C.error;
+          codeText = 'رمز الخروج: $code';
+        } else {
+          final active = runHub.infoFor(widget.script.path);
+          final live = active != null && active.runId == r.runId && active.isLive;
+          endMs = live ? DateTime.now().millisecondsSinceEpoch : r.timeMs;
+          status = live ? 'جاري' : 'خطأ (لا يوجد سطر نهاية)';
+          color = live ? C.ok : C.error;
+          codeText = live ? 'قيد التشغيل' : 'نهاية غير محفوظة';
+        }
+        output.add(_LogDisplayItem.header(
+          'تشغيل · ${_logDate(r.timeMs)}',
+          'المدة: ${_logDuration(r.timeMs, endMs)} · الحالة: $status · $codeText',
+          color,
+        ));
+        i++;
+        continue;
+      }
+      if (r.type == 'end') {
+        if (!starts.containsKey(r.runId)) {
+          final code = r.code ?? -1;
+          final status = code == 0 ? 'انتهى' : code == 130 ? 'موقوف' : 'خطأ';
+          final color = code == 0 ? C.ok : code == 130 ? C.warn : C.error;
+          output.add(_LogDisplayItem.header(
+            'تشغيل · البداية غير متوفرة',
+            '${_logDate(r.timeMs)} · الحالة: $status · رمز الخروج: $code',
+            color,
+          ));
+        }
+        i++;
+        continue;
+      }
+
+      if (r.kind == 'o' || r.kind == 'e') {
+        final lines = <Line>[];
+        while (i < _records.length) {
+          final part = _records[i];
+          if (part.type != 'event' || (part.kind != 'o' && part.kind != 'e')) break;
+          appendOutputEventLines(lines, part.text, part.kind == 'e' ? 3 : 0,
+              maxLines: 1000000);
+          i++;
+        }
+        for (final line in lines) {
+          output.add(_LogDisplayItem.line(line.text, line.kind));
+        }
+        continue;
+      }
+      output.add(_LogDisplayItem.line(r.text, r.kind == 'i' ? 2 : 1));
+      i++;
+    }
+    return output;
+  }
+
+  String _copyText(List<_StoredLogRecord> records) {
+    final out = StringBuffer();
+    final starts = <String, _StoredLogRecord>{};
+    for (final r in records) {
+      if (r.type == 'start') starts[r.runId] = r;
+    }
+    for (final r in records) {
+      switch (r.type) {
+        case 'start':
+          out.write('\n──────── تشغيل · ${_logDate(r.timeMs)} ────────\n');
+          break;
+        case 'event':
+          if (r.kind == 's' || r.kind == 'i') {
+            out.write('\n${r.text}\n');
+          } else {
+            out.write(r.text);
+          }
+          break;
+        case 'end':
+          if (!starts.containsKey(r.runId)) out.write('\n[رمز الخروج: ${r.code ?? -1}]\n');
+          final start = starts[r.runId];
+          if (start != null) {
+            // يطبع سطر الحالة مرة واحدة هنا، مع إبقاء سطر البداية مستقلًا.
+            final code = r.code ?? -1;
+            final state = code == 0 ? 'انتهى' : code == 130 ? 'موقوف' : 'خطأ';
+            out.write('\n[$state · رمز الخروج: $code]\n');
+          }
+          break;
+      }
+    }
+    return out.toString();
+  }
+
+  Future<void> _copyLog() async {
+    try {
+      var fetched = <_StoredLogRecord>[];
+      int? before;
+      int? epoch;
+      var hasMore = true;
+      var attempts = 0;
+      var staleRetries = 0;
+      while (hasMore && attempts < 32) {
+        final page = await bayanPython.logsPage(
+          widget.script.path,
+          before: before,
+          maxBytes: 1024 * 1024,
+          epoch: epoch,
+        );
+        attempts++;
+        if (page.stale) {
+          if (staleRetries++ >= 2) break;
+          fetched = <_StoredLogRecord>[];
+          before = null;
+          epoch = null;
+          hasMore = true;
+          continue;
+        }
+        fetched.insertAll(0, _StoredLogRecord.parsePage(page.text));
+        epoch = page.epoch;
+        before = page.start;
+        hasMore = page.hasMore && page.start > 0;
+        final approxChars = fetched.fold<int>(0, (n, r) => n + r.text.length + 64);
+        if (approxChars >= _copyLimit) break;
+      }
+      if (!mounted) return;
+      var text = _copyText(fetched);
+      if (text.isEmpty) {
+        _snack('لا يوجد سجل للنسخ');
+        return;
+      }
+      var truncated = false;
+      if (text.length > _copyLimit) {
+        var from = text.length - _copyLimit;
+        if (from > 0 && from < text.length) {
+          final unit = text.codeUnitAt(from);
+          if (unit >= 0xDC00 && unit <= 0xDFFF) from++;
+        }
+        text = text.substring(from);
+        truncated = true;
+      }
+      await Clipboard.setData(ClipboardData(text: text));
+      if (mounted) {
+        _snack(truncated
+            ? 'نُسخ آخر 400 ألف حرف تقريبًا لتجنب حد حافظة أندرويد'
+            : 'تم نسخ السجل');
+      }
+    } catch (e) {
+      if (mounted) _snack('تعذّر نسخ السجل: ${errText(e)}');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final items = _displayItems();
+    return Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            Header(
+              title: widget.script.name,
+              back: true,
+              mono: true,
+              onBack: () => Navigator.pop(context),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 4, 10, 2),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    child: Text(
+                      'حجم السجل: $_sizeLabel',
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(color: C.muted, fontSize: 12),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextButton.icon(
+                          onPressed: _loading ? null : _copyLog,
+                          icon: const Icon(Icons.content_copy_outlined, size: 17),
+                          label: const Text('نسخ', maxLines: 1),
+                        ),
+                      ),
+                      Expanded(
+                        child: TextButton.icon(
+                          onPressed: _loading ? null : _clearLog,
+                          icon: const Icon(Icons.delete_sweep_outlined, size: 17),
+                          label: const Text('مسح السجل', maxLines: 1),
+                        ),
+                      ),
+                      Expanded(
+                        child: TextButton.icon(
+                          onPressed: _loading ? null : _refresh,
+                          icon: const Icon(Icons.refresh_rounded, size: 17),
+                          label: const Text('تحديث', maxLines: 1),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            if (_loadingOlder) const LinearProgressIndicator(minHeight: 2),
+            Expanded(
+              child: _loading
+                  ? const Center(child: CircularProgressIndicator(color: C.accent))
+                  : _records.isEmpty
+                      ? const Center(
+                          child: Text('ما في سجل بعد', style: TextStyle(color: C.muted)),
+                        )
+                      : SelectionArea(
+                          contextMenuBuilder: arSelectionContextMenu,
+                          child: Directionality(
+                            textDirection: TextDirection.ltr,
+                            child: ListView.builder(
+                              controller: _scroll,
+                              padding: const EdgeInsets.fromLTRB(14, 8, 14, 18),
+                              itemCount: items.length,
+                              itemBuilder: (context, index) {
+                                final item = items[index];
+                                if (item.isHeader) {
+                                  return Container(
+                                    margin: const EdgeInsets.only(top: 10, bottom: 8),
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                    decoration: BoxDecoration(
+                                      color: C.surface,
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(color: C.border),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                                      children: [
+                                        Text(item.text,
+                                            textDirection: TextDirection.rtl,
+                                            style: mono.copyWith(
+                                                fontWeight: FontWeight.w600,
+                                                color: item.headerColor,
+                                                fontSize: 12)),
+                                        const SizedBox(height: 2),
+                                        Text(item.subtitle,
+                                            textDirection: TextDirection.rtl,
+                                            style: const TextStyle(
+                                                color: C.muted, fontSize: 11)),
+                                      ],
+                                    ),
+                                  );
+                                }
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 1),
+                                  child: Text(
+                                    item.text.isEmpty ? ' ' : item.text,
+                                    style: mono.copyWith(color: _lineColor(item.kind)),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class OutputScreen extends StatefulWidget {
+  const OutputScreen({super.key, required this.script, this.attachRunId});
+  final Script script;
+
+  /// null: تشغيل جديد. غير null: دخول لهذه الجلسة القائمة (حيّة أو منتهية) بلا تشغيل أي شيء.
+  final String? attachRunId;
 
   @override
   State<OutputScreen> createState() => _OutputScreenState();
@@ -3317,6 +4159,8 @@ class _OutputScreenState extends State<OutputScreen> {
   StreamSubscription<BayanEvent>? _events;
   bool _stopRequested = false;
   bool _starting = false;
+  // true أثناء معالجة حدث أُعيد من مخزن الجلسة: لا نمرّر الشاشة مع كل حدث
+  bool _bulk = false;
   // بطاقات المكتبات الناقصة تحت الخطأ
   final _missing = <MissingLib>[];
   // سبب الخطأ مكتبة ناقصة وليس كود المستخدم: أسطر File "…" تُعرض نصًا أحمر عاديًا
@@ -3335,14 +4179,22 @@ class _OutputScreenState extends State<OutputScreen> {
       if (mounted) setState(() {});
     });
     _installerSub = libInstaller.changes.listen(_onInstaller);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _startRun());
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) {
+      final id = widget.attachRunId;
+      if (id == null) {
+        unawaited(_startRun());
+      } else {
+        unawaited(_enterSession(id));
+      }
+    });
   }
 
   @override
   void dispose() {
     _events?.cancel();
     _installerSub?.cancel();
-    _stopRequested = true;
+    // الخروج يفصل الاستماع فقط: السكربت يكمل شغله
     unawaited(_runner.dispose());
     _input.dispose();
     _scroll.dispose();
@@ -3353,6 +4205,7 @@ class _OutputScreenState extends State<OutputScreen> {
 
   void _onEvent(BayanEvent e) {
     if (!mounted) return;
+    _bulk = e.isReplay;
     switch (e.type) {
       case 'started':
       case 'error':
@@ -3361,6 +4214,9 @@ class _OutputScreenState extends State<OutputScreen> {
         setState(() {});
         if (e.type == 'error' && e.text.isNotEmpty) _add(e.text, 3);
         if (e.type == 'input' && e.text.isNotEmpty) _add(e.text, 2);
+        break;
+      case 'truncated':
+        _add('… الأقدم غير متوفر في الذاكرة', 1);
         break;
       case 'stdout':
         _appendOutput(e.text, 0);
@@ -3380,16 +4236,17 @@ class _OutputScreenState extends State<OutputScreen> {
         } else {
           _add('[انتهى بكود $code]', 3);
         }
-        unawaited(store.markRun(widget.script));
         _stopRequested = false;
         setState(() {});
         break;
     }
+    _bulk = false;
   }
 
   void _add(String text, [int kind = 0]) {
     if (!mounted || text.isEmpty) return;
     setState(() => _lines.add(Line(text, kind)));
+    if (_bulk) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) {
         _scroll.animateTo(
@@ -3404,23 +4261,8 @@ class _OutputScreenState extends State<OutputScreen> {
   void _appendOutput(String text, int kind) {
     if (!mounted || text.isEmpty) return;
     _rawOutput.write(text);
-    final normalized = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
-    setState(() {
-      for (var i = 0; i < normalized.length; i++) {
-        final ch = normalized[i];
-        if (_lines.isEmpty) {
-          _lines.add(Line('', kind));
-        } else if (_lines.last.kind != kind) {
-          _lines.add(Line('', kind));
-        }
-        if (ch == '\n') {
-          _lines.add(Line('', kind));
-        } else {
-          _lines.last.text += ch;
-        }
-      }
-      if (_lines.length > 5000) _lines.removeRange(0, _lines.length - 5000);
-    });
+    setState(() => appendOutputEventLines(_lines, text, kind));
+    if (_bulk) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
     });
@@ -3445,6 +4287,25 @@ class _OutputScreenState extends State<OutputScreen> {
       _starting = false;
       if (mounted) setState(() {});
     }
+  }
+
+  // دخول لجلسة قائمة (حيّة أو منتهية) بدل تشغيل جديد: يعرض إخراجها المحفوظ ثم يتابع البث الحي
+  Future<void> _enterSession(String runId) async {
+    if (!mounted || _starting) return;
+    setState(() {
+      _lines.clear();
+      _rawOutput.clear();
+      _missing.clear();
+      _plainFrames = false;
+    });
+    _add(r'$ python ' + widget.script.name, 1);
+    final found = await _runner.attach(runId);
+    if (!mounted) return;
+    if (!found) {
+      _add('انتهت هذه الجلسة وحُذف إخراجها. اضغط "إعادة تشغيل" لتشغيله من جديد.', 1);
+    }
+    setState(() {});
+    _scrollToEnd();
   }
 
   Future<void> _send() async {
@@ -3480,16 +4341,10 @@ class _OutputScreenState extends State<OutputScreen> {
       await Future<void>.delayed(const Duration(milliseconds: 120));
     }
     if (!mounted) return;
+    // تشغيل جديد يمر من بوابة RunSlot (إن كان سكربت آخر يعمل تُسأل قبل إيقافه)
+    if (!await claimRunSlot(context, widget.script, confirmOwnOldRun: false)) return;
+    if (!mounted) return;
     await _startRun();
-  }
-
-  Future<void> _leave() async {
-    _stopRequested = true;
-    try {
-      await _runner.stop();
-      await _runner.waitForFinish(timeout: const Duration(milliseconds: 450));
-    } catch (_) {}
-    if (mounted) Navigator.pop(context);
   }
 
   // ───── مكتبات ناقصة (F2) ─────
@@ -3595,22 +4450,6 @@ class _OutputScreenState extends State<OutputScreen> {
       );
 
   // ───── الضغط على سطر الخطأ يفتح المحرر عند ذلك السطر (F1) ─────
-  Future<bool> _confirmStopForEditor() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: C.surface,
-        title: const Text('السكربت ما زال يعمل'),
-        content: const Text('الانتقال إلى المحرر سيوقف السكربت الجاري. هل تريد المتابعة؟'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('إيقاف والانتقال')),
-        ],
-      ),
-    );
-    return ok == true;
-  }
-
   Future<void> _openFrame(FrameRef frame) async {
     final target = await store.scriptAtRelative(frame.relative);
     if (!mounted) return;
@@ -3622,10 +4461,7 @@ class _OutputScreenState extends State<OutputScreen> {
     final editor = _ScriptScreenState.open[target.path];
     if (editor != null && editor.mounted) {
       // محرر هذا الملف مفتوح فعلًا في المكدس: نرجع إليه (pop) بدل فتح نسخة ثانية.
-      // الرجوع من الإخراج يوقف السكربت الجاري، فنسأل أولًا.
-      if (_runner.isRunning && !await _confirmStopForEditor()) return;
-      if (!mounted) return;
-      _stopRequested = true;
+      // الرجوع لا يوقف السكربت الجاري (الخروج من الإخراج يفصل الاستماع فقط).
       final route = editor.route;
       if (route != null) {
         nav.popUntil((r) => identical(r, route));
@@ -3697,25 +4533,19 @@ class _OutputScreenState extends State<OutputScreen> {
   Widget build(BuildContext context) {
     final idle = !_runner.isRunning;
     final waiting = _runnerState == ScriptRunnerState.waitingForInput;
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, result) {
-        if (!didPop) unawaited(_leave());
-      },
-      child: Scaffold(
-        body: SafeArea(
-          child: Column(
-            children: [
-              Header(
-                title: widget.script.name,
-                back: true,
-                mono: true,
-                onBack: () => unawaited(_leave()),
-              ),
-              Expanded(child: _consoleBox(waiting)),
-              _actionBar(idle),
-            ],
-          ),
+    return Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            Header(
+              title: widget.script.name,
+              back: true,
+              mono: true,
+              onBack: () => Navigator.pop(context),
+            ),
+            Expanded(child: _consoleBox(waiting)),
+            _actionBar(idle),
+          ],
         ),
       ),
     );
@@ -3779,7 +4609,7 @@ class _OutputScreenState extends State<OutputScreen> {
                 PressFx(
                   scale: .88,
                   child: IconButton(
-                    tooltip: 'مسح',
+                    tooltip: 'مسح الشاشة',
                     iconSize: 22,
                     color: C.muted,
                     visualDensity: VisualDensity.compact,
@@ -3798,24 +4628,27 @@ class _OutputScreenState extends State<OutputScreen> {
                       style: const TextStyle(fontSize: 13, color: C.dim),
                     ),
                   )
-                : Directionality(
-                    textDirection: TextDirection.ltr,
-                    child: ListView.builder(
-                      controller: _scroll,
-                      padding: const EdgeInsets.all(14),
-                      itemCount: _lines.length + (_missing.isEmpty ? 0 : 1),
-                      itemBuilder: (_, i) {
-                        if (i >= _lines.length) return _missingFooter();
-                        final line = _lines[i];
-                        // سطر File "…", line N داخل Bayan 777 قابل للضغط
-                        final frame =
-                            (line.kind == 3 && !_plainFrames) ? parseFrame(line.text) : null;
-                        if (frame != null) return _frameLine(line, frame);
-                        return Text(
-                          line.text,
-                          style: mono.copyWith(color: _lineColor(line.kind)),
-                        );
-                      },
+                : SelectionArea(
+                    contextMenuBuilder: arSelectionContextMenu,
+                    child: Directionality(
+                      textDirection: TextDirection.ltr,
+                      child: ListView.builder(
+                        controller: _scroll,
+                        padding: const EdgeInsets.all(14),
+                        itemCount: _lines.length + (_missing.isEmpty ? 0 : 1),
+                        itemBuilder: (_, i) {
+                          if (i >= _lines.length) return _missingFooter();
+                          final line = _lines[i];
+                          // سطر File "…", line N داخل Bayan 777 قابل للضغط
+                          final frame =
+                              (line.kind == 3 && !_plainFrames) ? parseFrame(line.text) : null;
+                          if (frame != null) return _frameLine(line, frame);
+                          return Text(
+                            line.text,
+                            style: mono.copyWith(color: _lineColor(line.kind)),
+                          );
+                        },
+                      ),
                     ),
                   ),
           ),
