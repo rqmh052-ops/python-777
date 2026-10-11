@@ -35,6 +35,9 @@ from pathlib import Path
 from typing import Any
 
 PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
+# PEP 376: an empty file inside <name>.dist-info that marks a distribution the
+# user asked for (as opposed to one pulled in automatically as a dependency).
+REQUESTED_NAME = "REQUESTED"
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
 PYPI_SIMPLE = "https://pypi.org/simple/{name}/"
 CHAQUOPY_INDEX = "https://chaquo.com/pypi-13.1/{name}/"
@@ -540,11 +543,42 @@ def _run_exit_code(value: Any) -> int:
         return 1
 
 
+def _is_internal_frame(frame: Any) -> bool:
+    """Frames that belong to Chaquopy's import machinery, not to the user's code.
+
+    Example of the noise they add to a ModuleNotFoundError traceback:
+        File "import.pxi", line 60, in java.chaquopy.import_override
+    """
+    filename = str(getattr(frame, "filename", "") or "").replace("\\", "/")
+    name = str(getattr(frame, "name", "") or "")
+    return filename.rsplit("/", 1)[-1] == "import.pxi" or name.startswith("java.chaquopy")
+
+
+def _drop_internal_frames(te: traceback.TracebackException, seen: set[int]) -> None:
+    """Remove internal frames from `te` and from every chained exception."""
+    if id(te) in seen:
+        return
+    seen.add(id(te))
+    te.stack[:] = [f for f in te.stack if not _is_internal_frame(f)]
+    for child in (te.__cause__, te.__context__):
+        if child is not None:
+            _drop_internal_frames(child, seen)
+    for child in getattr(te, "exceptions", None) or ():
+        _drop_internal_frames(child, seen)
+
+
 def _print_user_traceback(exc: BaseException, file: Any) -> None:
-    """Print a traceback without the runner's own internal frames."""
+    """Print a traceback without the runner's own or Chaquopy's internal frames."""
     tb = exc.__traceback__
     while tb is not None and tb.tb_frame.f_globals is globals():
         tb = tb.tb_next
+    try:
+        te = traceback.TracebackException(type(exc), exc, tb)
+        _drop_internal_frames(te, set())
+        file.write("".join(te.format()))
+        return
+    except Exception:
+        pass
     try:
         traceback.print_exception(type(exc), exc, tb, file=file)
     except Exception:
@@ -1564,6 +1598,20 @@ def _remove_distribution_files(dist_info: Path, site: Path, backup_root: Path, b
             if parent == site.resolve():
                 break
             parent = parent.parent
+    # The PEP 376 REQUESTED marker is not listed in RECORD, so it is moved to the
+    # rollback storage explicitly. Otherwise it would outlive the library and
+    # make a later automatic (companion) install of it look user-requested.
+    marker = dist_info / REQUESTED_NAME
+    if marker.is_file() or marker.is_symlink():
+        try:
+            marker_rel = marker.relative_to(site).as_posix()
+        except ValueError:
+            marker_rel = ""
+        if marker_rel and marker_rel not in backed:
+            marker_backup = backup_root / marker_rel
+            marker_backup.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(marker, marker_backup)
+            backed.add(marker_rel)
     # Python can leave bytecode behind in __pycache__. Keeping a stale package
     # directory can make it importable as a namespace package after uninstall,
     # so remove caches belonging to directories touched by this distribution.
@@ -1614,30 +1662,129 @@ def _clear_site_modules() -> None:
     importlib.invalidate_caches()
 
 
-def _current_packages() -> list[dict[str, Any]]:
+def _dist_requires(parsed: Any) -> set[str]:
+    """Normalised names of the dependencies a distribution needs right now.
+
+    Uses the same marker evaluation as the install plan; extras are ignored (a
+    requirement behind `extra == ...` is never installed, so it never counts).
+    """
+    out: set[str] = set()
+    for raw in parsed.get_all("Requires-Dist") or []:
+        try:
+            parts = _req_parts(raw)
+        except Exception:
+            continue
+        if parts is not None and parts[0]:
+            out.add(parts[0])
+    return out
+
+
+def _scan_distributions() -> dict[str, dict[str, Any]]:
+    """Every installed distribution with a readable METADATA, keyed by normalised name.
+
+    A dist-info without METADATA (or without Name/Version) is ignored. If two
+    dist-info folders carry the same name the first one wins, like
+    `_distribution_record`.
+    """
     _, _, site, _ = _require_config()
-    out: list[dict[str, Any]] = []
+    entries: dict[str, dict[str, Any]] = {}
     for dist in sorted(site.glob("*.dist-info"), key=lambda p: p.name.lower()):
         meta_file = dist / "METADATA"
         if not meta_file.is_file():
             continue
         try:
-            meta = Parser().parsestr(meta_file.read_text("utf-8", errors="replace"))
-            name = meta.get("Name", "").strip()
-            version = meta.get("Version", "").strip()
+            parsed = Parser().parsestr(meta_file.read_text("utf-8", errors="replace"))
+            name = parsed.get("Name", "").strip()
+            version = parsed.get("Version", "").strip()
             if not name or not version:
                 continue
-            size = 0
-            for rel in _record_paths(dist):
-                p = site / rel
-                try:
-                    if p.is_file():
-                        size += p.stat().st_size
-                except OSError:
-                    pass
-            out.append({"name": name, "version": version, "size": size})
+            norm = _norm_name(name)
+            if norm in entries:
+                continue
+            entries[norm] = {
+                "name": name,
+                "version": version,
+                "dist": dist,
+                "explicit": (dist / REQUESTED_NAME).is_file(),
+                "requires": _dist_requires(parsed),
+            }
         except Exception:
             continue
+    return entries
+
+
+def _reachable(start: Any, entries: dict[str, dict[str, Any]], excluded: set[str] | None = None) -> set[str]:
+    """Distributions reachable from `start` through installed dependencies (cycle-safe)."""
+    skip = excluded or set()
+    seen: set[str] = set()
+    stack = [n for n in start if n in entries and n not in skip]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        for dep in entries[node]["requires"]:
+            if dep in entries and dep not in skip and dep not in seen:
+                stack.append(dep)
+    return seen
+
+
+def _classify_requested(entries: dict[str, dict[str, Any]]) -> dict[str, bool]:
+    """norm -> True if the user asked for it, False if it is only a companion.
+
+    A distribution counts as requested when it carries the REQUESTED marker, or
+    when no other installed distribution needs it (libraries installed before
+    the marker existed). Everything else that is reachable from those is a
+    companion. An unmarked group that only needs itself (a dependency cycle
+    nobody else uses) is treated as requested, so it never becomes invisible.
+    """
+    needed_by: dict[str, set[str]] = {n: set() for n in entries}
+    for norm, entry in entries.items():
+        for dep in entry["requires"]:
+            if dep in entries and dep != norm:
+                needed_by[dep].add(norm)
+    roots = {n for n, e in entries.items() if e["explicit"] or not needed_by[n]}
+    reach = _reachable(roots, entries)
+    return {n: (n in roots) or (n not in reach) for n in entries}
+
+
+def _removal_set(norm: str, entries: dict[str, dict[str, Any]], requested: dict[str, bool]) -> list[str]:
+    """`norm` first, then the companions nothing else needs once it is gone."""
+    removed = {norm}
+    keep_roots = [n for n in entries if n not in removed and requested.get(n, True)]
+    alive = _reachable(keep_roots, entries, removed)
+    orphans = sorted(n for n in entries if n not in removed and n not in alive and not requested.get(n, True))
+    return [norm, *orphans]
+
+
+def _current_packages() -> list[dict[str, Any]]:
+    _, _, site, _ = _require_config()
+    entries = _scan_distributions()
+    requested = _classify_requested(entries)
+    needed_by: dict[str, set[str]] = {n: set() for n in entries}
+    for norm, entry in entries.items():
+        for dep in entry["requires"]:
+            if dep in entries and dep != norm:
+                needed_by[dep].add(norm)
+    out: list[dict[str, Any]] = []
+    for norm, entry in entries.items():
+        size = 0
+        for rel in _record_paths(entry["dist"]):
+            p = site / rel
+            try:
+                if p.is_file():
+                    size += p.stat().st_size
+            except OSError:
+                pass
+        out.append({
+            "name": entry["name"],
+            "version": entry["version"],
+            "size": size,
+            "requested": requested[norm],
+            "requiredBy": sorted((entries[n]["name"] for n in needed_by[norm]), key=str.lower),
+            "requires": sorted((entries[d]["name"] for d in entry["requires"] if d in entries and d != norm), key=str.lower),
+        })
+    out.sort(key=lambda item: item["name"].lower())
     return out
 
 
@@ -1740,6 +1887,14 @@ def install_package(spec: str, callback: Any, job_id: str) -> str:
         _plan_package(root_norm, root_constraints, callback, plan, set())
         if not plan:
             installed = _installed_version(root_norm)
+            # Already there (maybe pulled in earlier as a companion): the user
+            # asked for it explicitly now, so it becomes a requested library.
+            found_root = _distribution_record(root_norm)
+            if found_root is not None:
+                try:
+                    (found_root[0] / REQUESTED_NAME).write_text("", encoding="utf-8")
+                except OSError:
+                    pass
             result = {"ok": True, "name": root_norm, "version": installed or "", "already": True}
             callback.emitPackage("done", 1, 1, "المكتبة مثبتة بالفعل")
             _store_metadata(result)
@@ -1761,10 +1916,18 @@ def install_package(spec: str, callback: Any, job_id: str) -> str:
                 callback.emitPackage("verify", index - 1, len(plan), f"التحقق من {metadata['name']} {metadata['version']}")
                 # Remove older distribution contents into rollback storage.
                 old = _distribution_record(norm)
+                # Only the library the user asked for gets the marker, plus any
+                # library that already had it (an upgrade must not lose it).
+                want_marker = norm == primary_name or bool(old and (old[0] / REQUESTED_NAME).is_file())
                 if old and old[1]["version"] != metadata["version"]:
                     _remove_distribution_files(old[0], site, backup_root, backed)
                 stage = install_root / re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{norm}-{metadata['version']}")
-                files, _ = _extract_wheel(wheel_path, stage)
+                files, dist_rel = _extract_wheel(wheel_path, stage)
+                if want_marker:
+                    marker_rel = f"{dist_rel}/{REQUESTED_NAME}"
+                    (stage / marker_rel).write_text("", encoding="utf-8")
+                    if marker_rel not in files:
+                        files.append(marker_rel)
                 callback.emitPackage("install", index - 1, len(plan), f"تثبيت {metadata['name']} {metadata['version']}")
                 _install_from_staging(stage, files, site, backup_root, backed, installed_now)
                 if norm == primary_name:
@@ -1831,20 +1994,34 @@ def install_package(spec: str, callback: Any, job_id: str) -> str:
 
 
 def remove_package(name: str) -> str:
+    """Remove a library together with the companions that nothing else needs.
+
+    A companion stays if another installed library still needs it, or if the user
+    asked for it explicitly. Everything happens in one transaction: if any file
+    cannot be moved, the files already moved are put back.
+    """
     with _PACKAGE_LOCK:
         norm, _ = _parse_spec(name)
-        found = _distribution_record(norm)
+        entries = _scan_distributions()
+        found = entries.get(norm)
         if not found:
             return json.dumps({"ok": False, "error": "المكتبة غير مثبتة"}, ensure_ascii=False)
         _, _, site, cache = _require_config()
+        requested = _classify_requested(entries)
+        order = _removal_set(norm, entries, requested)
         transaction = Path(tempfile.mkdtemp(prefix="rm-", dir=str(cache / "tmp")))
         backup = transaction / "backup"
         backed: set[str] = set()
         try:
-            _remove_distribution_files(found[0], site, backup, backed)
+            for victim in order:
+                _remove_distribution_files(entries[victim]["dist"], site, backup, backed)
             _cleanup_empty_dirs(site)
-            _store_metadata({"ok": True, "name": found[1]["name"], "version": found[1]["version"], "removed": True})
-            return json.dumps({"ok": True, "name": found[1]["name"], "version": found[1]["version"]}, ensure_ascii=False)
+            companions = [{"name": entries[n]["name"], "version": entries[n]["version"]} for n in order[1:]]
+            _store_metadata({"ok": True, "name": found["name"], "version": found["version"], "removed": True, "alsoRemoved": companions})
+            return json.dumps(
+                {"ok": True, "name": found["name"], "version": found["version"], "alsoRemoved": companions},
+                ensure_ascii=False,
+            )
         except Exception as exc:
             for rel in sorted(backed, key=lambda x: len(x.split("/"))):
                 src = backup / rel

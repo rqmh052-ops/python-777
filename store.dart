@@ -213,6 +213,17 @@ class ScriptStore {
     return d;
   }
 
+  // ───── أعلام صغيرة لا تخص السكربتات (مثل: هل ظهرت شاشة الترحيب؟) ─────
+  bool getFlag(String key) => _prefs?.getBool('flag_$key') ?? false;
+
+  Future<void> setFlag(String key, bool value) async {
+    try {
+      await _prefs?.setBool('flag_$key', value);
+    } catch (e) {
+      debugPrint('setFlag: $e');
+    }
+  }
+
   // ───── الصلاحيات ─────
   Future<void> requestAccess() async {
     try {

@@ -341,9 +341,10 @@ void showInstallDetails(BuildContext context, LibJob job) {
 
 // ───────── بطاقة تثبيت مكتبة ناقصة (تظهر تحت الخطأ في شاشة الإخراج) ─────────
 class MissingLib {
-  MissingLib(this.package, this.module);
+  MissingLib(this.package, this.module, {this.failed = false});
   final String package; // اسم التثبيت (opencv-python)
   final String module; // اسم الاستيراد (cv2)
+  final bool failed; // هذه المكتبة هي التي أوقفت التشغيل (ModuleNotFoundError)
   bool checking = true;
   bool? available;
   String reason = '';
@@ -728,6 +729,9 @@ class ActionRow extends StatelessWidget {
       );
 }
 
+// علم يُحفظ بعد أول ظهور لشاشة الترحيب (الصلاحيات)
+const _welcomeFlag = 'welcome_seen_v1';
+
 // ───────── الشاشة الرئيسية ─────────
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -758,6 +762,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _boot() async {
     await store.init();
     if (!mounted) return;
+    if (!store.getFlag(_welcomeFlag)) {
+      // الترحيب يشمل إذن الملفات، فلا نعرض نافذته المنفصلة في هذه المرة
+      _asked = true;
+      await _showWelcome();
+      return;
+    }
     if (fallbackMode.value && !_asked) {
       _asked = true;
       _showAccessDialog();
@@ -827,11 +837,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _key.currentState?.openEndDrawer();
   }
 
+  // شاشة الترحيب عند أول فتح؛ تُعدّ مشاهَدة مهما كانت طريقة الخروج منها
+  Future<void> _showWelcome() async {
+    if (!mounted) return;
+    await Navigator.of(context)
+        .push<void>(smooth<void>(const PermissionsScreen(welcome: true)));
+    await store.setFlag(_welcomeFlag, true);
+  }
+
+  // «فحص الصلاحيات» من القائمة؛ وعند الرجوع تُفتح القائمة مجدداً كما كانت
+  Future<void> _openPermissions() async {
+    final nav = Navigator.of(context);
+    nav.pop(); // يغلق القائمة الجانبية
+    await nav.push<void>(smooth<void>(const PermissionsScreen()));
+    if (!mounted) return;
+    _key.currentState?.openEndDrawer();
+  }
+
 
   @override
   Widget build(BuildContext context) => Scaffold(
         key: _key,
-        endDrawer: AppDrawer(onLibraries: _openLibraries),
+        endDrawer: AppDrawer(
+            onLibraries: _openLibraries, onPermissions: _openPermissions),
         body: SafeArea(
           child: Column(children: [
             Header(
@@ -1176,8 +1204,9 @@ Future<void> deleteScript(BuildContext context, Script s) async {
 
 // ───────── القائمة الجانبية ─────────
 class AppDrawer extends StatelessWidget {
-  const AppDrawer({super.key, required this.onLibraries});
-  final VoidCallback onLibraries;
+  const AppDrawer(
+      {super.key, required this.onLibraries, required this.onPermissions});
+  final VoidCallback onLibraries, onPermissions;
 
   Widget _nav(IconData icon, String label, bool active, VoidCallback onTap) =>
       Material(
@@ -1236,6 +1265,9 @@ class AppDrawer extends StatelessWidget {
                       () => Navigator.pop(context)),
                   const SizedBox(height: 4),
                   _nav(Icons.extension_outlined, 'المكتبات', false, onLibraries),
+                  const SizedBox(height: 4),
+                  _nav(Icons.verified_user_outlined, 'فحص الصلاحيات', false,
+                      onPermissions),
                   const Padding(
                     padding: EdgeInsets.fromLTRB(4, 24, 4, 8),
                     child: Text('حول التطبيق',
@@ -1286,6 +1318,333 @@ class AppDrawer extends StatelessWidget {
       );
 }
 
+// ───────── شاشة الصلاحيات: الترحيب عند أول فتح + «فحص الصلاحيات» من القائمة ─────────
+enum _PermState { granted, missing, manual }
+
+class PermissionsScreen extends StatefulWidget {
+  const PermissionsScreen({super.key, this.welcome = false});
+
+  /// true: شاشة الترحيب (بلا زر رجوع، وفيها «تخطٍّ» لكل صلاحية وزر متابعة).
+  final bool welcome;
+
+  @override
+  State<PermissionsScreen> createState() => _PermissionsScreenState();
+}
+
+class _PermissionsScreenState extends State<PermissionsScreen>
+    with WidgetsBindingObserver {
+  SystemStatus _sys = const SystemStatus();
+  bool _busy = false;
+  final _skipped = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refresh();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // بعد العودة من صفحة إعدادات النظام نعيد الفحص
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refresh();
+  }
+
+  Future<void> _refresh() async {
+    SystemStatus next = _sys;
+    try {
+      next = await bayanSystem.status();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() => _sys = next);
+  }
+
+  void _snack(String m) {
+    final s = ScaffoldMessenger.of(context);
+    s.clearSnackBars();
+    s.showSnackBar(SnackBar(content: Text(m)));
+  }
+
+  Future<void> _run(Future<void> Function() action) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await action();
+    } catch (e) {
+      if (mounted) _snack(errText(e));
+    }
+    if (!mounted) return;
+    setState(() => _busy = false);
+    await _refresh();
+  }
+
+  String get _brandName {
+    switch (_sys.oem) {
+      case 'xiaomi':
+        return 'شاومي';
+      case 'samsung':
+        return 'سامسونج';
+      case 'huawei':
+        return 'هواوي / أونر';
+      case 'oppo':
+        return 'أوبو / ريلمي';
+      case 'oneplus':
+        return 'وان بلس';
+      case 'vivo':
+        return 'فيفو';
+      default:
+        return _sys.manufacturer;
+    }
+  }
+
+  // خطوات يدوية حسب الشركة. المصدر: dontkillmyapp.com (قد تختلف التسمية حسب إصدار النظام)
+  String get _brandSteps {
+    switch (_sys.oem) {
+      case 'xiaomi':
+        return 'الإعدادات ← التطبيقات ← مشغّل بايثون ← الأذونات ← «التشغيل التلقائي» (Autostart) وفعّله. ثم اجعل توفير البطارية للتطبيق «بلا قيود» (No restrictions)، وأقفل التطبيق في قائمة التطبيقات الأخيرة.';
+      case 'samsung':
+        return 'الإعدادات ← البطارية ← حدود استخدام الخلفية: أزل التطبيق من «التطبيقات النائمة» و«النائمة بعمق»، وأضفه إلى «التطبيقات التي لا تنام أبدًا» (Never sleeping apps). وأوقف «وضع السكون للتطبيقات غير المستخدمة».';
+      case 'oppo':
+      case 'oneplus':
+        return 'معلومات التطبيق ← استخدام البطارية ← «السماح بالتشغيل في الخلفية»، وفعّل «التشغيل التلقائي» (Auto launch) للتطبيق، وثبّت التطبيق في قائمة التطبيقات الأخيرة.';
+      case 'huawei':
+        return 'الإعدادات ← البطارية ← «تشغيل التطبيقات» (App launch) ← مشغّل بايثون ← «إدارة يدوية»، وفعّل كل المفاتيح. وضع التطبيق ضمن «التطبيقات المحمية» (Protected apps) إن وُجدت.';
+      default:
+        return 'افتح إعدادات التشغيل التلقائي أو الخلفية للتطبيق وامنحه السماح. تختلف أسماء الصفحات من شركة لأخرى.';
+    }
+  }
+
+  Future<void> _grantFiles() => store.requestAccess();
+
+  Future<void> _grantNotifications() => bayanSystem.requestNotifications();
+
+  Future<void> _grantBattery() async {
+    final how = await bayanSystem.requestBattery();
+    if (how == 'list') {
+      if (mounted) {
+        _snack('اختر «كل التطبيقات» ثم مشغّل بايثون ثم «عدم التحسين».');
+      }
+    } else if (how == 'app') {
+      if (mounted) {
+        _snack('افتح «البطارية» من إعدادات التطبيق واختر «بلا قيود».');
+      }
+    } else if (how == 'failed') {
+      if (mounted) _snack('تعذّر فتح إعدادات البطارية. افتحها يدويًا من إعدادات النظام.');
+    }
+  }
+
+  Future<void> _openAutoStart() async {
+    final how = await bayanSystem.openAutoStart();
+    if (how == 'app') {
+      if (mounted) {
+        _snack('لم نجد صفحة الشركة، فتحنا إعدادات التطبيق. اتبع الخطوات المكتوبة.');
+      }
+    } else if (how == 'failed') {
+      if (mounted) _snack('تعذّر فتح الإعدادات. اتبع الخطوات المكتوبة يدويًا.');
+    }
+  }
+
+  Widget _card({
+    required int index,
+    required String id,
+    required IconData icon,
+    required String title,
+    required String why,
+    required _PermState state,
+    required String actionLabel,
+    required Future<void> Function() onAction,
+    String? steps,
+  }) {
+    final skipped = _skipped.contains(id) && state != _PermState.granted;
+    final Color tone = state == _PermState.granted
+        ? C.ok
+        : (state == _PermState.missing ? C.warn : C.muted);
+    final String chip = state == _PermState.granted
+        ? 'ممنوح'
+        : (state == _PermState.missing ? 'غير ممنوح' : 'إعداد يدوي');
+    return Appear(
+      index: index,
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: _box(C.surface),
+        child: Opacity(
+          opacity: skipped ? .6 : 1,
+          child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(children: [
+                  Container(
+                    width: 40,
+                    height: 40,
+                    decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: tone.withValues(alpha: .14)),
+                    child: Icon(icon, color: tone, size: 22),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                      child: Text(title,
+                          style: const TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.w600))),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                        color: tone.withValues(alpha: .14),
+                        borderRadius: BorderRadius.circular(20)),
+                    child: Text(chip,
+                        style: TextStyle(
+                            fontSize: 12,
+                            color: tone,
+                            fontWeight: FontWeight.w600)),
+                  ),
+                ]),
+                const SizedBox(height: 10),
+                Text(why,
+                    style: const TextStyle(
+                        fontSize: 13.5, height: 1.6, color: C.muted)),
+                if (steps != null) ...[
+                  const SizedBox(height: 8),
+                  Text(steps,
+                      style: const TextStyle(
+                          fontSize: 13, height: 1.6, color: C.text)),
+                ],
+                if (state != _PermState.granted) ...[
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    OButton(
+                        label: actionLabel,
+                        height: 38,
+                        fontSize: 13,
+                        onPressed: _busy ? null : () => _run(onAction)),
+                    if (widget.welcome && !skipped) ...[
+                      const SizedBox(width: 8),
+                      TextButton(
+                          onPressed: () => setState(() => _skipped.add(id)),
+                          child: const Text('تخطٍّ',
+                              style: TextStyle(color: C.muted))),
+                    ],
+                    if (skipped)
+                      const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 8),
+                          child: Text('تم التخطي',
+                              style: TextStyle(fontSize: 12, color: C.dim))),
+                  ]),
+                ],
+              ]),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Column(children: [
+            Header(
+                title: widget.welcome ? 'مرحبًا بك' : 'فحص الصلاحيات',
+                back: !widget.welcome),
+            Expanded(
+              child: ListenableBuilder(
+                listenable: fallbackMode,
+                builder: (context, _) {
+                  final filesOk = !fallbackMode.value;
+                  final missing = (filesOk ? 0 : 1) +
+                      (_sys.notifications ? 0 : 1) +
+                      (_sys.battery ? 0 : 1);
+                  var i = 0;
+                  return ListView(
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      if (widget.welcome) ...[
+                        const Text(
+                            'لتعمل سكربتاتك الطويلة (مثل بوتات تيليجرام) بثبات حتى مع إغلاق الشاشة، يحتاج التطبيق إلى الصلاحيات التالية. تحت كل صلاحية سبب طلبها. يمكنك تخطّيها الآن ومنحها لاحقًا من القائمة الجانبية ← «فحص الصلاحيات».',
+                            style: TextStyle(
+                                fontSize: 14, height: 1.7, color: C.muted)),
+                        const SizedBox(height: 16),
+                      ],
+                      _card(
+                        index: i++,
+                        id: 'files',
+                        icon: Icons.folder_open_outlined,
+                        title: 'الوصول إلى الملفات',
+                        why:
+                            'لحفظ سكربتاتك كملفات حقيقية في مجلد «Bayan 777» وقراءتها من أي مدير ملفات.',
+                        state:
+                            filesOk ? _PermState.granted : _PermState.missing,
+                        actionLabel: 'منح',
+                        onAction: _grantFiles,
+                      ),
+                      const SizedBox(height: 12),
+                      _card(
+                        index: i++,
+                        id: 'notifications',
+                        icon: Icons.notifications_none,
+                        title: 'الإشعارات',
+                        why:
+                            'يظهر إشعار دائم أثناء عمل السكربتات في الخلفية، وفيه «فتح التطبيق» و«إيقاف الكل». بدونه قد لا ترى أن سكربتًا ما زال يعمل.',
+                        state: _sys.notifications
+                            ? _PermState.granted
+                            : _PermState.missing,
+                        actionLabel: 'منح',
+                        onAction: _grantNotifications,
+                      ),
+                      const SizedBox(height: 12),
+                      _card(
+                        index: i++,
+                        id: 'battery',
+                        icon: Icons.battery_charging_full,
+                        title: 'استثناء البطارية',
+                        why:
+                            'حتى لا يوقف النظام السكربتات الطويلة أثناء قفل الشاشة. هذا أهم إعداد لاستمرار العمل في الخلفية.',
+                        state: _sys.battery
+                            ? _PermState.granted
+                            : _PermState.missing,
+                        actionLabel: 'منح',
+                        onAction: _grantBattery,
+                      ),
+                      if (_sys.oem.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        _card(
+                          index: i++,
+                          id: 'autostart',
+                          icon: Icons.play_circle_outline,
+                          title: 'التشغيل التلقائي ($_brandName)',
+                          why:
+                              'جهازك من $_brandName، وهذه الشركة تُغلق التطبيقات في الخلفية بشدة. لا يمكن فحص هذا الإعداد من التطبيق، فتأكد منه بنفسك.',
+                          steps: _brandSteps,
+                          state: _PermState.manual,
+                          actionLabel: 'فتح الإعداد',
+                          onAction: _openAutoStart,
+                        ),
+                      ],
+                      const SizedBox(height: 16),
+                      const Text(
+                          'ملاحظة: بعض الشركات تُنهي التطبيقات في الخلفية رغم كل الإعدادات، و«إيقاف إجباري» من إعدادات النظام يقتل العملية. هذه الإعدادات تعطيك أقصى استمرارية ممكنة، لكنها لا تضمنها.',
+                          style: TextStyle(
+                              fontSize: 12.5, height: 1.7, color: C.dim)),
+                      if (widget.welcome) ...[
+                        const SizedBox(height: 20),
+                        PButton(
+                            label: missing == 0 ? 'متابعة' : 'تخطّي الآن',
+                            onPressed: () => Navigator.pop(context)),
+                      ],
+                    ],
+                  );
+                },
+              ),
+            ),
+          ]),
+        ),
+      );
+}
+
 // ───────── شاشة المكتبات ─────────
 class LibrariesScreen extends StatefulWidget {
   const LibrariesScreen({super.key});
@@ -1305,6 +1664,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
   bool _refreshing = false;
   bool _needsRefresh = false;
   bool _wasLive = false;
+  bool _companionsOpen = false;
 
   @override
   void initState() {
@@ -1321,7 +1681,11 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
   }
 
   void _syncShown() {
-    _shown = _packages.keys.toSet();
+    // المطلوبة فقط؛ المكتبات المرافقة تظهر في قسمها المطوي أسفل القائمة
+    _shown = {
+      for (final e in _packages.entries)
+        if (e.value.requested) e.key,
+    };
   }
 
   void _onInstaller(int _) {
@@ -1404,17 +1768,74 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     libInstaller.enqueue(clean);
   }
 
+  // المكتبات المرافقة التي ستُزال مع [package] لأن أي مكتبة أخرى لن تحتاجها بعد إزالتها.
+  // نفس منطق remove_package في بايثون: ما لا يمكن الوصول إليه من المكتبات المطلوبة المتبقية.
+  List<InstalledPackage> _orphansAfterRemoving(InstalledPackage package) {
+    final removedKey = pkgKey(package.name);
+    final alive = <String>{};
+    final stack = <String>[
+      for (final e in _packages.entries)
+        if (e.key != removedKey && e.value.requested) e.key,
+    ];
+    while (stack.isNotEmpty) {
+      final key = stack.removeLast();
+      if (!alive.add(key)) continue;
+      final current = _packages[key];
+      if (current == null) continue;
+      for (final dep in current.requires) {
+        final depKey = pkgKey(dep);
+        if (depKey != removedKey &&
+            _packages.containsKey(depKey) &&
+            !alive.contains(depKey)) {
+          stack.add(depKey);
+        }
+      }
+    }
+    final orphans = <InstalledPackage>[
+      for (final e in _packages.entries)
+        if (e.key != removedKey && !e.value.requested && !alive.contains(e.key))
+          e.value,
+    ];
+    orphans.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return orphans;
+  }
+
   Future<void> _remove(InstalledPackage package) async {
     if (libInstaller.busy) {
       _snack('انتظر حتى تنتهي عملية المكتبة الحالية');
       return;
     }
+    final orphans = _orphansAfterRemoving(package);
+    final needing = package.requiredBy;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: C.surface,
         title: const Text('إزالة المكتبة'),
-        content: Text('هل تريد إزالة ${package.name}؟\nلن يتم حذف ملفات سكربتاتك.'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('هل تريد إزالة ${package.name}؟\nلن يتم حذف ملفات سكربتاتك.'),
+            if (orphans.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              const Text('ستُزال معها لأنها لا تحتاجها مكتبة أخرى:'),
+              const SizedBox(height: 4),
+              Text(
+                orphans.map((p) => p.name).join('، '),
+                textDirection: TextDirection.ltr,
+                style: mono.copyWith(fontSize: 13, color: C.muted),
+              ),
+            ],
+            if (needing.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                'تنبيه: تحتاجها ${needing.join('، ')}، وقد تتوقف عن العمل بعد إزالتها.',
+                style: const TextStyle(color: C.warn),
+              ),
+            ],
+          ],
+        ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
           TextButton(
@@ -1431,7 +1852,9 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       await _refresh(silent: true);
       if (mounted) {
         setState(_syncShown);
-        _snack('تمت إزالة ${package.name}');
+        _snack(orphans.isEmpty
+            ? 'تمت إزالة ${package.name}'
+            : 'تمت إزالة ${package.name} مع ${orphans.length} مكتبة مرافقة');
       }
     } catch (e) {
       if (mounted) _snack('تعذر إزالة المكتبة: ${errText(e)}');
@@ -1562,10 +1985,36 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         onPressed: libInstaller.busy ? null : () => _install('${lib.name}==$latest'),
       );
     }
-    return TextButton(
-      onPressed: libInstaller.busy ? null : () => _remove(installed),
-      style: TextButton.styleFrom(foregroundColor: C.error),
-      child: const Text('إزالة'),
+    // الإزالة في الصف السفلي من البطاقة (_installedZone)، فلا شيء هنا
+    return const SizedBox.shrink();
+  }
+
+  // زر إزالة بإطار أحمر، عند الطرف الأيسر من الصف السفلي
+  Widget _removeButton(InstalledPackage p, {required bool enabled}) {
+    final color = enabled ? C.error : C.error.withValues(alpha: .4);
+    return PressFx(
+      enabled: enabled,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: enabled ? () => _remove(p) : null,
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            height: 34,
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              border: Border.all(color: color, width: 1.2),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(
+              'إزالة',
+              style: TextStyle(
+                  fontSize: 13, fontWeight: FontWeight.w600, color: color),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -1573,19 +2022,39 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     final latest = cat?.latestVersion;
     final update = cat?.updateAvailable == true && latest != null;
     return Row(children: [
-      const Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
-      const SizedBox(width: 6),
-      const Text('تم تثبيت المكتبة بنجاح', style: TextStyle(fontSize: 12, color: C.ok)),
-      const SizedBox(width: 8),
-      Flexible(
-        child: Text(
-          'الإصدار ${p.version}${update ? '  ←  $latest' : ''}',
-          textDirection: TextDirection.ltr,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 11, color: C.dim),
-        ),
+      Expanded(
+        child: Row(children: [
+          const Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
+          const SizedBox(width: 6),
+          const Text('تم تثبيت المكتبة بنجاح',
+              style: TextStyle(fontSize: 12, color: C.ok)),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'الإصدار ${p.version}${update ? '  ←  $latest' : ''}',
+              textDirection: TextDirection.ltr,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11, color: C.dim),
+            ),
+          ),
+        ]),
       ),
+      const SizedBox(width: 8),
+      _removeButton(p, enabled: !libInstaller.busy),
     ]);
+  }
+
+  // مكتبة من الكتالوج موجودة لكنها جاءت تلقائيًا مع مكتبة أخرى (لم يطلبها المستخدم)
+  Widget _companionZone(InstalledPackage p) {
+    final by = p.requiredBy.join('، ');
+    return Align(
+      alignment: AlignmentDirectional.centerStart,
+      child: Text(
+        by.isEmpty ? 'مثبتة تلقائيًا كمكتبة مرافقة' : 'مثبتة تلقائيًا لأن $by تحتاجها',
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontSize: 11, color: C.dim),
+      ),
+    );
   }
 
   Widget _idleZone(CatalogPackage? cat) {
@@ -1599,11 +2068,14 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     );
   }
 
-  // كل بطاقة: عنوان + زر، ثم منطقة تقدم بارتفاع ثابت (22) محجوزة دائمًا،
-  // فلا يرتفع شيء ولا ينزل أثناء التثبيت.
+  // كل بطاقة: عنوان + زر، ثم منطقة سفلية بارتفاع ثابت (36) محجوزة دائمًا
+  // (تتسع لزر الإزالة)، فلا يرتفع شيء ولا ينزل بين الحالات.
   Widget _tile(Lib lib, int index) {
     final key = pkgKey(lib.name);
-    final installed = _packages[key];
+    final raw = _packages[key];
+    // المرافقة (لم يطلبها المستخدم) لا تُعامل كمثبتة في بطاقتها
+    final installed = (raw != null && raw.requested) ? raw : null;
+    final companion = (raw != null && !raw.requested) ? raw : null;
     final cat = _catalogFor(lib.name);
     final job = libInstaller.jobFor(key);
 
@@ -1622,6 +2094,9 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     } else if (job != null) {
       zoneKey = 'done';
       zone = LibJobZone(job: job);
+    } else if (companion != null) {
+      zoneKey = 'companion';
+      zone = _companionZone(companion);
     } else {
       zoneKey = 'idle';
       zone = _idleZone(cat);
@@ -1663,15 +2138,98 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
               ),
               const SizedBox(height: 8),
               SizedBox(
-                height: 22,
+                height: 36,
                 child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 200),
                   child: KeyedSubtree(key: ValueKey(zoneKey), child: zone),
                 ),
               ),
+              // ما تحتاجه هذه المكتبة من مكتبات مرافقة (في قسم «المثبتة» فقط حتى لا تتحرك البطاقات)
+              if (installed != null &&
+                  _shown.contains(key) &&
+                  installed.requires.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    'تعتمد عليها: ${installed.requires.join('، ')}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 11, color: C.dim),
+                  ),
+                ),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _companionRow(InstalledPackage p) {
+    final by = p.requiredBy.join('، ');
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Expanded(
+              child: Text(
+                p.name,
+                textDirection: TextDirection.ltr,
+                textAlign: TextAlign.right,
+                overflow: TextOverflow.ellipsis,
+                style: mono.copyWith(fontSize: 14),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              p.version,
+              textDirection: TextDirection.ltr,
+              style: const TextStyle(fontSize: 11, color: C.dim),
+            ),
+          ]),
+          if (by.isNotEmpty)
+            Text('تحتاجها: $by',
+                style: const TextStyle(fontSize: 11, color: C.dim)),
+        ],
+      ),
+    );
+  }
+
+  // قسم مطوي أسفل القائمة: المكتبات التي ثُبّتت تلقائيًا مع غيرها (بلا زر إزالة منفرد)
+  Widget _companionsSection(List<InstalledPackage> items) {
+    return Container(
+      decoration: _box(C.surface),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _companionsOpen = !_companionsOpen),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Row(children: [
+                const Icon(Icons.link_rounded, color: C.muted, size: 18),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text('مكتبات مرافقة (${items.length})',
+                      style: const TextStyle(fontSize: 13, color: C.muted)),
+                ),
+                Icon(
+                  _companionsOpen
+                      ? Icons.expand_less_rounded
+                      : Icons.expand_more_rounded,
+                  color: C.muted,
+                  size: 22,
+                ),
+              ]),
+            ),
+          ),
+          if (_companionsOpen) ...[
+            Container(height: 1, color: C.border),
+            for (final p in items) _companionRow(p),
+          ],
+        ],
       ),
     );
   }
@@ -1690,6 +2248,8 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     final customJobs = installer.jobs
         .where((j) => !catalogKeys.contains(j.key) && !_shown.contains(j.key))
         .toList();
+    final companions = _packages.values.where((p) => !p.requested).toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     var i = 0;
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -1742,6 +2302,10 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
           onPressed: _downloadUnknown,
         ),
         const SizedBox(height: 12),
+        if (companions.isNotEmpty) ...[
+          _companionsSection(companions),
+          const SizedBox(height: 12),
+        ],
         if (_packages.isNotEmpty)
           Center(
             child: Text(
@@ -2755,6 +3319,10 @@ class _OutputScreenState extends State<OutputScreen> {
   bool _starting = false;
   // بطاقات المكتبات الناقصة تحت الخطأ
   final _missing = <MissingLib>[];
+  // سبب الخطأ مكتبة ناقصة وليس كود المستخدم: أسطر File "…" تُعرض نصًا أحمر عاديًا
+  // (بلا رابط) ما دام الفحص لم يقل إن المكتبة غير متاحة. تبقى كذلك بعد نجاح التثبيت،
+  // وتتصفّر عند بدء تشغيل جديد.
+  bool _plainFrames = false;
   final _removing = <String>{};
   StreamSubscription<int>? _installerSub;
 
@@ -2866,6 +3434,7 @@ class _OutputScreenState extends State<OutputScreen> {
       _lines.clear();
       _rawOutput.clear();
       _missing.clear();
+      _plainFrames = false;
     });
     _add(r'$ python ' + widget.script.name, 1);
     try {
@@ -2948,7 +3517,9 @@ class _OutputScreenState extends State<OutputScreen> {
           if (raw is! Map) continue;
           final pkg = raw['package']?.toString() ?? '';
           final module = raw['module']?.toString() ?? pkg;
-          if (pkg.isNotEmpty) items.add(MissingLib(pkg, module));
+          if (pkg.isNotEmpty) {
+            items.add(MissingLib(pkg, module, failed: raw['failed'] == true));
+          }
         }
       }
     } catch (_) {}
@@ -2957,6 +3528,7 @@ class _OutputScreenState extends State<OutputScreen> {
       _missing
         ..clear()
         ..addAll(items);
+      _plainFrames = items.any((m) => m.failed);
     });
     _scrollToEnd();
     unawaited(_checkAvailability(items));
@@ -2980,6 +3552,10 @@ class _OutputScreenState extends State<OutputScreen> {
         }
         for (final m in items) {
           m.checking = false;
+        }
+        // مكتبة مكتوبة خطأ أو غير مدعومة: الخطأ فعلًا في السكربت، فتعود الروابط
+        if (items.any(_missing.contains)) {
+          _plainFrames = items.any((m) => m.failed && m.available != false);
         }
       });
     } catch (_) {
@@ -3232,7 +3808,8 @@ class _OutputScreenState extends State<OutputScreen> {
                         if (i >= _lines.length) return _missingFooter();
                         final line = _lines[i];
                         // سطر File "…", line N داخل Bayan 777 قابل للضغط
-                        final frame = line.kind == 3 ? parseFrame(line.text) : null;
+                        final frame =
+                            (line.kind == 3 && !_plainFrames) ? parseFrame(line.text) : null;
                         if (frame != null) return _frameLine(line, frame);
                         return Text(
                           line.text,

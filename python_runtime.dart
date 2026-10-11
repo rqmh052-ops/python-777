@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 // يعرض رسالة الخطأ الحقيقية بدل PlatformException(code, message, null, null)
 String errText(Object e) =>
@@ -40,17 +41,35 @@ class InstalledPackage {
     required this.name,
     required this.version,
     required this.size,
+    this.requested = true,
+    this.requiredBy = const <String>[],
+    this.requires = const <String>[],
   });
 
   final String name;
   final String version;
   final int size;
 
+  /// true: المستخدم هو من طلبها. false: مكتبة مرافقة ثُبّتت تلقائيًا مع مكتبة أخرى.
+  final bool requested;
+
+  /// أسماء المكتبات المثبّتة التي تحتاج هذه المكتبة.
+  final List<String> requiredBy;
+
+  /// أسماء المكتبات المثبّتة التي تحتاجها هذه المكتبة.
+  final List<String> requires;
+
   factory InstalledPackage.fromJson(Map<String, dynamic> json) {
+    List<String> names(dynamic raw) => raw is List
+        ? raw.map((e) => e.toString()).toList(growable: false)
+        : const <String>[];
     return InstalledPackage(
       name: json['name']?.toString() ?? '',
       version: json['version']?.toString() ?? '',
       size: (json['size'] as num?)?.toInt() ?? 0,
+      requested: json['requested'] != false,
+      requiredBy: names(json['requiredBy']),
+      requires: names(json['requires']),
     );
   }
 }
@@ -133,6 +152,89 @@ class CatalogPackage {
     );
   }
 }
+
+// ───────── الصلاحيات والإعدادات الخاصة بالتشغيل في الخلفية (قناة bayan/system) ─────────
+class SystemStatus {
+  const SystemStatus({
+    this.notifications = false,
+    this.battery = false,
+    this.manufacturer = '',
+    this.oem = '',
+    this.sdk = 0,
+  });
+
+  /// هل الإشعارات مفعّلة للتطبيق؟
+  final bool notifications;
+
+  /// هل التطبيق مستثنى من تحسين البطارية؟
+  final bool battery;
+  final String manufacturer;
+
+  /// xiaomi | samsung | huawei | oppo | oneplus | vivo، أو فارغ إن لم نعرف صفحة خاصة بالشركة.
+  final String oem;
+  final int sdk;
+
+  factory SystemStatus.fromJson(Map<String, dynamic> json) => SystemStatus(
+        notifications: json['notifications'] == true,
+        battery: json['battery'] == true,
+        manufacturer: json['manufacturer']?.toString() ?? '',
+        oem: json['oem']?.toString() ?? '',
+        sdk: (json['sdk'] as num?)?.toInt() ?? 0,
+      );
+}
+
+class BayanSystem {
+  const BayanSystem();
+
+  static const _channel = MethodChannel('bayan/system');
+
+  Future<SystemStatus> status() async {
+    final dynamic raw = await _channel.invokeMethod<dynamic>('status');
+    if (raw is Map) {
+      return SystemStatus.fromJson(Map<String, dynamic>.from(raw));
+    }
+    return const SystemStatus();
+  }
+
+  /// نافذة النظام لاستثناء البطارية. النتيجة: dialog | list | app | failed
+  Future<String> requestBattery() async {
+    final dynamic raw = await _channel.invokeMethod<dynamic>('requestBattery');
+    return raw?.toString() ?? 'failed';
+  }
+
+  Future<bool> openAppSettings() async {
+    final dynamic raw = await _channel.invokeMethod<dynamic>('openAppSettings');
+    return raw == true;
+  }
+
+  Future<bool> openNotificationSettings() async {
+    final dynamic raw =
+        await _channel.invokeMethod<dynamic>('openNotificationSettings');
+    return raw == true;
+  }
+
+  /// صفحة «التشغيل التلقائي/الخلفية» عند الشركة. النتيجة: oem | app | failed
+  Future<String> openAutoStart() async {
+    final dynamic raw = await _channel.invokeMethod<dynamic>('openAutoStart');
+    return raw?.toString() ?? 'failed';
+  }
+
+  /// أندرويد 13+: نافذة إذن الإشعارات. بعد الرفض النهائي (أو قبل أندرويد 13) نفتح إعدادات الإشعارات.
+  Future<void> requestNotifications() async {
+    PermissionStatus result = PermissionStatus.denied;
+    try {
+      result = await Permission.notification.request();
+    } catch (_) {}
+    if (result.isGranted) return;
+    final now = await status();
+    if (now.notifications) return;
+    if (result.isPermanentlyDenied || now.sdk < 33) {
+      await openNotificationSettings();
+    }
+  }
+}
+
+const bayanSystem = BayanSystem();
 
 class BayanPythonRuntime {
   BayanPythonRuntime._() {
