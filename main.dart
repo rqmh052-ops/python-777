@@ -27,15 +27,29 @@ class C {
   static const cyan = Color(0xFF6FD3E8);
   static const accentEdge = Color(0xFF7AA7FF); // حد الأزرار المعبأة (أفتح قليلاً من accent)
   static const outline = Color(0xFF34435E); // حد الأزرار الشفافة المحايدة
+  static const borderHi = Color(0xFF2A3A58); // حد البطاقات المرفوعة (أفتح قليلاً من border)
 }
 
 const mono = TextStyle(
     fontFamily: 'monospace', fontSize: 14, height: 1.57, color: C.text);
 
-BoxDecoration _box(Color color) => BoxDecoration(
+// ظل ناعم يرفع البطاقات قليلاً عن الخلفية
+const _shadow = <BoxShadow>[
+  BoxShadow(color: Color(0x4D000000), blurRadius: 14, offset: Offset(0, 5)),
+];
+
+// raised: تدرج خفيف من الأعلى + حد أفتح + ظل (للبطاقات). بدونه: صندوق مسطح كما كان.
+BoxDecoration _box(Color color, {bool raised = false}) => BoxDecoration(
     color: color,
-    borderRadius: BorderRadius.circular(12),
-    border: Border.all(color: C.border));
+    gradient: raised
+        ? LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color.lerp(color, Colors.white, .045)!, color])
+        : null,
+    borderRadius: BorderRadius.circular(14),
+    border: Border.all(color: raised ? C.borderHi : C.border),
+    boxShadow: raised ? _shadow : null);
 
 final _ob = OutlineInputBorder(
     borderRadius: BorderRadius.circular(10),
@@ -506,6 +520,7 @@ class App extends StatelessWidget {
         debugShowCheckedModeBanner: false,
         title: 'مشغّل بايثون',
         theme: ThemeData(
+          fontFamily: 'Tajawal',
           brightness: Brightness.dark,
           scaffoldBackgroundColor: C.bg,
           canvasColor: C.surface,
@@ -565,8 +580,8 @@ class Header extends StatelessWidget {
                   textAlign: TextAlign.right,
                   textDirection: mono ? TextDirection.ltr : null,
                   style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w600,
+                      fontSize: 21,
+                      fontWeight: FontWeight.w800,
                       fontFamily: mono ? 'monospace' : null)),
             ),
           ),
@@ -637,20 +652,39 @@ class PButton extends StatelessWidget {
     final on = onPressed != null;
     return PressFx(
       enabled: on,
-      child: SizedBox(
+      child: Container(
         height: height,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(radius),
+          gradient: on
+              ? const LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Color(0xFF6B9EFF), C.accent])
+              : null,
+          color: on ? null : C.accent.withValues(alpha: .35),
+          boxShadow: on
+              ? [
+                  BoxShadow(
+                      color: C.accent.withValues(alpha: .30),
+                      blurRadius: 16,
+                      offset: const Offset(0, 6))
+                ]
+              : null,
+        ),
         child: FilledButton(
           onPressed: onPressed,
           style: FilledButton.styleFrom(
-            backgroundColor: C.accent,
+            backgroundColor: Colors.transparent,
+            disabledBackgroundColor: Colors.transparent,
+            shadowColor: Colors.transparent,
             foregroundColor: C.onAccent,
-            disabledBackgroundColor: C.accent.withValues(alpha: .35),
             disabledForegroundColor: C.onAccent,
             side: BorderSide(
                 color: on ? C.accentEdge : C.accentEdge.withValues(alpha: .25)),
             shape:
                 RoundedRectangleBorder(borderRadius: BorderRadius.circular(radius)),
-            textStyle: TextStyle(fontSize: fontSize, fontWeight: FontWeight.w600),
+            textStyle: TextStyle(fontSize: fontSize, fontWeight: FontWeight.w800),
           ),
           child: Row(mainAxisSize: MainAxisSize.min, children: [
             if (icon != null) ...[Icon(icon, size: 20), const SizedBox(width: 8)],
@@ -696,6 +730,7 @@ class OButton extends StatelessWidget {
           style: OutlinedButton.styleFrom(
             foregroundColor: accent ? C.accent : C.text,
             disabledForegroundColor: C.dim,
+            backgroundColor: line.withValues(alpha: on ? .08 : .03),
             side: BorderSide(color: on ? line : line.withValues(alpha: .4)),
             padding: padding,
             minimumSize: minWidth == null ? null : Size(minWidth!, height),
@@ -833,8 +868,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         backgroundColor: C.surface,
         title: const Text('إذن الوصول إلى الملفات'),
         content: Text(all
-            ? 'لحفظ سكربتاتك كملفات حقيقية في مجلد "Bayan 777" يحتاج التطبيق إذن «الوصول إلى جميع الملفات».\n\nاضغط «فتح الإعدادات» وفعّل الإذن للتطبيق ثم ارجع إليه.\n\nإلى أن تمنحه، تُحفظ السكربتات مؤقتاً داخل مساحة التطبيق ثم تُنقل تلقائياً.'
-            : 'لحفظ سكربتاتك كملفات حقيقية في مجلد "Bayan 777" يحتاج التطبيق إذن الوصول إلى التخزين.\n\nاضغط «منح الإذن» للمتابعة.\n\nإلى أن تمنحه، تُحفظ السكربتات مؤقتاً داخل مساحة التطبيق ثم تُنقل تلقائياً.'),
+            ? 'لحفظ ملفاتك في مجلد "Bayan 777"، فعّل إذن «الوصول إلى جميع الملفات» ثم ارجع للتطبيق.'
+            : 'لحفظ ملفاتك في مجلد "Bayan 777"، امنح إذن التخزين.'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -960,7 +995,7 @@ class StorageBanner extends StatelessWidget {
             SizedBox(width: 10),
             Expanded(
                 child: Text(
-                    'السكربتات محفوظة مؤقتاً داخل التطبيق فقط. امنح إذن الملفات لتُحفظ في مجلد Bayan 777.',
+                    'امنح إذن الملفات لحفظ سكربتاتك في Bayan 777.',
                     style: TextStyle(fontSize: 13, color: C.text))),
           ]),
           const SizedBox(height: 10),
@@ -995,7 +1030,7 @@ class EmptyState extends StatelessWidget {
           const Text('ما عندك سكربتات بعد',
               style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
-          const Text('اضغط "سكربت جديد" وابدأ بكتابة أول سكربت',
+          const Text('اضغط «سكربت جديد» للبدء',
               textAlign: TextAlign.center,
               style: TextStyle(color: C.muted, fontSize: 14)),
         ]),
@@ -1013,14 +1048,17 @@ class ScriptTile extends StatelessWidget {
       );
 
   Widget _tile(BuildContext context) {
-    final run = script.lastRun;
     final info = runHub.infoFor(script.path);
-    return Material(
+    final live = info != null &&
+        (info.status == RunStatus.running ||
+            info.status == RunStatus.waiting ||
+            info.status == RunStatus.error);
+    final tile = Material(
       color: C.surface,
       clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: C.border)),
+          borderRadius: BorderRadius.circular(14),
+          side: const BorderSide(color: C.borderHi)),
       child: InkWell(
         onTap: () => Navigator.push(context, smooth(ScriptScreen(script: script)))
             .then((_) => store.refresh()),
@@ -1052,10 +1090,10 @@ class ScriptTile extends StatelessWidget {
                         const Icon(Icons.push_pin, color: C.accent, size: 15),
                       ],
                     ]),
-                    const SizedBox(height: 2),
-                    Text('آخر تعديل: ${relativeTime(script.modified)}',
-                        style: const TextStyle(fontSize: 12, color: C.muted)),
-                    _statusLine(info, run),
+                    if (live) ...[
+                      const SizedBox(height: 3),
+                      _statusLine(info),
+                    ],
                   ]),
             ),
             const Icon(Icons.chevron_left,
@@ -1064,11 +1102,16 @@ class ScriptTile extends StatelessWidget {
         ),
       ),
     );
+    return Container(
+      decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14), boxShadow: _shadow),
+      child: tile,
+    );
   }
 
-  // أخضر «يعمل منذ 02:15» (مؤقت حي) · عنبري «ينتظر إدخال» · أحمر «انتهى بكود N»
-  // · رمادي «آخر تشغيل: …» (انتهى بنجاح أو أُوقف أو لم يُشغّل). سطر واحد دائمًا.
-  Widget _statusLine(RunInfo? info, DateTime? lastRun) {
+  // أخضر «يعمل منذ 02:15» (مؤقت حي) · عنبري «ينتظر إدخال» · أحمر «انتهى بكود N».
+  // لا شيء في بقية الحالات (لا تواريخ في البطاقة).
+  Widget _statusLine(RunInfo? info) {
     if (info != null && info.status == RunStatus.running) {
       return ValueListenableBuilder<int>(
         valueListenable: runHub.clock,
@@ -1087,9 +1130,7 @@ class ScriptTile extends StatelessWidget {
       return Text(code == null ? 'انتهى بخطأ' : 'انتهى بكود $code',
           style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)));
     }
-    return Text(
-        lastRun == null ? 'لم يُشغّل بعد' : 'آخر تشغيل: ${relativeTime(lastRun)}',
-        style: const TextStyle(fontSize: 12, color: C.muted));
+    return const SizedBox.shrink();
   }
 }
 
@@ -1619,42 +1660,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     await _refresh();
   }
 
-  String get _brandName {
-    switch (_sys.oem) {
-      case 'xiaomi':
-        return 'شاومي';
-      case 'samsung':
-        return 'سامسونج';
-      case 'huawei':
-        return 'هواوي / أونر';
-      case 'oppo':
-        return 'أوبو / ريلمي';
-      case 'oneplus':
-        return 'وان بلس';
-      case 'vivo':
-        return 'فيفو';
-      default:
-        return _sys.manufacturer;
-    }
-  }
-
-  // خطوات يدوية حسب الشركة. المصدر: dontkillmyapp.com (قد تختلف التسمية حسب إصدار النظام)
-  String get _brandSteps {
-    switch (_sys.oem) {
-      case 'xiaomi':
-        return 'الإعدادات ← التطبيقات ← مشغّل بايثون ← الأذونات ← «التشغيل التلقائي» (Autostart) وفعّله. ثم اجعل توفير البطارية للتطبيق «بلا قيود» (No restrictions)، وأقفل التطبيق في قائمة التطبيقات الأخيرة.';
-      case 'samsung':
-        return 'الإعدادات ← البطارية ← حدود استخدام الخلفية: أزل التطبيق من «التطبيقات النائمة» و«النائمة بعمق»، وأضفه إلى «التطبيقات التي لا تنام أبدًا» (Never sleeping apps). وأوقف «وضع السكون للتطبيقات غير المستخدمة».';
-      case 'oppo':
-      case 'oneplus':
-        return 'معلومات التطبيق ← استخدام البطارية ← «السماح بالتشغيل في الخلفية»، وفعّل «التشغيل التلقائي» (Auto launch) للتطبيق، وثبّت التطبيق في قائمة التطبيقات الأخيرة.';
-      case 'huawei':
-        return 'الإعدادات ← البطارية ← «تشغيل التطبيقات» (App launch) ← مشغّل بايثون ← «إدارة يدوية»، وفعّل كل المفاتيح. وضع التطبيق ضمن «التطبيقات المحمية» (Protected apps) إن وُجدت.';
-      default:
-        return 'افتح إعدادات التشغيل التلقائي أو الخلفية للتطبيق وامنحه السماح. تختلف أسماء الصفحات من شركة لأخرى.';
-    }
-  }
-
   Future<void> _grantFiles() => store.requestAccess();
 
   Future<void> _grantNotifications() => bayanSystem.requestNotifications();
@@ -1670,18 +1675,39 @@ class _PermissionsScreenState extends State<PermissionsScreen>
         _snack('افتح «البطارية» من إعدادات التطبيق واختر «بلا قيود».');
       }
     } else if (how == 'failed') {
-      if (mounted) _snack('تعذّر فتح إعدادات البطارية. افتحها يدويًا من إعدادات النظام.');
+      if (mounted) _snack('تعذّر فتح إعدادات البطارية.');
     }
   }
 
   Future<void> _openAutoStart() async {
     final how = await bayanSystem.openAutoStart();
     if (how == 'app') {
-      if (mounted) {
-        _snack('لم نجد صفحة الشركة، فتحنا إعدادات التطبيق. اتبع الخطوات المكتوبة.');
-      }
+      if (mounted) _snack('فتحنا إعدادات التطبيق بدل صفحة الشركة.');
     } else if (how == 'failed') {
-      if (mounted) _snack('تعذّر فتح الإعدادات. اتبع الخطوات المكتوبة يدويًا.');
+      if (mounted) _snack('تعذّر فتح الإعدادات.');
+    }
+  }
+
+  Future<void> _openBrandBattery() async {
+    final how = await bayanSystem.openBrandBattery();
+    if (how == 'app') {
+      if (mounted) _snack('فتحنا إعدادات التطبيق بدل صفحة الشركة.');
+    } else if (how == 'failed') {
+      if (mounted) _snack('تعذّر فتح الإعدادات.');
+    }
+  }
+
+  Future<void> _openAppSettings() async {
+    final ok = await bayanSystem.openAppSettings();
+    if (!ok && mounted) _snack('تعذّر فتح الإعدادات.');
+  }
+
+  Future<void> _openDeveloper() async {
+    final how = await bayanSystem.openDeveloperOptions();
+    if (how == 'about') {
+      if (mounted) _snack('فعّل خيارات المطور: اضغط 7 مرات على «رقم الإصدار».');
+    } else if (how == 'failed') {
+      if (mounted) _snack('تعذّر فتح الإعدادات.');
     }
   }
 
@@ -1694,7 +1720,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     required _PermState state,
     required String actionLabel,
     required Future<void> Function() onAction,
-    String? steps,
   }) {
     final skipped = _skipped.contains(id) && state != _PermState.granted;
     final Color tone = state == _PermState.granted
@@ -1707,7 +1732,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
       index: index,
       child: Container(
         padding: const EdgeInsets.all(14),
-        decoration: _box(C.surface),
+        decoration: _box(C.surface, raised: true),
         child: Opacity(
           opacity: skipped ? .6 : 1,
           child: Column(
@@ -1719,7 +1744,9 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                     height: 40,
                     decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: tone.withValues(alpha: .14)),
+                        color: tone.withValues(alpha: .14),
+                        border:
+                            Border.all(color: tone.withValues(alpha: .35))),
                     child: Icon(icon, color: tone, size: 22),
                   ),
                   const SizedBox(width: 12),
@@ -1744,12 +1771,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                 Text(why,
                     style: const TextStyle(
                         fontSize: 13.5, height: 1.6, color: C.muted)),
-                if (steps != null) ...[
-                  const SizedBox(height: 8),
-                  Text(steps,
-                      style: const TextStyle(
-                          fontSize: 13, height: 1.6, color: C.text)),
-                ],
                 if (state != _PermState.granted) ...[
                   const SizedBox(height: 12),
                   Row(children: [
@@ -1778,6 +1799,148 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     );
   }
 
+  // بطاقة اختصار: الضغط عليها يفتح صفحة الإعداد مباشرة (عنوان + سطر قصير)
+  Widget _shortcut({
+    required int index,
+    required IconData icon,
+    required String title,
+    required String hint,
+    required Future<void> Function() onTap,
+  }) =>
+      Appear(
+        index: index,
+        child: PressFx(
+          scale: .985,
+          child: Container(
+            decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(14), boxShadow: _shadow),
+            child: Material(
+              color: C.surface,
+              clipBehavior: Clip.antiAlias,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: const BorderSide(color: C.borderHi)),
+              child: InkWell(
+                onTap: _busy ? null : () => _run(onTap),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  child: Row(children: [
+                    Container(
+                      width: 40,
+                      height: 40,
+                      decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: C.accent.withValues(alpha: .12),
+                          border: Border.all(
+                              color: C.accent.withValues(alpha: .35))),
+                      child: Icon(icon, color: C.accent, size: 22),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(title,
+                                style: const TextStyle(
+                                    fontSize: 16, fontWeight: FontWeight.w600)),
+                            if (hint.isNotEmpty) ...[
+                              const SizedBox(height: 2),
+                              Text(hint,
+                                  style: const TextStyle(
+                                      fontSize: 12.5, color: C.muted)),
+                            ],
+                          ]),
+                    ),
+                    const Icon(Icons.chevron_left,
+                        color: C.muted,
+                        size: 22,
+                        textDirection: TextDirection.ltr),
+                  ]),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+  // سطر قصير بلا زر (لما لا يمكن فتحه من التطبيق)
+  Widget _tip(int index, IconData icon, String text) => Appear(
+        index: index,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          child: Row(children: [
+            Icon(icon, color: C.dim, size: 18),
+            const SizedBox(width: 8),
+            Expanded(
+                child: Text(text,
+                    style: const TextStyle(fontSize: 12.5, color: C.dim))),
+          ]),
+        ),
+      );
+
+  // اختصارات الشركة + خيارات المطور. صفحات الشركات لا يمكن فحص وجودها مسبقًا،
+  // فإن لم تُفتح الصفحة تُفتح إعدادات التطبيق ويظهر تنبيه قصير.
+  List<Widget> _shortcuts(int start) {
+    final items = <Widget>[];
+    var k = start;
+    void add(IconData icon, String title, String hint,
+        Future<void> Function() onTap) {
+      items.add(const SizedBox(height: 12));
+      items.add(_shortcut(
+          index: k++, icon: icon, title: title, hint: hint, onTap: onTap));
+    }
+
+    switch (_sys.oem) {
+      case 'xiaomi':
+        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
+            _openAutoStart);
+        add(Icons.tune, 'توفير البطارية', 'اختر «بلا قيود»',
+            _openBrandBattery);
+        break;
+      case 'samsung':
+        add(Icons.tune, 'حدود الخلفية', 'أضفه إلى Never sleeping apps',
+            _openAutoStart);
+        break;
+      case 'huawei':
+        add(Icons.play_circle_outline, 'تشغيل التطبيقات',
+            'إدارة يدوية ← فعّل الكل', _openAutoStart);
+        break;
+      case 'oppo':
+      case 'oneplus':
+        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
+            _openAutoStart);
+        add(Icons.tune, 'نشاط الخلفية', 'اسمح بالتشغيل في الخلفية',
+            _openAppSettings);
+        break;
+      case 'vivo':
+        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
+            _openAutoStart);
+        add(Icons.tune, 'استهلاك الخلفية', 'اسمح بالاستهلاك العالي',
+            _openAppSettings);
+        break;
+      case 'transsion':
+        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
+            _openAutoStart);
+        add(Icons.tune, 'نشاط الخلفية', 'Allow background activity',
+            _openAppSettings);
+        break;
+      case 'asus':
+        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
+            _openAutoStart);
+        break;
+      default:
+        break;
+    }
+    add(Icons.developer_mode, 'خيارات المطور',
+        'أوقف «Suspend execution for cached apps»', _openDeveloper);
+    if (_sys.oem.isNotEmpty) {
+      items.add(const SizedBox(height: 14));
+      items.add(_tip(k++, Icons.lock_outline, 'اقفل التطبيق في قائمة الأخيرة'));
+    }
+    return items;
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
         body: SafeArea(
@@ -1799,7 +1962,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                     children: [
                       if (widget.welcome) ...[
                         const Text(
-                            'لتعمل سكربتاتك الطويلة (مثل بوتات تيليجرام) بثبات حتى مع إغلاق الشاشة، يحتاج التطبيق إلى الصلاحيات التالية. تحت كل صلاحية سبب طلبها. يمكنك تخطّيها الآن ومنحها لاحقًا من القائمة الجانبية ← «فحص الصلاحيات».',
+                            'امنح هذه الصلاحيات لتستمر سكربتاتك في الخلفية.',
                             style: TextStyle(
                                 fontSize: 14, height: 1.7, color: C.muted)),
                         const SizedBox(height: 16),
@@ -1809,8 +1972,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                         id: 'files',
                         icon: Icons.folder_open_outlined,
                         title: 'الوصول إلى الملفات',
-                        why:
-                            'لحفظ سكربتاتك كملفات حقيقية في مجلد «Bayan 777» وقراءتها من أي مدير ملفات.',
+                        why: 'لحفظ ملفاتك',
                         state:
                             filesOk ? _PermState.granted : _PermState.missing,
                         actionLabel: 'منح',
@@ -1822,8 +1984,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                         id: 'notifications',
                         icon: Icons.notifications_none,
                         title: 'الإشعارات',
-                        why:
-                            'يظهر إشعار دائم أثناء عمل السكربتات في الخلفية، وفيه «فتح التطبيق» و«إيقاف الكل». بدونه قد لا ترى أن سكربتًا ما زال يعمل.',
+                        why: 'لإظهار ما يعمل في الخلفية',
                         state: _sys.notifications
                             ? _PermState.granted
                             : _PermState.missing,
@@ -1836,32 +1997,17 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                         id: 'battery',
                         icon: Icons.battery_charging_full,
                         title: 'استثناء البطارية',
-                        why:
-                            'حتى لا يوقف النظام السكربتات الطويلة أثناء قفل الشاشة. هذا أهم إعداد لاستمرار العمل في الخلفية.',
+                        why: 'لتستمر السكربتات مع قفل الشاشة',
                         state: _sys.battery
                             ? _PermState.granted
                             : _PermState.missing,
                         actionLabel: 'منح',
                         onAction: _grantBattery,
                       ),
-                      if (_sys.oem.isNotEmpty) ...[
-                        const SizedBox(height: 12),
-                        _card(
-                          index: i++,
-                          id: 'autostart',
-                          icon: Icons.play_circle_outline,
-                          title: 'التشغيل التلقائي ($_brandName)',
-                          why:
-                              'جهازك من $_brandName، وهذه الشركة تُغلق التطبيقات في الخلفية بشدة. لا يمكن فحص هذا الإعداد من التطبيق، فتأكد منه بنفسك.',
-                          steps: _brandSteps,
-                          state: _PermState.manual,
-                          actionLabel: 'فتح الإعداد',
-                          onAction: _openAutoStart,
-                        ),
-                      ],
+                      ..._shortcuts(i),
                       const SizedBox(height: 16),
                       const Text(
-                          'ملاحظة: بعض الشركات تُنهي التطبيقات في الخلفية رغم كل الإعدادات، و«إيقاف إجباري» من إعدادات النظام يقتل العملية. هذه الإعدادات تعطيك أقصى استمرارية ممكنة، لكنها لا تضمنها.',
+                          'قد تُنهي بعض الأجهزة التطبيقات رغم كل الإعدادات.',
                           style: TextStyle(
                               fontSize: 12.5, height: 1.7, color: C.dim)),
                       if (widget.welcome) ...[
@@ -2253,25 +2399,21 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     );
   }
 
-  Widget _installedZone(InstalledPackage p, CatalogPackage? cat) {
+  // سطر الإصدار تحت البطاقة (مع سهم الإصدار الأحدث إن وُجد)
+  String _versionLine(InstalledPackage p, CatalogPackage? cat) {
     final latest = cat?.latestVersion;
     final update = cat?.updateAvailable == true && latest != null;
+    return 'الإصدار ${p.version}${update ? '  ←  $latest' : ''}';
+  }
+
+  Widget _installedZone(InstalledPackage p) {
     return Row(children: [
-      Expanded(
+      const Expanded(
         child: Row(children: [
-          const Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
-          const SizedBox(width: 6),
-          const Text('تم تثبيت المكتبة بنجاح',
+          Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
+          SizedBox(width: 6),
+          Text('تم تثبيت المكتبة بنجاح',
               style: TextStyle(fontSize: 12, color: C.ok)),
-          const SizedBox(width: 8),
-          Flexible(
-            child: Text(
-              'الإصدار ${p.version}${update ? '  ←  $latest' : ''}',
-              textDirection: TextDirection.ltr,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 11, color: C.dim),
-            ),
-          ),
         ]),
       ),
       const SizedBox(width: 8),
@@ -2325,7 +2467,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       );
     } else if (installed != null) {
       zoneKey = 'installed';
-      zone = _installedZone(installed, cat);
+      zone = _installedZone(installed);
     } else if (job != null) {
       zoneKey = 'done';
       zone = LibJobZone(job: job);
@@ -2344,7 +2486,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         index: index,
         child: Container(
           padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
-          decoration: _box(C.surface),
+          decoration: _box(C.surface, raised: true),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -2379,15 +2521,12 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
                   child: KeyedSubtree(key: ValueKey(zoneKey), child: zone),
                 ),
               ),
-              // ما تحتاجه هذه المكتبة من مكتبات مرافقة (في قسم «المثبتة» فقط حتى لا تتحرك البطاقات)
-              if (installed != null &&
-                  _shown.contains(key) &&
-                  installed.requires.isNotEmpty)
+              // الإصدار تحت البطاقة (في قسم «المثبتة» فقط حتى لا تتحرك البطاقات)
+              if (installed != null && _shown.contains(key))
                 Padding(
                   padding: const EdgeInsets.only(top: 2),
                   child: Text(
-                    'تعتمد عليها: ${installed.requires.join('، ')}',
-                    maxLines: 2,
+                    _versionLine(installed, cat),
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontSize: 11, color: C.dim),
                   ),
@@ -2434,7 +2573,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
   // قسم مطوي أسفل القائمة: المكتبات التي ثُبّتت تلقائيًا مع غيرها (بلا زر إزالة منفرد)
   Widget _companionsSection(List<InstalledPackage> items) {
     return Container(
-      decoration: _box(C.surface),
+      decoration: _box(C.surface, raised: true),
       clipBehavior: Clip.antiAlias,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2489,27 +2628,6 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: C.accent.withValues(alpha: .10),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: C.border),
-          ),
-          child: const Row(
-            children: [
-              Icon(Icons.info_outline, color: C.accent, size: 20),
-              SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  'المكتبات تثبت مرة واحدة داخل بيئة Python العامة للتطبيق، وتصبح متاحة لكل سكربتاتك.',
-                  style: TextStyle(fontSize: 13, color: C.text),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 20),
         if (customInstalled.isNotEmpty || shownCatalog.isNotEmpty) ...[
           const Text('المثبتة', style: TextStyle(color: C.muted, fontSize: 13)),
           const SizedBox(height: 10),

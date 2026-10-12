@@ -20,3 +20,12 @@ dependencies:
 
 flutter:
   uses-material-design: true
+  # خط Tajawal (ترخيص OFL): 400 عادي، 700 عريض، 800 ثقيل
+  fonts:
+    - family: Tajawal
+      fonts:
+        - asset: fonts/Tajawal-Regular.ttf
+        - asset: fonts/Tajawal-Bold.ttf
+          weight: 700
+        - asset: fonts/Tajawal-ExtraBold.ttf
+          weight: 800

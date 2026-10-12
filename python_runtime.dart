@@ -181,7 +181,8 @@ class SystemStatus {
   final bool battery;
   final String manufacturer;
 
-  /// xiaomi | samsung | huawei | oppo | oneplus | vivo، أو فارغ إن لم نعرف صفحة خاصة بالشركة.
+  /// xiaomi | samsung | huawei | oppo | oneplus | vivo | transsion (Infinix/Tecno/itel) | asus،
+  /// أو فارغ إن لم نعرف صفحة خاصة بالشركة.
   final String oem;
   final int sdk;
 
@@ -227,6 +228,19 @@ class BayanSystem {
   /// صفحة «التشغيل التلقائي/الخلفية» عند الشركة. النتيجة: oem | app | failed
   Future<String> openAutoStart() async {
     final dynamic raw = await _channel.invokeMethod<dynamic>('openAutoStart');
+    return raw?.toString() ?? 'failed';
+  }
+
+  /// صفحة «توفير البطارية» للتطبيق عند الشركة (شاومي). النتيجة: oem | app | failed
+  Future<String> openBrandBattery() async {
+    final dynamic raw = await _channel.invokeMethod<dynamic>('openBrandBattery');
+    return raw?.toString() ?? 'failed';
+  }
+
+  /// خيارات المطور. النتيجة: dev | about (غير مفعّلة، فُتحت «حول الهاتف») | failed
+  Future<String> openDeveloperOptions() async {
+    final dynamic raw =
+        await _channel.invokeMethod<dynamic>('openDeveloperOptions');
     return raw?.toString() ?? 'failed';
   }
 

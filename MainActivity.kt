@@ -1713,6 +1713,8 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
                 "openAppSettings" -> result.success(openAppSettings())
                 "openNotificationSettings" -> result.success(openNotificationSettings())
                 "openAutoStart" -> result.success(openAutoStart())
+                "openBrandBattery" -> result.success(openBrandBattery())
+                "openDeveloperOptions" -> result.success(openDeveloperOptions())
                 else -> result.notImplemented()
             }
         } catch (t: Throwable) {
@@ -1729,6 +1731,10 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
             id.contains("oneplus") -> "oneplus"
             id.contains("oppo") || id.contains("realme") -> "oppo"
             id.contains("vivo") || id.contains("iqoo") -> "vivo"
+            // مجموعة Transsion: XOS (Infinix) وHiOS (Tecno) وitel. «itel» كلمة قصيرة فنطابقها ككلمة كاملة.
+            id.contains("infinix") || id.contains("tecno") || id.contains("transsion") ||
+                id.split(Regex("[^a-z0-9]+")).contains("itel") -> "transsion"
+            id.contains("asus") -> "asus"
             else -> ""
         }
     }
@@ -1810,8 +1816,21 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
             "com.samsung.android.lool" to "com.samsung.android.sm.ui.battery.BatteryActivity",
             "com.samsung.android.lool" to "com.samsung.android.sm.battery.ui.usage.CheckableAppListActivity",
             "com.samsung.android.lool" to "com.samsung.android.sm.battery.ui.BatteryActivity",
+            "com.samsung.android.sm" to "com.samsung.android.sm.ui.battery.BatteryActivity",
+        )
+        // Infinix/Tecno/itel: تطبيق Phone Master (وأسماء أقدم له). نجرّب بالترتيب ونلتقط الفشل.
+        "transsion" -> listOf(
+            "com.transsion.phonemaster" to "com.cyin.himgr.autostart.AutoStartActivity",
+            "com.transsion.phonemanager" to "com.itel.autobootmanager.activity.AutoBootMgrActivity",
+            "com.transsion.mobilebutler" to "com.transsion.mobilebutler.MainActivity",
         )
         else -> emptyList()
+    }
+
+    private fun component(pkg: String, cls: String, data: String? = null): Intent {
+        val intent = Intent().setComponent(ComponentName(pkg, cls))
+        if (data != null) intent.data = Uri.parse(data)
+        return intent
     }
 
     /** "oem" فُتحت صفحة الشركة، "app" فُتحت إعدادات التطبيق بدلها، "failed". */
@@ -1821,6 +1840,46 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
             if (launch(Intent().setComponent(ComponentName(pkg, cls)))) return "oem"
         }
         if (oem == "oneplus" && launch(Intent("com.android.settings.action.BACKGROUND_OPTIMIZE"))) return "oem"
+        if (oem == "xiaomi" && launch(Intent("miui.intent.action.OP_AUTO_START").addCategory(Intent.CATEGORY_DEFAULT))) {
+            return "oem"
+        }
+        if (oem == "asus") {
+            val asus = listOf(
+                component("com.asus.mobilemanager", "com.asus.mobilemanager.entry.FunctionActivity", "mobilemanager://function/entry/AutoStart"),
+                component("com.asus.mobilemanager", "com.asus.mobilemanager.MainActivity"),
+            )
+            for (intent in asus) if (launch(intent)) return "oem"
+        }
         return if (openAppSettings()) "app" else "failed"
+    }
+
+    /** صفحة «توفير البطارية» الخاصة بالتطبيق عند الشركة (شاومي). "oem" | "app" | "failed". */
+    private fun openBrandBattery(): String {
+        if (oemKey() == "xiaomi") {
+            val label = context.applicationInfo.loadLabel(context.packageManager).toString()
+            val intents = listOf(
+                component("com.miui.powerkeeper", "com.miui.powerkeeper.ui.HiddenAppsConfigActivity")
+                    .putExtra("package_name", context.packageName)
+                    .putExtra("package_label", label),
+                Intent("miui.intent.action.POWER_HIDE_MODE_APP_LIST").addCategory(Intent.CATEGORY_DEFAULT),
+                component("com.miui.securitycenter", "com.miui.powercenter.PowerSettings"),
+            )
+            for (intent in intents) if (launch(intent)) return "oem"
+        }
+        return if (openAppSettings()) "app" else "failed"
+    }
+
+    /**
+     * خيارات المطور (فيها «Suspend execution for cached apps» و«حد العمليات في الخلفية»).
+     * "dev" فُتحت، "about" غير مفعّلة فتحنا «حول الهاتف» لتفعيلها، "failed".
+     */
+    private fun openDeveloperOptions(): String {
+        val enabled = try {
+            Settings.Global.getInt(context.contentResolver, Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) == 1
+        } catch (t: Throwable) {
+            false
+        }
+        if (enabled && launch(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) return "dev"
+        return if (launch(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS))) "about" else "failed"
     }
 }
