@@ -14,7 +14,7 @@ CHAQUOPY = "17.0.0"
 PYTHON = "3.13"
 ABIS = ["arm64-v8a"]
 COMPILE_SDK = 37  # permission_handler_android يتطلب 37
-APP_PACKAGE = "dev.pyrunner.py_runner"
+APP_PACKAGE = "com.bynux.app"
 
 
 def patch_plugin_version(text: str, plugin: str, version: str) -> str:
@@ -94,6 +94,12 @@ def patch_app_build() -> None:
         raise RuntimeError("Flutter لم ينشئ app/build.gradle(.kts)")
 
     text = path.read_text(encoding="utf-8")
+    if kts:
+        text = re.sub(r'namespace\s*=\s*"[^"]+"', f'namespace = "{APP_PACKAGE}"', text, count=1)
+        text = re.sub(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{APP_PACKAGE}"', text, count=1)
+    else:
+        text = re.sub(r"namespace\s*[= ]\s*[\"'][^\"']+[\"']", f'namespace "{APP_PACKAGE}"', text, count=1)
+        text = re.sub(r"applicationId\s*(?:=\s*)?[\"'][^\"']+[\"']", f'applicationId "{APP_PACKAGE}"', text, count=1)
     if "com.chaquo.python" not in text:
         m = re.search(r"plugins\s*\{(?P<body>[\s\S]*?)\n\}", text)
         if not m:
@@ -178,6 +184,59 @@ androidComponents {
 }
 """
 
+    # مفتاح توقيع ثابت اختياري من GitHub Secrets. عند غياب الأسرار يستمر البناء
+    # بمفتاح Flutter الافتراضي، لكن تسجيل جوجل لن يكون ثابتاً بين البناءات.
+    if "bynuxRelease" not in text:
+        if kts:
+            text += """
+
+android {
+    signingConfigs {
+        create("bynuxRelease") {
+            val keyPath = System.getenv("BYNUX_KEYSTORE_PATH")
+            if (!keyPath.isNullOrBlank()) {
+                storeFile = file(keyPath)
+                storePassword = System.getenv("BYNUX_KEYSTORE_PASSWORD")
+                keyAlias = "bynux"
+                keyPassword = System.getenv("BYNUX_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            val keyPath = System.getenv("BYNUX_KEYSTORE_PATH")
+            if (!keyPath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("bynuxRelease")
+            }
+        }
+    }
+}
+"""
+        else:
+            text += """
+
+android {
+    signingConfigs {
+        bynuxRelease {
+            def keyPath = System.getenv("BYNUX_KEYSTORE_PATH")
+            if (keyPath != null && !keyPath.trim().isEmpty()) {
+                storeFile file(keyPath)
+                storePassword System.getenv("BYNUX_KEYSTORE_PASSWORD")
+                keyAlias "bynux"
+                keyPassword System.getenv("BYNUX_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+    buildTypes {
+        release {
+            def keyPath = System.getenv("BYNUX_KEYSTORE_PATH")
+            if (keyPath != null && !keyPath.trim().isEmpty()) {
+                signingConfig signingConfigs.bynuxRelease
+            }
+        }
+    }
+}
+"""
     path.write_text(text, encoding="utf-8")
 
 
@@ -306,7 +365,7 @@ def patch_manifest() -> None:
     if not path.exists():
         raise RuntimeError("AndroidManifest.xml مفقود")
     text = path.read_text(encoding="utf-8")
-    text = re.sub(r'android:label="[^"]*"', 'android:label="مشغّل بايثون"', text, count=1)
+    text = re.sub(r'android:label="[^"]*"', 'android:label="Bynux"', text, count=1)
     application = re.search(r"<application\b", text)
     if not application:
         raise RuntimeError("application tag مفقود")
@@ -333,7 +392,7 @@ def install_native_sources() -> None:
     kotlin_root.mkdir(parents=True, exist_ok=True)
     for old in kotlin_root.rglob("MainActivity.kt"):
         old.unlink()
-    target = kotlin_root / "dev" / "pyrunner" / "py_runner" / "MainActivity.kt"
+    target = kotlin_root / "com" / "bynux" / "app" / "MainActivity.kt"
     target.parent.mkdir(parents=True, exist_ok=True)
     source = ROOT / "MainActivity.kt"
     if not source.exists():
