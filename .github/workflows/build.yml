@@ -1,4 +1,4 @@
-name: Build Bayan APK
+name: Build Bynux APK
 
 on:
   push:
@@ -22,6 +22,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      - name: Set up Node.js for Cloudflare Worker tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test private cloud API
+        run: node tools/test_worker.mjs
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v6
@@ -49,9 +57,9 @@ jobs:
           cp pubspec.yaml /tmp/bayan_pubspec.yaml
           rm -rf lib
           mkdir -p lib
-          cp main.dart store.dart logo.dart python_runtime.dart script_runner.dart lib/
+          cp main.dart store.dart logo.dart python_runtime.dart script_runner.dart account_cloud.dart lib/
           cp -r lib /tmp/bayan_lib
-          flutter create . --platforms=android --project-name py_runner --org dev.pyrunner
+          flutter create . --platforms=android --project-name app --org com.bynux
           rm -rf lib
           cp -r /tmp/bayan_lib lib
           cp /tmp/bayan_pubspec.yaml pubspec.yaml
@@ -67,6 +75,20 @@ jobs:
 
       - name: Configure Chaquopy and Android
         run: python tools/prepare_android.py
+
+      - name: Prepare stable Android signing key
+        env:
+          BYNUX_KEYSTORE_BASE64: ${{ secrets.BYNUX_KEYSTORE_BASE64 }}
+          BYNUX_KEYSTORE_PASSWORD: ${{ secrets.BYNUX_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -n "$BYNUX_KEYSTORE_BASE64" ] && [ -n "$BYNUX_KEYSTORE_PASSWORD" ]; then
+            printf '%s' "$BYNUX_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/bynux-release.jks"
+            echo "BYNUX_KEYSTORE_PATH=$RUNNER_TEMP/bynux-release.jks" >> "$GITHUB_ENV"
+            echo "BYNUX_KEYSTORE_PASSWORD=$BYNUX_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "Stable Bynux signing key configured."
+          else
+            echo "Signing secrets are not configured; this build will use Flutter's temporary debug signing key. Google Sign-In will not be stable until both secrets are added."
+          fi
 
       - name: Install Flutter dependencies
         run: flutter pub get
@@ -97,7 +119,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: bayan-release-apk
+          name: bynux-7.1-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 14
