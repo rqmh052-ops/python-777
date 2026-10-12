@@ -387,6 +387,140 @@ def patch_manifest() -> None:
     path.write_text(text, encoding="utf-8")
 
 
+# أيقونة التطبيق: ضع صورة باسم icon.png في جذر المشروع فقط، والبناء يولّد كل المقاسات.
+# إن كانت الصورة بخلفية بيضاء أو مربعات (شفافية مزيفة) تُزال الخلفية تلقائيًا.
+ICON_SOURCE = ROOT / "icon.png"
+LEGACY_ICON_SIZES = (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192))
+ADAPTIVE_CANVAS = 432  # 108dp عند xxxhdpi
+ADAPTIVE_TILE = 288  # 72dp = النافذة المرئية للأيقونة التكيفية
+
+
+def _remove_backdrop(rgb):
+    """يحوّل صورة RGB ذات خلفية بيضاء/رمادية فاتحة إلى RGBA بخلفية شفافة.
+
+    الخلفية = بكسلات فاتحة شبه محايدة متصلة بحافة الصورة (تشمل المربعات والهالة البيضاء).
+    الكتابة البيضاء داخل الأيقونة محاطة باللون الأزرق فلا يصلها الملء الفيضي.
+    """
+    import numpy as np
+    from scipy import ndimage as ndi
+
+    a = rgb.astype(np.int16)
+    mn, mx = a.min(axis=2), a.max(axis=2)
+    candidate = (mn >= 200) & ((mx - mn) <= 24)
+    labels, _ = ndi.label(candidate)
+    edge = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    edge = edge[edge != 0]
+    solid = ~np.isin(labels, edge)
+    lab2, n2 = ndi.label(solid)
+    if n2 > 1:
+        sizes = ndi.sum(solid, lab2, range(1, n2 + 1))
+        solid = lab2 == (1 + int(np.argmax(sizes)))
+    solid = ndi.binary_fill_holes(solid)
+    core = ndi.binary_erosion(solid, iterations=2)
+    _, (iy, ix) = ndi.distance_transform_edt(~core, return_indices=True)
+    colour = np.where(core[..., None], a, a[iy, ix])  # لا هالة بيضاء على الحافة
+    alpha = ndi.gaussian_filter(solid.astype(np.float32), 0.9)
+    alpha = np.clip((alpha - 0.5) * 2.0 + 0.5, 0, 1)
+    alpha = np.where(core, 1.0, alpha) * ndi.binary_dilation(solid, iterations=1)
+    return np.dstack([colour.astype(np.uint8), (alpha * 255).round().astype(np.uint8)])
+
+
+def prepare_icon_master(source: Path):
+    """يقرأ الصورة، يزيل الخلفية إن لزم، يقصّها على حدود الأيقونة ويجعلها مربعة (RGBA)."""
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(source).convert("RGBA")
+    arr = np.array(img)
+    corners = [arr[0, 0, 3], arr[0, -1, 3], arr[-1, 0, 3], arr[-1, -1, 3]]
+    if min(int(c) for c in corners) >= 250:  # لا شفافية في الزوايا: خلفية مرسومة
+        arr = _remove_backdrop(arr[..., :3])
+        img = Image.fromarray(arr)
+    ys, xs = np.where(np.array(img)[..., 3] > 5)
+    if len(xs) == 0:
+        raise RuntimeError("icon.png: لم يبقَ أي محتوى بعد إزالة الخلفية")
+    img = img.crop((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
+    side = max(img.size)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(img, ((side - img.width) // 2, (side - img.height) // 2))
+    return square
+
+
+def _adaptive_background(master) -> str:
+    """لون خلفية الأيقونة التكيفية: متوسط حلقة داخل حافة الأيقونة مباشرة."""
+    import numpy as np
+    from scipy import ndimage as ndi
+
+    arr = np.array(master)
+    side = arr.shape[0]
+    solid = arr[..., 3] > 250
+    ring = ndi.binary_erosion(solid, iterations=max(1, int(side * 0.055))) ^ ndi.binary_erosion(
+        solid, iterations=max(2, int(side * 0.09))
+    )
+    if not ring.any():
+        return "#0B2561"
+    r, g, b = arr[ring][:, :3].mean(axis=0).round().astype(int)
+    return "#%02X%02X%02X" % (r, g, b)
+
+
+def install_launcher_icons(res_dir: Path | None = None, source: Path | None = None) -> list[str]:
+    """يولّد أيقونة التطبيق من icon.png داخل مشروع أندرويد المولَّد (بدون أي ملفات جاهزة).
+
+    flutter create يضع أيقونة Flutter الافتراضية؛ نحذف أي ic_launcher* قديمة أولًا حتى لا يحدث
+    تعارض موارد (مثل ic_launcher.webp بجانب ic_launcher.png)، ثم نكتب: mipmap-*/ic_launcher.png
+    للأجهزة القديمة + أيقونة adaptive (mipmap-anydpi-v26) بزوايا شفافة وبلا أي خلفية بيضاء.
+    """
+    from PIL import Image
+
+    src = source if source is not None else ICON_SOURCE
+    if not src.is_file():
+        raise RuntimeError(f"{src.name} غير موجود في جذر المشروع: أيقونة التطبيق مفقودة")
+    target = res_dir if res_dir is not None else ANDROID / "app" / "src" / "main" / "res"
+    target.mkdir(parents=True, exist_ok=True)
+    for old in list(target.glob("mipmap-*/ic_launcher*")) + list(target.glob("drawable*/ic_launcher*")):
+        if old.is_file():
+            old.unlink()
+    for old in target.glob("values*/ic_launcher_background*"):
+        if old.is_file():
+            old.unlink()
+
+    master = prepare_icon_master(src)
+    written: list[str] = []
+
+    def write(rel: str, data: str | None = None, image=None) -> None:
+        path = target / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if image is not None:
+            image.save(path, optimize=True)
+        else:
+            path.write_text(data or "", encoding="utf-8")
+        written.append(rel)
+
+    for density, px in LEGACY_ICON_SIZES:
+        write(f"mipmap-{density}/ic_launcher.png", image=master.resize((px, px), Image.LANCZOS))
+    canvas = Image.new("RGBA", (ADAPTIVE_CANVAS, ADAPTIVE_CANVAS), (0, 0, 0, 0))
+    tile = master.resize((ADAPTIVE_TILE, ADAPTIVE_TILE), Image.LANCZOS)
+    offset = (ADAPTIVE_CANVAS - ADAPTIVE_TILE) // 2
+    canvas.paste(tile, (offset, offset), tile)
+    write("drawable-nodpi/ic_launcher_foreground.png", image=canvas)
+    write(
+        "mipmap-anydpi-v26/ic_launcher.xml",
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <background android:drawable="@color/ic_launcher_background"/>\n'
+        '    <foreground android:drawable="@drawable/ic_launcher_foreground"/>\n'
+        "</adaptive-icon>\n",
+    )
+    write(
+        "values/ic_launcher_background.xml",
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<resources>\n"
+        f'    <color name="ic_launcher_background">{_adaptive_background(master)}</color>\n'
+        "</resources>\n",
+    )
+    return sorted(written)
+
+
 def install_native_sources() -> None:
     kotlin_root = ANDROID / "app" / "src" / "main" / "kotlin"
     kotlin_root.mkdir(parents=True, exist_ok=True)
@@ -428,6 +562,8 @@ def main() -> None:
     report_versions()
     patch_manifest()
     write_notification_icon()
+    icons = install_launcher_icons()
+    print(f"Launcher icon installed ({len(icons)} files)")
     install_native_sources()
     print("Bayan Android/Chaquopy configuration prepared successfully")
     print(f"Chaquopy={CHAQUOPY}, Python={PYTHON}, ABI={ABIS}")

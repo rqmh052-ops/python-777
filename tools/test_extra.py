@@ -1014,6 +1014,72 @@ SAMPLE_MANIFEST = """<manifest xmlns:android="http://schemas.android.com/apk/res
 """
 
 
+def test_launcher_icon_installed_without_white_background() -> None:
+    """The app icon is generated at build time from icon.png (the only icon file in the project),
+    replaces Flutter's default one, has transparent corners (no white backdrop), includes an
+    adaptive icon, and leftover ic_launcher.* files never cause duplicate resources."""
+    import xml.dom.minidom as minidom
+
+    from PIL import Image, ImageDraw
+
+    prep = _load_tool("prepare_android")
+    assert (ROOT / "icon.png").is_file(), "icon.png in the project root is the only icon file needed"
+    assert not (ROOT / "android_res").exists(), "no pre-built icon folders: the build generates them"
+    with tempfile.TemporaryDirectory(prefix="bayan-icon-") as td:
+        res = Path(td) / "res"
+        (res / "mipmap-hdpi").mkdir(parents=True)
+        (res / "mipmap-hdpi" / "ic_launcher.webp").write_bytes(b"old")
+        (res / "mipmap-hdpi" / "ic_launcher.png").write_bytes(b"old")
+        copied = prep.install_launcher_icons(res)
+        copied_again = prep.install_launcher_icons(res)
+        assert copied == copied_again, "installing twice is idempotent"
+        assert not (res / "mipmap-hdpi" / "ic_launcher.webp").exists(), "stale webp would clash with the png"
+        for density, px in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+            img = Image.open(res / f"mipmap-{density}" / "ic_launcher.png").convert("RGBA")
+            assert img.size == (px, px), (density, img.size)
+            assert img.getpixel((0, 0))[3] == 0 and img.getpixel((px - 1, px - 1))[3] == 0, "corners are transparent"
+            assert img.getpixel((px // 2, px // 2))[3] == 255
+            # no white fringe: the first/last opaque pixels of the middle row are the blue border
+            opaque = [x for x in range(px) if img.getpixel((x, px // 2))[3] > 200]
+            for x in (opaque[0], opaque[-1]):
+                r, g, b, a = img.getpixel((x, px // 2))
+                assert b > 150 and r < 120, (density, x, (r, g, b, a))
+        fg = Image.open(res / "drawable-nodpi" / "ic_launcher_foreground.png").convert("RGBA")
+        assert fg.size == (432, 432) and fg.getpixel((0, 0))[3] == 0
+        # the tile sits inside the 66dp safe zone: 72..360 of 432px
+        xs = [x for x in range(432) if fg.getpixel((x, 216))[3] > 0]
+        assert min(xs) >= 70 and max(xs) <= 362, (min(xs), max(xs))
+        adaptive_xml = (res / "mipmap-anydpi-v26" / "ic_launcher.xml").read_text(encoding="utf-8")
+        assert minidom.parseString(adaptive_xml.encode("utf-8")).documentElement.tagName == "adaptive-icon"
+        assert "@drawable/ic_launcher_foreground" in adaptive_xml
+        color = minidom.parse(str(res / "values" / "ic_launcher_background.xml"))
+        assert re.fullmatch(r"#[0-9A-F]{6}", color.getElementsByTagName("color")[0].firstChild.data)
+
+    # the original artwork as the user sends it (white / light-grey checkerboard backdrop)
+    # is cleaned automatically, so only icon.png has to be uploaded
+    with tempfile.TemporaryDirectory(prefix="bayan-icon-dirty-") as td:
+        src = Path(td) / "dirty.png"
+        im = Image.new("RGB", (400, 400), (253, 253, 253))
+        d = ImageDraw.Draw(im)
+        for gy in range(20):
+            for gx in range(20):
+                if (gx + gy) % 2:
+                    d.rectangle((gx * 20, gy * 20, gx * 20 + 19, gy * 20 + 19), fill=(236, 236, 235))
+        d.rounded_rectangle((30, 30, 369, 369), radius=60, fill=(0, 100, 250))
+        d.rounded_rectangle((50, 50, 349, 349), radius=45, fill=(8, 30, 110))
+        d.rectangle((150, 180, 250, 220), fill=(255, 255, 255))  # white lettering inside the tile
+        im.save(src)
+        master = prep.prepare_icon_master(src)
+        w = master.size[0]
+        assert master.size == (w, w)
+        assert master.getpixel((0, 0))[3] == 0 and master.getpixel((w - 1, w - 1))[3] == 0
+        centre = master.getpixel((w // 2, w // 2))
+        assert centre[3] == 255 and centre[0] > 200, "white lettering inside the tile is kept"
+        res2 = Path(td) / "res"
+        prep.install_launcher_icons(res2, src)
+        assert (res2 / "mipmap-xxxhdpi" / "ic_launcher.png").is_file()
+
+
 def test_background_manifest_and_icon() -> None:
     """The foreground service is declared as specialUse (with the Play subtype property) and the
     permissions it needs exist. Patching twice must not duplicate anything."""
@@ -1334,8 +1400,11 @@ def test_plan_2_2g_tiles_and_management() -> None:
     main_dart = (ROOT / "main.dart").read_text(encoding="utf-8")
     store = (ROOT / "store.dart").read_text(encoding="utf-8")
     tile = main_dart[main_dart.index("class ScriptTile") : main_dart.index("String fmtElapsed")]
-    for text in ("يعمل منذ", "ينتظر إدخال", "انتهى بكود", "valueListenable: runHub.clock"):
+    for text in ("يعمل منذ", "ينتظر إدخال", "valueListenable: runHub.clock"):
         assert text in tile, text
+    # الخطأ تكفيه النقطة الحمراء: لا سطر «انتهى بكود N» في البطاقة ولا في الإخراج
+    assert "انتهى بكود" not in tile and "info.exitCode" not in tile
+    assert "انتهى بكود" not in re.sub(r"//[^\n]*", "", main_dart), "no exit-code text anywhere in the UI"
     # الاتفاق الجديد: لا «آخر تعديل» ولا «آخر تشغيل» في بطاقة السكربت (الحالة الحية فقط)
     for text in ("آخر تعديل", "آخر تشغيل", "لم يُشغّل بعد"):
         assert text not in tile, text

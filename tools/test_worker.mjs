@@ -31,6 +31,7 @@ class MockR2 {
       writeHttpMetadata(headers){headers.set('content-type',o.contentType || 'application/octet-stream');}
     };
   }
+  async delete(key) { this.objects.delete(key); }
   async head(key) { const o=this.objects.get(key); return o ? {size:o.bytes.length} : null; }
   async put(key,value,opts={}) {
     const bytes=typeof value==='string' ? new TextEncoder().encode(value) : new Uint8Array(value);
@@ -69,4 +70,47 @@ assert.equal(r.status,405,'delete is disabled');
 const t2=await token('user_2','two@example.com');
 r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:{authorization:`Bearer ${t2}`}}),env);
 assert.equal((await r.json()).files.length,0,'users are isolated');
-console.log('Worker mocked integration tests: PASS (health, auth, profile, upload, list, download, no-delete, account isolation)');
+
+// ── long-lived Bynux sessions (remember me) ──
+r=await worker.fetch(new Request('https://bynux.test/v1/health'),env);
+assert.equal((await r.json()).sessions,true,'health reports session support');
+r=await worker.fetch(new Request('https://bynux.test/v1/session',{method:'POST',headers:h1,body:'{}'}),env);
+assert.equal(r.status,200); const grant=await r.json();
+assert.match(grant.sessionToken,/^bxs_[A-Za-z0-9_-]{43}$/); assert.ok(Date.parse(grant.expiresAt)>Date.now()+100*24*3600*1000,'session lasts months');
+const hs={authorization:`Bearer ${grant.sessionToken}`};
+assert.ok(![...env.FILES.objects.keys()].some((k)=>k.includes(grant.sessionToken)),'raw session token is never stored');
+r=await worker.fetch(new Request('https://bynux.test/v1/profile',{headers:hs}),env);
+assert.equal(r.status,200); assert.equal((await r.json()).email,'one@example.com','session maps to the same account');
+r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:hs}),env);
+assert.equal((await r.json()).files.length,1,'session sees the same files as the Google token');
+r=await worker.fetch(new Request('https://bynux.test/v1/files/via_session.py',{method:'PUT',headers:{...hs,'content-length':'8'},body:'print(1)\n'.slice(0,8)}),env);
+assert.equal(r.status,200,'upload works with a session token');
+r=await worker.fetch(new Request('https://bynux.test/v1/session',{method:'POST',headers:hs,body:'{}'}),env);
+assert.equal(r.status,403,'a session cannot mint another session');
+r=await worker.fetch(new Request('https://bynux.test/v1/session',{headers:h1}),env);
+assert.equal(r.status,405,'session endpoint is POST only');
+r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:{authorization:'Bearer bxs_'+'A'.repeat(43)}}),env);
+assert.equal(r.status,401,'unknown session rejected');
+r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:{authorization:'Bearer bxs_short'}}),env);
+assert.equal(r.status,401,'malformed session rejected');
+// expiry: an expired session is rejected and removed
+r=await worker.fetch(new Request('https://bynux.test/v1/session',{method:'POST',headers:{authorization:`Bearer ${await token('user_1','one@example.com')}`},body:'{}'}),env);
+const old=(await r.json()).sessionToken;
+const oldKey=[...env.FILES.objects.keys()].filter((k)=>k.startsWith('sessions/')).pop();
+const oldData=JSON.parse(new TextDecoder().decode(env.FILES.objects.get(oldKey).bytes)); oldData.expiresAt=Date.now()-1000;
+env.FILES.objects.get(oldKey).bytes=new TextEncoder().encode(JSON.stringify(oldData));
+r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:{authorization:`Bearer ${old}`}}),env);
+assert.equal(r.status,401,'expired session rejected'); assert.ok(!env.FILES.objects.has(oldKey),'expired session is deleted');
+// another account's session never reaches this account's files
+r=await worker.fetch(new Request('https://bynux.test/v1/session',{method:'POST',headers:{authorization:`Bearer ${t2}`},body:'{}'}),env);
+const s2=(await r.json()).sessionToken;
+r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:{authorization:`Bearer ${s2}`}}),env);
+assert.equal((await r.json()).files.length,0,'sessions are isolated per account');
+// revoke
+r=await worker.fetch(new Request('https://bynux.test/v1/session/revoke',{method:'POST',headers:hs,body:'{}'}),env);
+assert.equal(r.status,200);
+r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:hs}),env);
+assert.equal(r.status,401,'revoked session no longer works');
+r=await worker.fetch(new Request('https://bynux.test/v1/files',{headers:h1}),env);
+assert.equal(r.status,200,'Google token still works after revoking a session');
+console.log('Worker mocked integration tests: PASS (health, auth, profile, upload, list, download, no-delete, account isolation, sessions)');
