@@ -1595,7 +1595,7 @@ class AppDrawer extends StatelessWidget {
 }
 
 // ───────── شاشة الصلاحيات: الترحيب عند أول فتح + «فحص الصلاحيات» من القائمة ─────────
-enum _PermState { granted, missing, manual }
+enum _PermState { granted, missing }
 
 class PermissionsScreen extends StatefulWidget {
   const PermissionsScreen({super.key, this.welcome = false});
@@ -1722,12 +1722,8 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     required Future<void> Function() onAction,
   }) {
     final skipped = _skipped.contains(id) && state != _PermState.granted;
-    final Color tone = state == _PermState.granted
-        ? C.ok
-        : (state == _PermState.missing ? C.warn : C.muted);
-    final String chip = state == _PermState.granted
-        ? 'ممنوح'
-        : (state == _PermState.missing ? 'غير ممنوح' : 'إعداد يدوي');
+    final Color tone = state == _PermState.granted ? C.ok : C.warn;
+    final String chip = state == _PermState.granted ? 'ممنوح' : 'غير ممنوح';
     return Appear(
       index: index,
       child: Container(
