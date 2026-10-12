@@ -53,6 +53,9 @@ BoxDecoration _box(Color color, {bool raised = false}) => BoxDecoration(
     border: Border.all(color: raised ? C.borderHi : C.border),
     boxShadow: raised ? _shadow : null);
 
+// ارتفاع خانة إدخال الكونسول وزر الإرسال بجانبها (متساويان).
+const double _inputHeight = 50;
+
 final _ob = OutlineInputBorder(
     borderRadius: BorderRadius.circular(10),
     borderSide: const BorderSide(color: C.border));
@@ -503,7 +506,7 @@ class MissingLibCard extends StatelessWidget {
       );
 }
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
@@ -511,6 +514,9 @@ void main() {
     systemNavigationBarColor: C.bg,
     systemNavigationBarIconBrightness: Brightness.light,
   ));
+  // قراءة الجلسة المحفوظة على الجهاز (ملف محلي سريع، لا شبكة): تحدد من أول إطار
+  // هل نعرض الرئيسية مباشرة أم شاشة الدخول، بدون أي دوران انتظار.
+  await BynuxSession.instance.loadSaved();
   runApp(const App());
 }
 
@@ -1067,9 +1073,7 @@ class ScriptTile extends StatelessWidget {
   Widget _tile(BuildContext context) {
     final info = runHub.infoFor(script.path);
     final live = info != null &&
-        (info.status == RunStatus.running ||
-            info.status == RunStatus.waiting ||
-            info.status == RunStatus.error);
+        (info.status == RunStatus.running || info.status == RunStatus.waiting);
     final tile = Material(
       color: C.surface,
       clipBehavior: Clip.antiAlias,
@@ -1126,8 +1130,8 @@ class ScriptTile extends StatelessWidget {
     );
   }
 
-  // أخضر «يعمل منذ 02:15» (مؤقت حي) · عنبري «ينتظر إدخال» · أحمر «انتهى بكود N».
-  // لا شيء في بقية الحالات (لا تواريخ في البطاقة).
+  // أخضر «يعمل منذ 02:15» (مؤقت حي) · عنبري «ينتظر إدخال».
+  // لا شيء في بقية الحالات: الخطأ تكفيه النقطة الحمراء بجانب الاسم، ولا يُعرض رمز الخروج.
   Widget _statusLine(RunInfo? info) {
     if (info != null && info.status == RunStatus.running) {
       return ValueListenableBuilder<int>(
@@ -1140,11 +1144,6 @@ class ScriptTile extends StatelessWidget {
     }
     if (info != null && info.status == RunStatus.waiting) {
       return Text('ينتظر إدخال',
-          style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)));
-    }
-    if (info != null && info.status == RunStatus.error) {
-      final code = info.exitCode;
-      return Text(code == null ? 'انتهى بخطأ' : 'انتهى بكود $code',
           style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)));
     }
     return const SizedBox.shrink();
@@ -1633,18 +1632,27 @@ class _AuthGateState extends State<AuthGate> {
   void initState() {
     super.initState();
     _session.addListener(_onSessionChanged);
-    unawaited(_session.initialize());
+    // الشاشة لا تنتظر شيئًا: الجلسة المحفوظة قُرئت قبل runApp. هذا الاستدعاء
+    // يجهّز جوجل ويجدد الجلسة في الخلفية فقط.
+    unawaited(_session.restoreInBackground());
+    final saved = _session.user;
+    if (saved != null) _ensureProfile(saved);
+  }
+
+  // يحفظ الخادم تاريخ إنشاء الحساب من أول دخول ناجح، لا من تخزين محلي قد يُحذف.
+  void _ensureProfile(BynuxUser user) {
+    if (_profileInitializedFor == user.id) return;
+    _profileInitializedFor = user.id;
+    unawaited(BynuxCloudApi.instance.getProfile().catchError(
+        (Object _) => const CloudProfile(email: '', createdAt: null)));
   }
 
   void _onSessionChanged() {
     final user = _session.user;
     if (user == null) {
       _profileInitializedFor = null;
-    } else if (_profileInitializedFor != user.id) {
-      _profileInitializedFor = user.id;
-      // يحفظ الخادم تاريخ إنشاء الحساب من أول دخول ناجح، لا من تخزين محلي قد يُحذف.
-      unawaited(BynuxCloudApi.instance.getProfile().catchError(
-          (Object _) => const CloudProfile(email: '', createdAt: null)));
+    } else {
+      _ensureProfile(user);
     }
     if (mounted) setState(() {});
   }
@@ -5271,14 +5279,8 @@ class _OutputScreenState extends State<OutputScreen> {
         _onMissing(e.text);
         break;
       case 'exit':
-        final code = e.exitCode;
-        if (code == 0) {
-          _add('[انتهى بكود 0]', 1);
-        } else if (code == 130) {
-          if (!_stopRequested) _add('[تم إيقاف التشغيل]', 1);
-        } else {
-          _add('[انتهى بكود $code]', 3);
-        }
+        // لا نكتب «انتهى بكود N» في الإخراج: النقطة الملوّنة بجانب اسم السكربت تكفي.
+        if (e.exitCode == 130 && !_stopRequested) _add('[تم إيقاف التشغيل]', 1);
         _stopRequested = false;
         setState(() {});
         break;
@@ -5323,13 +5325,11 @@ class _OutputScreenState extends State<OutputScreen> {
     });
     _add(r'$ python ' + widget.script.name, 1);
     try {
-      try {
-        final uploaded = await BynuxCloudApi.instance
-            .uploadLocalScript(widget.script.path);
-        _add('[تمت مزامنة ${uploaded.name} مع السحابة]', 1);
-      } catch (error) {
-        _add('[تعذّر رفع النسخة السحابية: ${bynuxFriendlyCloudError(error)}]', 2);
-      }
+      // النسخة السحابية تُرفع بصمت وفي الخلفية: لا تُكتب في الإخراج ولا تؤخر التشغيل.
+      // حالة المزامنة تظهر في صفحة «حالة المزامنة» داخل الإعدادات.
+      unawaited(BynuxCloudApi.instance
+          .uploadLocalScript(widget.script.path)
+          .then<void>((_) {}, onError: (Object _) {}));
       await _runner.start();
     } catch (e) {
       if (mounted) _add('تعذر بدء Python: ${errText(e)}', 3);
@@ -5708,23 +5708,30 @@ class _OutputScreenState extends State<OutputScreen> {
             child: Row(
               children: [
                 Expanded(
+                  // نفس ارتفاع زر الإرسال (50). expands: true ليملأ الحقل الارتفاع كله
+                  // (بدونه يرسم الإطار بحجم النص فقط ويلتصق بالأعلى).
                   child: SizedBox(
-                    height: 44,
+                    height: _inputHeight,
                     child: TextField(
                       contextMenuBuilder: arContextMenu,
                       controller: _input,
                       enabled: waiting,
+                      expands: true,
+                      maxLines: null,
+                      minLines: null,
+                      keyboardType: TextInputType.text,
+                      textAlignVertical: TextAlignVertical.center,
                       onSubmitted: (_) => unawaited(_send()),
                       textInputAction: TextInputAction.send,
                       style: const TextStyle(fontSize: 14),
                       cursorColor: C.accent,
                       decoration: InputDecoration(
-                        hintText: waiting ? 'اكتب هنا ثم أرسل' : 'في انتظار input()…',
+                        hintText: waiting ? 'اكتب هنا ثم أرسل' : 'اكتب هنا…',
                         hintStyle: const TextStyle(color: C.dim),
                         isDense: true,
                         filled: true,
                         fillColor: C.surface,
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 14),
                         border: _ob,
                         enabledBorder: _ob,
                         disabledBorder: _ob,
@@ -5741,6 +5748,8 @@ class _OutputScreenState extends State<OutputScreen> {
                     label: 'إرسال',
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 200),
+                      width: _inputHeight,
+                      height: _inputHeight,
                       decoration: BoxDecoration(
                         color: waiting ? C.accent : C.border,
                         borderRadius: BorderRadius.circular(10),

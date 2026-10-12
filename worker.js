@@ -4,11 +4,20 @@
  *   FILES             -> private R2 bucket binding
  *   GOOGLE_CLIENT_ID  -> Web OAuth client ID (plain text variable)
  * No APP_TOKEN is used; Google ID tokens provide the user identity.
+ *
+ * Sessions: a Google ID token only lives for one hour and cannot always be refreshed
+ * silently on the phone. After one successful Google sign-in the app asks for a long-lived
+ * Bynux session token (POST /v1/session). Only a SHA-256 hash of that token is stored in
+ * the same R2 bucket (sessions/<hash>), so no new secret or binding is needed.
  */
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_FILES_PER_USER = 200;
 const PROFILE_FILE = '.bynux-profile.json';
 const GOOGLE_CERTS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
+const SESSION_PREFIX = 'sessions/';
+const SESSION_TOKEN_PREFIX = 'bxs_';
+const SESSION_TOKEN_PATTERN = /^bxs_[A-Za-z0-9_-]{43}$/;
+const SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 
 let cachedGoogleKeys = null;
 let googleKeysExpiresAt = 0;
@@ -103,6 +112,7 @@ async function verifyGoogleIdToken(request, env) {
 
     return {
       ok: true,
+      kind: 'google',
       user: {
         sub: String(claims.sub),
         email: typeof claims.email === 'string' ? claims.email : '',
@@ -111,6 +121,61 @@ async function verifyGoogleIdToken(request, env) {
   } catch (_) {
     return { ok: false, status: 401, message: 'Unable to verify Google token' };
   }
+}
+
+function bearerToken(request) {
+  const match = (request.headers.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : null;
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function newSessionToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  const encoded = btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return `${SESSION_TOKEN_PREFIX}${encoded}`;
+}
+
+async function verifySessionToken(token, env) {
+  if (!env.FILES) return { ok: false, status: 503, message: 'R2 binding FILES is not configured' };
+  if (!SESSION_TOKEN_PATTERN.test(token)) {
+    return { ok: false, status: 401, message: 'Invalid session token' };
+  }
+  try {
+    const key = `${SESSION_PREFIX}${await sha256Hex(token)}`;
+    const object = await env.FILES.get(key);
+    if (!object) return { ok: false, status: 401, message: 'Invalid or expired session' };
+    let data = null;
+    try {
+      data = await object.json();
+    } catch (_) {
+      data = null;
+    }
+    if (!data || typeof data.sub !== 'string' || !/^[A-Za-z0-9_-]{1,255}$/.test(data.sub) ||
+        !Number.isFinite(data.expiresAt) || data.expiresAt <= Date.now()) {
+      await env.FILES.delete(key);
+      return { ok: false, status: 401, message: 'Invalid or expired session' };
+    }
+    return {
+      ok: true,
+      kind: 'session',
+      sessionKey: key,
+      user: { sub: data.sub, email: typeof data.email === 'string' ? data.email : '' },
+    };
+  } catch (_) {
+    return { ok: false, status: 401, message: 'Unable to verify session' };
+  }
+}
+
+async function authenticate(request, env) {
+  const token = bearerToken(request);
+  if (token && token.startsWith(SESSION_TOKEN_PREFIX)) return verifySessionToken(token, env);
+  return verifyGoogleIdToken(request, env);
 }
 
 function safeScriptName(raw) {
@@ -223,9 +288,31 @@ async function readLimitedBody(request, maxBytes) {
   return { bytes };
 }
 
-async function handleApi(request, env, user, url) {
+async function handleApi(request, env, auth, url) {
+  const user = auth.user;
   if (!env.FILES) return error('R2 binding FILES is not configured', 503);
   if (!env.GOOGLE_CLIENT_ID) return error('Google client ID is not configured', 503);
+
+  if (url.pathname === '/v1/session' && request.method === 'POST') {
+    // Only a fresh Google sign-in can mint a session; a session cannot renew itself.
+    if (auth.kind !== 'google') return error('A Google sign-in is required to create a session', 403);
+    const token = newSessionToken();
+    const expiresAt = Date.now() + SESSION_TTL_MS;
+    await env.FILES.put(`${SESSION_PREFIX}${await sha256Hex(token)}`, JSON.stringify({
+      sub: user.sub,
+      email: user.email,
+      createdAt: new Date().toISOString(),
+      expiresAt,
+    }), {
+      httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'private, no-store' },
+    });
+    return json({ ok: true, sessionToken: token, expiresAt: new Date(expiresAt).toISOString() });
+  }
+
+  if (url.pathname === '/v1/session/revoke' && request.method === 'POST') {
+    if (auth.kind === 'session') await env.FILES.delete(auth.sessionKey);
+    return json({ ok: true });
+  }
 
   if (url.pathname === '/v1/profile' && request.method === 'GET') {
     const profile = await readProfile(env, user);
@@ -283,6 +370,9 @@ async function handleApi(request, env, user, url) {
     return json({ ok: true, name, size: body.bytes.byteLength, uploadedAt });
   }
 
+  if (url.pathname === '/v1/session' || url.pathname === '/v1/session/revoke') {
+    return error('Method not allowed', 405, { allow: 'POST' });
+  }
   if (url.pathname.startsWith('/v1/files') || url.pathname === '/v1/profile') {
     return error('Method not allowed', 405, { allow: 'GET, PUT' });
   }
@@ -297,7 +387,7 @@ export default {
         status: 204,
         headers: {
           'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET, PUT, OPTIONS',
+          'access-control-allow-methods': 'GET, PUT, POST, OPTIONS',
           'access-control-allow-headers': 'Authorization, Content-Type',
           'access-control-max-age': '86400',
         },
@@ -309,16 +399,17 @@ export default {
         ok: true,
         storage_bound: Boolean(env.FILES),
         auth_configured: Boolean(env.GOOGLE_CLIENT_ID),
+        sessions: Boolean(env.FILES),
       });
     }
 
-    const verified = await verifyGoogleIdToken(request, env);
+    const verified = await authenticate(request, env);
     if (!verified.ok) return error(verified.message, verified.status);
 
     try {
-      const response = await handleApi(request, env, verified.user, url);
+      const response = await handleApi(request, env, verified, url);
       response.headers.set('access-control-allow-origin', '*');
-      response.headers.set('access-control-allow-methods', 'GET, PUT, OPTIONS');
+      response.headers.set('access-control-allow-methods', 'GET, PUT, POST, OPTIONS');
       response.headers.set('access-control-allow-headers', 'Authorization, Content-Type');
       return response;
     } catch (_) {
