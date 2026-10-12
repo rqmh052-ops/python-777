@@ -56,9 +56,6 @@ class BynuxSession extends ChangeNotifier {
   static final BynuxSession instance = BynuxSession._();
 
   static const String _prefsKey = 'bynux_session_v1';
-  // الاستعادة الهادئة من جوجل قد تتأخر أو لا ترد؛ لا ننتظرها أكثر من هذا.
-  static const Duration _silentTimeout = Duration(seconds: 8);
-
   final GoogleSignIn _google = GoogleSignIn.instance;
   StreamSubscription<GoogleSignInAuthenticationEvent>? _events;
   GoogleSignInAccount? _account;
@@ -67,12 +64,11 @@ class BynuxSession extends ChangeNotifier {
   DateTime? _sessionExpiresAt;
   bool _googleReady = false;
   bool _ready = false;
-  bool _restoreStarted = false;
+  bool _signingIn = false;
   bool _obtainingSession = false;
   bool _sessionUnsupported = false;
   String? _initializationError;
   Future<void>? _initializationFuture;
-  Future<GoogleSignInAccount?>? _silentInFlight;
 
   BynuxUser? get user => _user;
   bool get ready => _ready;
@@ -82,7 +78,7 @@ class BynuxSession extends ChangeNotifier {
     final token = _sessionToken;
     final expiresAt = _sessionExpiresAt;
     if (token == null || token.isEmpty || expiresAt == null) return false;
-    return expiresAt.isAfter(DateTime.now().add(const Duration(days: 1)));
+    return expiresAt.isAfter(DateTime.now().add(const Duration(minutes: 1)));
   }
 
   /// يقرأ الجلسة المحفوظة من ملف محلي (بدون شبكة). يُستدعى قبل runApp ليظهر أول إطار
@@ -148,7 +144,7 @@ class BynuxSession extends ChangeNotifier {
         (event) {
           // نتجاهل حدث الخروج القادم من المكتبة عمدًا: الخروج الوحيد المعتمد هو
           // ضغطة «تسجيل الخروج» من المستخدم، حتى لا تضيع الجلسة بسبب حدث عابر.
-          if (event is GoogleSignInAuthenticationEventSignIn) {
+          if (event is GoogleSignInAuthenticationEventSignIn && !_signingIn) {
             _adoptAccount(event.user);
           }
         },
@@ -166,36 +162,9 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
-  /// يعمل في الخلفية بعد ظهور الشاشة. يحاول استعادة حساب جوجل بهدوء إن لم يوجد
-  /// حساب محفوظ أو لم تتوفر جلسة صالحة، وأي فشل هنا لا يغيّر ما يراه المستخدم.
-  Future<void> restoreInBackground() async {
-    if (_restoreStarted) return;
-    _restoreStarted = true;
-    await initialize();
-    if (!_googleReady) return;
-    if (_user != null && _sessionIsValid) return;
-    final account = await _silentAccount();
-    if (account == null) return;
-    final token = account.authentication.idToken;
-    _adoptAccount(account);
-    if (token != null && token.isNotEmpty) unawaited(_obtainSession(token));
-  }
-
-  Future<GoogleSignInAccount?> _silentAccount() =>
-      _silentInFlight ??= _silentAccountOnce().whenComplete(() {
-        _silentInFlight = null;
-      });
-
-  Future<GoogleSignInAccount?> _silentAccountOnce() async {
-    if (!_googleReady) return null;
-    try {
-      final attempt = _google.attemptLightweightAuthentication();
-      if (attempt == null) return null;
-      return await attempt.timeout(_silentTimeout);
-    } catch (_) {
-      return null;
-    }
-  }
+  /// لا يستدعي جوجل إطلاقًا. الجلسة المحفوظة (رمز الخادم الطويل) هي المرجع الوحيد؛
+  /// واجهة جوجل لا تظهر إلا من زر «تسجيل الدخول» اليدوي. بقيت الدالة لأن الشاشة تستدعيها.
+  Future<void> restoreInBackground() async {}
 
   void _adoptAccount(GoogleSignInAccount account) {
     _account = account;
@@ -217,18 +186,29 @@ class BynuxSession extends ChangeNotifier {
     if (!_googleReady) {
       throw StateError(_initializationError ?? 'تعذّر تجهيز تسجيل الدخول بجوجل.');
     }
+    _signingIn = true;
     try {
       final account = await _google.authenticate();
       final token = account.authentication.idToken;
       if (token == null || token.isEmpty) {
         throw StateError('لم يصل رمز التحقق من جوجل. تحقّق من إعدادات معرّف التطبيق وبصمة التوقيع.');
       }
+      // نحصل على رمز الجلسة الطويل قبل فتح الرئيسية (محاولتان)، ولا نعتمد على
+      // رمز جوجل الذي ينتهي بعد ساعة. هكذا لا يحتاج التطبيق جوجل بعد الآن.
+      final grant = await _mintSession(token, attempts: 2);
+      _account = account;
       _adoptAccount(account);
-      unawaited(_obtainSession(token));
+      if (grant != null) {
+        _sessionToken = grant.token;
+        _sessionExpiresAt = grant.expiresAt;
+        await _persist();
+      }
     } catch (error) {
       _initializationError = _friendlyError(error);
       notifyListeners();
       rethrow;
+    } finally {
+      _signingIn = false;
     }
   }
 
@@ -243,33 +223,46 @@ class BynuxSession extends ChangeNotifier {
     notifyListeners();
     if (token != null) unawaited(BynuxCloudApi.instance.revokeSession(token));
     try {
+      await initialize();
       if (_googleReady) await _google.signOut();
     } catch (_) {
       // الخروج المحلي تم؛ فشل جوجل لا يمنعه.
     }
   }
 
-  /// يستبدل رمز جوجل (ساعة واحدة) برمز جلسة طويل من الخادم، ليبقى السحابي يعمل
-  /// بعد إغلاق التطبيق دون الحاجة لجوجل. إن كان الخادم قديمًا (لم يُعاد نشره)
-  /// نكمل برمز جوجل كما كان.
+  /// يستبدل رمز جوجل (ساعة واحدة) برمز جلسة طويل من الخادم. يُرجع null عند الفشل.
+  /// إن كان الخادم قديمًا (لم يُعاد نشر worker.js) لا نعيد المحاولة في هذا التشغيل.
+  Future<CloudSessionGrant?> _mintSession(String googleToken, {int attempts = 1}) async {
+    if (_sessionUnsupported) return null;
+    for (var i = 0; i < attempts; i++) {
+      try {
+        return await BynuxCloudApi.instance.createSession(googleToken);
+      } on CloudApiException catch (error) {
+        if (error.statusCode == 404 || error.statusCode == 405) {
+          _sessionUnsupported = true;
+          return null;
+        }
+        if (error.statusCode == 401 || error.statusCode == 403) return null;
+      } catch (_) {
+        // لا اتصال الآن.
+      }
+      if (i + 1 < attempts) await Future<void>.delayed(const Duration(seconds: 2));
+    }
+    return null;
+  }
+
+  /// نسخة الخلفية: تُستدعى عندما يتوفر رمز جوجل صالح في الذاكرة ولا توجد جلسة.
   Future<void> _obtainSession(String googleToken) async {
-    if (_obtainingSession || _sessionUnsupported || _user == null) return;
-    if (_sessionIsValid) return;
+    if (_obtainingSession || _user == null || _sessionIsValid) return;
     _obtainingSession = true;
     final forUser = _user?.id;
     try {
-      final grant = await BynuxCloudApi.instance.createSession(googleToken);
-      if (forUser != null && _user?.id == forUser) {
+      final grant = await _mintSession(googleToken);
+      if (grant != null && forUser != null && _user?.id == forUser) {
         _sessionToken = grant.token;
         _sessionExpiresAt = grant.expiresAt;
         await _persist();
       }
-    } on CloudApiException catch (error) {
-      if (error.statusCode == 404 || error.statusCode == 405) {
-        _sessionUnsupported = true;
-      }
-    } catch (_) {
-      // لا اتصال الآن: نعيد المحاولة مع أول طلب سحابي ناجح لاحقًا.
     } finally {
       _obtainingSession = false;
     }
@@ -301,32 +294,24 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
-  /// الرمز الذي يُرسل للخادم: رمز الجلسة المحفوظ إن كان صالحًا، وإلا رمز جوجل.
+  /// الرمز الذي يُرسل للخادم: رمز الجلسة المحفوظ إن كان صالحًا، وإلا رمز جوجل إن كان
+  /// ما زال في الذاكرة. لا نفتح واجهة جوجل هنا أبدًا.
   Future<String> authToken() async {
     final saved = _sessionToken;
     if (saved != null && _sessionIsValid) return saved;
-    final google = await _freshGoogleToken();
-    unawaited(_obtainSession(google));
-    return google;
+    final google = _freshGoogleToken();
+    if (google != null) {
+      unawaited(_obtainSession(google));
+      return google;
+    }
+    throw CloudApiException(_sessionUnsupported
+        ? 'خادم السحابة قديم ولا يدعم حفظ الجلسة. أعد نشر ملف worker.js ثم سجّل الخروج وادخل من جديد.'
+        : 'انتهت جلسة السحابة. سجّل الخروج ثم ادخل بحساب جوجل مرة واحدة.');
   }
 
-  Future<String> _freshGoogleToken() async {
-    var token = _account?.authentication.idToken;
-    if (_idTokenIsFresh(token)) return token!;
-
-    // رموز هوية جوجل تنتهي صلاحيتها؛ نحاول استعادة الجلسة بهدوء للحصول على رمز جديد
-    // قبل مطالبة المستخدم بالتسجيل مرة أخرى.
-    await initialize();
-    final restored = await _silentAccount();
-    if (restored != null) {
-      _account = restored;
-      token = restored.authentication.idToken;
-    }
-    if (!_idTokenIsFresh(token)) {
-      throw const CloudApiException(
-          'انتهت جلسة التحقق. أعد تسجيل الدخول بحساب جوجل للمتابعة.');
-    }
-    return token!;
+  String? _freshGoogleToken() {
+    final token = _account?.authentication.idToken;
+    return _idTokenIsFresh(token) ? token : null;
   }
 
   static String _friendlyError(Object error) {
