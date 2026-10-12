@@ -1,4 +1,4 @@
-package dev.pyrunner.py_runner
+package com.bynux.app
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -1469,7 +1469,7 @@ class BayanScriptService : Service() {
         private const val TAG = "BayanScriptService"
         const val CHANNEL_ID = "bayan_scripts"
         const val NOTIFICATION_ID = 7771
-        const val ACTION_STOP_ALL = "dev.pyrunner.py_runner.action.STOP_ALL"
+        const val ACTION_STOP_ALL = "com.bynux.app.action.STOP_ALL"
 
         @Volatile private var instance: BayanScriptService? = null
 
@@ -1599,7 +1599,7 @@ class BayanScriptService : Service() {
         } else {
             Notification.Builder(this)
         }
-        val title = if (runs.isEmpty()) "مشغّل بايثون" else "${runs.size} سكربت يعمل"
+        val title = if (runs.isEmpty()) "Bynux" else "${runs.size} سكربت يعمل"
         val text = when {
             stopping -> "جارٍ إيقاف السكربتات…"
             runs.isEmpty() -> ""

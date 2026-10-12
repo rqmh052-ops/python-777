@@ -1,10 +1,10 @@
 name: py_runner
 description: واجهة تطبيق تشغيل سكربتات بايثون (نسخة تجريبية)
 publish_to: "none"
-version: 0.1.0+1
+version: 7.1.0+710
 
 environment:
-  sdk: ^3.10.0
+  sdk: ^3.11.0
 
 dependencies:
   flutter:
@@ -17,6 +17,7 @@ dependencies:
   file_picker: ^13.1.0
   shared_preferences: ^2.5.3
   device_info_plus: ^13.1.0
+  google_sign_in: ^7.2.0
 
 flutter:
   uses-material-design: true

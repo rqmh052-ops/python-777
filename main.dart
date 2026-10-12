@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'account_cloud.dart';
+
 import 'logo.dart';
 import 'store.dart';
 import 'python_runtime.dart';
@@ -518,7 +520,7 @@ class App extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
         debugShowCheckedModeBanner: false,
-        title: 'مشغّل بايثون',
+        title: 'Bynux',
         theme: ThemeData(
           fontFamily: 'Tajawal',
           brightness: Brightness.dark,
@@ -538,7 +540,7 @@ class App extends StatelessWidget {
         ),
         builder: (context, child) =>
             Directionality(textDirection: TextDirection.rtl, child: child!),
-        onGenerateRoute: (_) => smooth<void>(const HomeScreen()),
+        home: const AuthGate(),
       );
 }
 
@@ -910,16 +912,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _key.currentState?.openEndDrawer();
   }
 
+  Future<void> _openAccount() async {
+    final nav = Navigator.of(context);
+    if (_key.currentState?.isEndDrawerOpen == true) nav.pop();
+    await nav.push<void>(smooth<void>(const AccountScreen()));
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
         key: _key,
         endDrawer: AppDrawer(
-            onLibraries: _openLibraries, onPermissions: _openPermissions),
+            onLibraries: _openLibraries,
+            onPermissions: _openPermissions,
+            onAccount: _openAccount),
         body: SafeArea(
           child: Column(children: [
             Header(
                 title: 'سكربتاتي',
+                actions: [
+                  IconButton(
+                    tooltip: 'حسابي',
+                    onPressed: _openAccount,
+                    icon: const Icon(Icons.account_circle_outlined),
+                    color: C.text,
+                  ),
+                ],
                 onMenu: () => _key.currentState?.openEndDrawer()),
             Expanded(
               child: ListenableBuilder(
@@ -1480,9 +1497,13 @@ Future<void> deleteScript(BuildContext context, Script s) async {
 
 // ───────── القائمة الجانبية ─────────
 class AppDrawer extends StatelessWidget {
-  const AppDrawer(
-      {super.key, required this.onLibraries, required this.onPermissions});
-  final VoidCallback onLibraries, onPermissions;
+  const AppDrawer({
+    super.key,
+    required this.onLibraries,
+    required this.onPermissions,
+    required this.onAccount,
+  });
+  final VoidCallback onLibraries, onPermissions, onAccount;
 
   Widget _nav(IconData icon, String label, bool active, VoidCallback onTap) =>
       Material(
@@ -1533,10 +1554,12 @@ class AppDrawer extends StatelessWidget {
                 children: [
                   const Padding(
                     padding: EdgeInsets.fromLTRB(4, 0, 4, 16),
-                    child: Text('مشغّل بايثون',
+                    child: Text('Bynux',
                         style: TextStyle(
                             fontSize: 18, fontWeight: FontWeight.w600)),
                   ),
+                  _nav(Icons.account_circle_outlined, 'حسابي', false, onAccount),
+                  const SizedBox(height: 4),
                   _nav(Icons.description_outlined, 'السكربتات', true,
                       () => Navigator.pop(context)),
                   const SizedBox(height: 4),
@@ -1568,7 +1591,7 @@ class AppDrawer extends StatelessWidget {
                               child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text('بيان',
+                                    Text('Bynux',
                                         style: TextStyle(
                                             fontSize: 18,
                                             fontWeight: FontWeight.w600)),
@@ -1593,6 +1616,912 @@ class AppDrawer extends StatelessWidget {
         ),
       );
 }
+
+// ───────── بوابة الحساب: لا يمكن الدخول إلى التطبيق قبل تسجيل جوجل ─────────
+class AuthGate extends StatefulWidget {
+  const AuthGate({super.key});
+
+  @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  final BynuxSession _session = BynuxSession.instance;
+  String? _profileInitializedFor;
+
+  @override
+  void initState() {
+    super.initState();
+    _session.addListener(_onSessionChanged);
+    unawaited(_session.initialize());
+  }
+
+  void _onSessionChanged() {
+    final user = _session.user;
+    if (user == null) {
+      _profileInitializedFor = null;
+    } else if (_profileInitializedFor != user.id) {
+      _profileInitializedFor = user.id;
+      // يحفظ الخادم تاريخ إنشاء الحساب من أول دخول ناجح، لا من تخزين محلي قد يُحذف.
+      unawaited(BynuxCloudApi.instance.getProfile().catchError(
+          (Object _) => const CloudProfile(email: '', createdAt: null)));
+    }
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _session.removeListener(_onSessionChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_session.ready) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(strokeWidth: 2.4, color: C.accent),
+        ),
+      );
+    }
+    final user = _session.user;
+    if (user == null) return const GoogleLoginScreen();
+    return HomeScreen(key: ValueKey<String>(user.id));
+  }
+}
+
+class GoogleLoginScreen extends StatefulWidget {
+  const GoogleLoginScreen({super.key});
+
+  @override
+  State<GoogleLoginScreen> createState() => _GoogleLoginScreenState();
+}
+
+class _GoogleLoginScreenState extends State<GoogleLoginScreen> {
+  bool _busy = false;
+  String? _message;
+
+  Future<void> _signIn() async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _message = null;
+    });
+    try {
+      await BynuxSession.instance.signIn();
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _message = BynuxSession.instance.initializationError ??
+              'تعذّر تسجيل الدخول. تحقّق من الإنترنت ومن إعدادات جوجل للتطبيق.';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 420),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 92,
+                      height: 92,
+                      decoration: BoxDecoration(
+                        color: C.surface,
+                        borderRadius: BorderRadius.circular(26),
+                        border: Border.all(color: C.borderHi),
+                        boxShadow: _shadow,
+                      ),
+                      child: const Icon(Icons.cloud_outlined,
+                          color: C.accent, size: 48),
+                    ),
+                    const SizedBox(height: 22),
+                    const Text('Bynux',
+                        style: TextStyle(
+                            fontSize: 30, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'سجّل الدخول لحفظ سكربتاتك والوصول إليها من السحابة.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: C.muted, height: 1.6, fontSize: 15),
+                    ),
+                    const SizedBox(height: 26),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: ElevatedButton.icon(
+                        onPressed: _busy ? null : _signIn,
+                        icon: _busy
+                            ? const SizedBox(
+                                width: 19,
+                                height: 19,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2, color: C.onAccent),
+                              )
+                            : const Icon(Icons.login_rounded),
+                        label: Text(_busy ? 'جارٍ تسجيل الدخول…' : 'تسجيل الدخول بحساب جوجل'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: C.accent,
+                          foregroundColor: C.onAccent,
+                          disabledBackgroundColor: C.accent.withValues(alpha: .45),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(13)),
+                          textStyle: const TextStyle(
+                              fontSize: 15, fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                    ),
+                    if (_message != null) ...[
+                      const SizedBox(height: 16),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: C.error.withValues(alpha: .08),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: C.error.withValues(alpha: .4)),
+                        ),
+                        child: Text(_message!,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: C.error, height: 1.5)),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+}
+
+// ───────── صفحة الحساب ─────────
+class AccountScreen extends StatefulWidget {
+  const AccountScreen({super.key});
+
+  @override
+  State<AccountScreen> createState() => _AccountScreenState();
+}
+
+class _AccountScreenState extends State<AccountScreen> {
+  Future<CloudProfile>? _profileFuture;
+  bool _signingOut = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _profileFuture = BynuxCloudApi.instance.getProfile();
+  }
+
+  void _loadProfile() {
+    setState(() => _profileFuture = BynuxCloudApi.instance.getProfile());
+  }
+
+  void _open(Widget page) => Navigator.of(context).push<void>(smooth<void>(page));
+
+  Future<void> _signOut() async {
+    if (_signingOut) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: C.surface,
+        title: const Text('تسجيل الخروج'),
+        content: const Text('هل تريد تسجيل الخروج من حساب جوجل على هذا الجهاز؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('إلغاء')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('تسجيل الخروج', style: TextStyle(color: C.error))),
+        ],
+      ),
+    );
+    if (confirm != true || !mounted) return;
+    setState(() => _signingOut = true);
+    try {
+      await BynuxSession.instance.signOut();
+      if (!mounted) return;
+      Navigator.of(context).popUntil((route) => route.isFirst);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('تعذّر تسجيل الخروج. حاول مرة أخرى.')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _signingOut = false);
+    }
+  }
+
+  Widget _option({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+    Widget? trailing,
+  }) => Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(13),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 14),
+            decoration: _box(C.surface),
+            child: Row(children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: C.accent.withValues(alpha: .1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, color: C.accent, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.w700, fontSize: 15)),
+                    const SizedBox(height: 3),
+                    Text(subtitle,
+                        style: const TextStyle(
+                            color: C.muted, fontSize: 12, height: 1.4)),
+                  ],
+                ),
+              ),
+              trailing ?? const Icon(Icons.chevron_left, color: C.dim),
+            ]),
+          ),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final user = BynuxSession.instance.user;
+    return Scaffold(
+      body: SafeArea(
+        child: Column(children: [
+          Header(
+            title: 'حسابي',
+            back: true,
+            actions: [
+              IconButton(
+                tooltip: 'تحديث المعلومات',
+                onPressed: _loadProfile,
+                icon: const Icon(Icons.refresh_rounded),
+                color: C.text,
+              ),
+            ],
+          ),
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(17),
+                  decoration: _box(C.surface, raised: true),
+                  child: Row(children: [
+                    Container(
+                      width: 56,
+                      height: 56,
+                      decoration: BoxDecoration(
+                        color: C.accent.withValues(alpha: .12),
+                        shape: BoxShape.circle,
+                        border: Border.all(color: C.accent.withValues(alpha: .4)),
+                      ),
+                      child: const Icon(Icons.person_outline,
+                          color: C.accent, size: 30),
+                    ),
+                    const SizedBox(width: 13),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('حساب جوجل',
+                              style: TextStyle(
+                                  fontSize: 17, fontWeight: FontWeight.w800)),
+                          const SizedBox(height: 5),
+                          Text(user?.email ?? 'لا يوجد حساب مرتبط',
+                              textDirection: TextDirection.ltr,
+                              textAlign: TextAlign.right,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: C.muted, fontSize: 13)),
+                          const SizedBox(height: 10),
+                          Row(children: [
+                            const Icon(Icons.calendar_month_outlined,
+                                color: C.dim, size: 16),
+                            const SizedBox(width: 5),
+                            const Text('تاريخ الانضمام',
+                                style: TextStyle(color: C.muted, fontSize: 12)),
+                            const SizedBox(width: 7),
+                            Expanded(
+                              child: FutureBuilder<CloudProfile>(
+                                future: _profileFuture,
+                                builder: (context, snapshot) {
+                                  if (snapshot.connectionState != ConnectionState.done) {
+                                    return const Text('جارٍ التحميل…',
+                                        style: TextStyle(color: C.dim, fontSize: 12));
+                                  }
+                                  if (snapshot.hasError) {
+                                    return const Text('غير متاح حالياً',
+                                        style: TextStyle(color: C.dim, fontSize: 12));
+                                  }
+                                  return Text(
+                                    bynuxFormatDate(snapshot.data?.createdAt),
+                                    style: const TextStyle(
+                                        color: C.text, fontSize: 12),
+                                  );
+                                },
+                              ),
+                            ),
+                          ]),
+                        ],
+                      ),
+                    ),
+                  ]),
+                ),
+                const SizedBox(height: 18),
+                _option(
+                  icon: Icons.cloud_outlined,
+                  title: 'السحابة',
+                  subtitle: 'عرض سكربتاتك المحفوظة وتنزيلها',
+                  onTap: () => _open(const CloudFilesScreen()),
+                ),
+                const SizedBox(height: 9),
+                _option(
+                  icon: Icons.sync_rounded,
+                  title: 'حالة المزامنة',
+                  subtitle: 'آخر سكربت رُفع وحجم وعدد الملفات المحفوظة',
+                  onTap: () => _open(const SyncStatusScreen()),
+                ),
+                const SizedBox(height: 9),
+                _option(
+                  icon: Icons.shield_outlined,
+                  title: 'الخصوصية والأمان',
+                  subtitle: 'هذا القسم قيد التجهيز',
+                  onTap: () => _open(const PlaceholderAccountSection(
+                      title: 'الخصوصية والأمان', icon: Icons.shield_outlined)),
+                ),
+                const SizedBox(height: 9),
+                _option(
+                  icon: Icons.info_outline_rounded,
+                  title: 'حول التطبيق',
+                  subtitle: 'Bynux · الإصدار 7.1',
+                  onTap: () => _open(const PlaceholderAccountSection(
+                      title: 'حول التطبيق', icon: Icons.info_outline_rounded)),
+                ),
+                const SizedBox(height: 9),
+                _option(
+                  icon: Icons.logout_rounded,
+                  title: 'تسجيل الخروج',
+                  subtitle: 'الخروج من حساب جوجل على هذا الجهاز',
+                  onTap: _signOut,
+                  trailing: _signingOut
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: C.error),
+                        )
+                      : const Icon(Icons.chevron_left, color: C.error),
+                ),
+                const SizedBox(height: 16),
+                const Center(
+                  child: Text('Bynux 7.1',
+                      style: TextStyle(color: C.dim, fontSize: 12)),
+                ),
+              ],
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+// ───────── ملفات السحابة: تنزيل وبحث فقط؛ لا يوجد رفع أو حذف من هذه الصفحة ─────────
+class CloudFilesScreen extends StatefulWidget {
+  const CloudFilesScreen({super.key});
+
+  @override
+  State<CloudFilesScreen> createState() => _CloudFilesScreenState();
+}
+
+class _CloudFilesScreenState extends State<CloudFilesScreen> {
+  final TextEditingController _search = TextEditingController();
+  Future<List<CloudFile>>? _filesFuture;
+  final Set<String> _downloading = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    _filesFuture = BynuxCloudApi.instance.listFiles();
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  void _refresh() {
+    setState(() => _filesFuture = BynuxCloudApi.instance.listFiles());
+  }
+
+  Future<void> _download(CloudFile file) async {
+    if (_downloading.contains(file.name)) return;
+    setState(() => _downloading.add(file.name));
+    try {
+      final bytes = await BynuxCloudApi.instance.downloadFile(file.name);
+      final saved = await store.createFromBytes(file.name, bytes);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('تم تنزيل ${file.name} وحفظه باسم ${saved.name}')));
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(bynuxFriendlyCloudError(error))),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _downloading.remove(file.name));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Column(children: [
+            Header(
+              title: 'السحابة',
+              back: true,
+              actions: [
+                IconButton(
+                  tooltip: 'تحديث القائمة',
+                  onPressed: _refresh,
+                  icon: const Icon(Icons.refresh_rounded),
+                  color: C.text,
+                ),
+              ],
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+              child: TextField(
+                controller: _search,
+                onChanged: (_) => setState(() {}),
+                textInputAction: TextInputAction.search,
+                decoration: InputDecoration(
+                  hintText: 'ابحث عن اسم السكربت…',
+                  prefixIcon: const Icon(Icons.search_rounded),
+                  suffixIcon: _search.text.isEmpty
+                      ? null
+                      : IconButton(
+                          tooltip: 'مسح البحث',
+                          onPressed: () {
+                            _search.clear();
+                            setState(() {});
+                          },
+                          icon: const Icon(Icons.close_rounded),
+                        ),
+                  filled: true,
+                  fillColor: C.surface,
+                  border: _ob,
+                  enabledBorder: _ob,
+                  focusedBorder: _obFocus,
+                ),
+              ),
+            ),
+            Expanded(
+              child: FutureBuilder<List<CloudFile>>(
+                future: _filesFuture,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState != ConnectionState.done) {
+                    return const Center(
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2.4, color: C.accent));
+                  }
+                  if (snapshot.hasError) {
+                    return ListView(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.all(24),
+                      children: [
+                        const SizedBox(height: 60),
+                        const Icon(Icons.cloud_off_outlined,
+                            size: 48, color: C.dim),
+                        const SizedBox(height: 14),
+                        const Text('تعذّر تحميل ملفات السحابة',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 8),
+                        Text(bynuxFriendlyCloudError(snapshot.error!),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: C.muted, height: 1.5)),
+                        const SizedBox(height: 18),
+                        Center(
+                          child: OutlinedButton.icon(
+                            onPressed: _refresh,
+                            icon: const Icon(Icons.refresh_rounded),
+                            label: const Text('إعادة المحاولة'),
+                          ),
+                        ),
+                      ],
+                    );
+                  }
+                  final files = (snapshot.data ?? const <CloudFile>[])
+                      .where((file) => file.name.toLowerCase().contains(
+                          _search.text.trim().toLowerCase()))
+                      .toList();
+                  if (files.isEmpty) {
+                    return ListView(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.all(28),
+                      children: [
+                        const SizedBox(height: 52),
+                        Icon(
+                          _search.text.isEmpty
+                              ? Icons.cloud_queue_outlined
+                              : Icons.search_off_rounded,
+                          size: 52,
+                          color: C.dim,
+                        ),
+                        const SizedBox(height: 15),
+                        Text(
+                          _search.text.isEmpty
+                              ? 'لا توجد سكربتات محفوظة في السحابة حتى الآن.'
+                              : 'لا توجد نتيجة تطابق هذا البحث.',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: C.muted, height: 1.6),
+                        ),
+                      ],
+                    );
+                  }
+                  return RefreshIndicator(
+                    color: C.accent,
+                    backgroundColor: C.surface,
+                    onRefresh: () async {
+                      final next = BynuxCloudApi.instance.listFiles();
+                      setState(() => _filesFuture = next);
+                      try {
+                        await next;
+                      } catch (_) {
+                        // FutureBuilder displays the error and its retry action.
+                      }
+                    },
+                    child: ListView.separated(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
+                      itemCount: files.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 9),
+                      itemBuilder: (context, index) {
+                        final file = files[index];
+                        final isDownloading = _downloading.contains(file.name);
+                        return Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: _box(C.surface),
+                          child: Row(children: [
+                            Container(
+                              width: 44,
+                              height: 48,
+                              decoration: BoxDecoration(
+                                color: C.accent.withValues(alpha: .1),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: const Icon(Icons.code_rounded,
+                                  color: C.accent, size: 23),
+                            ),
+                            const SizedBox(width: 11),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(file.name,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 14)),
+                                  const SizedBox(height: 5),
+                                  Text(
+                                    '${bynuxFormatBytes(file.size)}  ·  ${bynuxFormatDate(file.uploadedAt)}',
+                                    style: const TextStyle(
+                                        color: C.muted, fontSize: 11, height: 1.4),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            IconButton(
+                              tooltip: 'تنزيل السكربت',
+                              onPressed: isDownloading ? null : () => _download(file),
+                              icon: isDownloading
+                                  ? const SizedBox(
+                                      width: 19,
+                                      height: 19,
+                                      child: CircularProgressIndicator(
+                                          strokeWidth: 2, color: C.accent),
+                                    )
+                                  : const Icon(Icons.download_rounded),
+                              color: C.accent,
+                            ),
+                          ]),
+                        );
+                      },
+                    ),
+                  );
+                },
+              ),
+            ),
+          ]),
+        ),
+      );
+}
+
+// ───────── معلومات المزامنة: الإحصاءات لا تُعرض داخل قائمة السحابة نفسها ─────────
+class _SyncDetails {
+  const _SyncDetails({
+    required this.profile,
+    required this.files,
+    required this.totalBytes,
+  });
+  final CloudProfile profile;
+  final List<CloudFile> files;
+  final int totalBytes;
+  CloudFile? get lastFile => files.isNotEmpty ? files.first : profile.lastUpload;
+}
+
+class SyncStatusScreen extends StatefulWidget {
+  const SyncStatusScreen({super.key});
+
+  @override
+  State<SyncStatusScreen> createState() => _SyncStatusScreenState();
+}
+
+class _SyncStatusScreenState extends State<SyncStatusScreen> {
+  Future<_SyncDetails>? _details;
+
+  @override
+  void initState() {
+    super.initState();
+    _details = _load();
+  }
+
+  Future<_SyncDetails> _load() async {
+    final values = await Future.wait<Object>([
+      BynuxCloudApi.instance.getProfile(),
+      BynuxCloudApi.instance.listFiles(),
+    ]);
+    final profile = values[0] as CloudProfile;
+    final files = values[1] as List<CloudFile>;
+    final total = files.fold<int>(0, (sum, file) => sum + file.size);
+    return _SyncDetails(profile: profile, files: files, totalBytes: total);
+  }
+
+  void _refresh() {
+    setState(() => _details = _load());
+  }
+
+  Widget _stat(IconData icon, String title, String value) => Container(
+        padding: const EdgeInsets.all(14),
+        decoration: _box(C.surface),
+        child: Row(children: [
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: C.accent.withValues(alpha: .1),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icon, color: C.accent),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: const TextStyle(color: C.muted, fontSize: 12)),
+                const SizedBox(height: 4),
+                Text(value,
+                    style: const TextStyle(
+                        fontSize: 18, fontWeight: FontWeight.w800)),
+              ],
+            ),
+          ),
+        ]),
+      );
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Column(children: [
+            Header(
+              title: 'حالة المزامنة',
+              back: true,
+              actions: [
+                IconButton(
+                  tooltip: 'تحديث المعلومات',
+                  onPressed: _refresh,
+                  icon: const Icon(Icons.refresh_rounded),
+                  color: C.text,
+                ),
+              ],
+            ),
+            Expanded(
+              child: FutureBuilder<_SyncDetails>(
+                future: _details,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState != ConnectionState.done) {
+                    return const Center(
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2.4, color: C.accent));
+                  }
+                  if (snapshot.hasError || !snapshot.hasData) {
+                    return Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.sync_problem_rounded,
+                                size: 48, color: C.warn),
+                            const SizedBox(height: 12),
+                            const Text('تعذّر قراءة حالة المزامنة',
+                                style: TextStyle(fontWeight: FontWeight.w700)),
+                            const SizedBox(height: 8),
+                            Text(bynuxFriendlyCloudError(snapshot.error!),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(color: C.muted, height: 1.5)),
+                            const SizedBox(height: 16),
+                            OutlinedButton.icon(
+                              onPressed: _refresh,
+                              icon: const Icon(Icons.refresh_rounded),
+                              label: const Text('إعادة المحاولة'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }
+                  final details = snapshot.data!;
+                  final last = details.lastFile;
+                  return ListView(
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(15),
+                        decoration: _box(C.surface, raised: true),
+                        child: Row(children: [
+                          const Icon(Icons.cloud_done_outlined,
+                              color: C.ok, size: 28),
+                          const SizedBox(width: 11),
+                          const Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('الاتصال بالسحابة يعمل',
+                                    style: TextStyle(
+                                        fontWeight: FontWeight.w800, fontSize: 15)),
+                                SizedBox(height: 4),
+                                Text('الإحصاءات مأخوذة من الملفات المحفوظة فعلياً',
+                                    style: TextStyle(
+                                        color: C.muted, fontSize: 12, height: 1.4)),
+                              ],
+                            ),
+                          ),
+                        ]),
+                      ),
+                      const SizedBox(height: 12),
+                      _stat(Icons.folder_copy_outlined, 'عدد الملفات المحفوظة',
+                          '${details.files.length} ملف'),
+                      const SizedBox(height: 9),
+                      _stat(Icons.storage_outlined, 'إجمالي حجم الملفات',
+                          bynuxFormatBytes(details.totalBytes)),
+                      const SizedBox(height: 18),
+                      Container(
+                        padding: const EdgeInsets.all(15),
+                        decoration: _box(C.surface),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text('آخر ملف تم رفعه',
+                                style: TextStyle(
+                                    color: C.muted, fontSize: 12)),
+                            const SizedBox(height: 9),
+                            if (last == null) ...[
+                              const Text('لم يتم رفع أي سكربت حتى الآن.',
+                                  style: TextStyle(color: C.text, height: 1.5)),
+                            ] else ...[
+                              Row(children: [
+                                const Icon(Icons.description_outlined,
+                                    color: C.accent, size: 22),
+                                const SizedBox(width: 9),
+                                Expanded(
+                                  child: Text(last.name,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                          fontWeight: FontWeight.w700)),
+                                ),
+                              ]),
+                              const SizedBox(height: 8),
+                              Text(
+                                '${bynuxFormatBytes(last.size)}  ·  ${bynuxFormatDate(last.uploadedAt)}',
+                                style: const TextStyle(
+                                    color: C.muted, fontSize: 12),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'يُرفع السكربت تلقائياً عند بدء تشغيله. إذا فشل الرفع بسبب الاتصال أو حدود السحابة، يستمر التشغيل المحلي وتظهر المشكلة هنا عند تحديث الحالة.',
+                        style: TextStyle(color: C.dim, fontSize: 12, height: 1.6),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ]),
+        ),
+      );
+}
+
+// صفحتان شكليتان فقط حسب الاتفاق؛ لا إعدادات خصوصية أو معلومات إضافية بعد.
+class PlaceholderAccountSection extends StatelessWidget {
+  const PlaceholderAccountSection({
+    super.key,
+    required this.title,
+    required this.icon,
+  });
+  final String title;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Column(children: [
+            Header(title: title, back: true),
+            Expanded(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(28),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(24),
+                    decoration: _box(C.surface),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(icon, color: C.dim, size: 42),
+                        const SizedBox(height: 12),
+                        Text(title,
+                            style: const TextStyle(
+                                fontWeight: FontWeight.w800, fontSize: 18)),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ]),
+        ),
+      );
+}
+
 
 // ───────── شاشة الصلاحيات: الترحيب عند أول فتح + «فحص الصلاحيات» من القائمة ─────────
 enum _PermState { granted, missing }
@@ -4394,6 +5323,13 @@ class _OutputScreenState extends State<OutputScreen> {
     });
     _add(r'$ python ' + widget.script.name, 1);
     try {
+      try {
+        final uploaded = await BynuxCloudApi.instance
+            .uploadLocalScript(widget.script.path);
+        _add('[تمت مزامنة ${uploaded.name} مع السحابة]', 1);
+      } catch (error) {
+        _add('[تعذّر رفع النسخة السحابية: ${bynuxFriendlyCloudError(error)}]', 2);
+      }
       await _runner.start();
     } catch (e) {
       if (mounted) _add('تعذر بدء Python: ${errText(e)}', 3);
