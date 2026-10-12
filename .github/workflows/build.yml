@@ -36,6 +36,10 @@ jobs:
         with:
           python-version: "3.13"
 
+      # يلزم لتوليد أيقونة التطبيق من icon.png (وللاختبار الخاص بها)
+      - name: Install icon tools
+        run: python -m pip install pillow numpy scipy
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
