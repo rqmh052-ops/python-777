@@ -1334,8 +1334,11 @@ def test_plan_2_2g_tiles_and_management() -> None:
     main_dart = (ROOT / "main.dart").read_text(encoding="utf-8")
     store = (ROOT / "store.dart").read_text(encoding="utf-8")
     tile = main_dart[main_dart.index("class ScriptTile") : main_dart.index("String fmtElapsed")]
-    for text in ("يعمل منذ", "ينتظر إدخال", "انتهى بكود", "آخر تشغيل:", "valueListenable: runHub.clock"):
+    for text in ("يعمل منذ", "ينتظر إدخال", "انتهى بكود", "valueListenable: runHub.clock"):
         assert text in tile, text
+    # الاتفاق الجديد: لا «آخر تعديل» ولا «آخر تشغيل» في بطاقة السكربت (الحالة الحية فقط)
+    for text in ("آخر تعديل", "آخر تشغيل", "لم يُشغّل بعد"):
+        assert text not in tile, text
     dot = _dart_block(main_dart, "static Color colorOf(RunStatus? s)")
     assert re.search(r"RunStatus\.running:\s*return C\.ok", dot)
     assert re.search(r"RunStatus\.waiting:\s*return C\.warn", dot)
