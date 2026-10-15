@@ -2090,9 +2090,9 @@ class _AccountScreenState extends State<AccountScreen> {
                       : const Icon(Icons.chevron_left, color: C.error),
                 ),
                 const SizedBox(height: 16),
-                const Center(
+                Center(
                   child: Text('Bynux ${_bynuxVersionLabel()}',
-                      style: TextStyle(color: C.dim, fontSize: 12)),
+                      style: const TextStyle(color: C.dim, fontSize: 12)),
                 ),
               ],
             ),
