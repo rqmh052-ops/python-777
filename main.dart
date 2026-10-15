@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -65,6 +67,9 @@ final _obFocus =
 const youtubeUrl = 'https://youtube.com/channel/UC4Ox1C-_DWCbIeiWJ_6rV9Q';
 const telegramUrl = 'https://t.me/Bayan_x777';
 final _logo = base64Decode(kLogoBase64);
+
+const MethodChannel _windowChannel = MethodChannel('bynux/window');
+final ValueNotifier<bool> _pipMode = ValueNotifier<bool>(false);
 
 // ───────── كتالوج المكتبات (التثبيت حقيقي داخل بيئة Python المشتركة) ─────────
 class Lib {
@@ -508,6 +513,11 @@ class MissingLibCard extends StatelessWidget {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  _windowChannel.setMethodCallHandler((call) async {
+    if (call.method == 'pipModeChanged') {
+      _pipMode.value = call.arguments == true;
+    }
+  });
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
@@ -810,6 +820,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     fallbackMode.addListener(_onMode);
+    runHub.addListener(_onRunHubChanged);
     // تحديث الأوقات النسبية واكتشاف الملفات الجديدة أثناء بقاء التطبيق مفتوحاً
     _tick = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!mounted) return;
@@ -822,7 +833,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _boot() async {
     await store.init();
     if (!mounted) return;
-    unawaited(runHub.init());
+    await runHub.init();
+    if (!mounted) return;
+    _syncPipAvailability();
     if (!store.getFlag(_welcomeFlag)) {
       // الترحيب يشمل إذن الملفات، فلا نعرض نافذته المنفصلة في هذه المرة
       _asked = true;
@@ -832,6 +845,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (fallbackMode.value && !_asked) {
       _asked = true;
       _showAccessDialog();
+    }
+  }
+
+  void _onRunHubChanged() => _syncPipAvailability();
+
+  void _syncPipAvailability() {
+    final enabled = runHub.hasLive;
+    unawaited(_windowChannel
+        .invokeMethod<void>('setPipEnabled', enabled)
+        .catchError((Object _) {}));
+    if (!enabled && _pipMode.value) {
+      unawaited(_windowChannel
+          .invokeMethod<void>('dismissPip')
+          .catchError((Object _) {}));
     }
   }
 
@@ -855,6 +882,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     fallbackMode.removeListener(_onMode);
+    runHub.removeListener(_onRunHubChanged);
+    unawaited(_windowChannel
+        .invokeMethod<void>('setPipEnabled', false)
+        .catchError((Object _) {}));
     _tick?.cancel();
     super.dispose();
   }
@@ -925,7 +956,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
+  Widget build(BuildContext context) => ValueListenableBuilder<bool>(
+        valueListenable: _pipMode,
+        builder: (context, inPip, _) {
+          if (inPip) return const _PipConsoleScreen();
+          return Scaffold(
         key: _key,
         endDrawer: AppDrawer(
             onLibraries: _openLibraries,
@@ -997,6 +1032,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ]),
         ),
+      );
+        },
       );
 }
 
@@ -1616,7 +1653,7 @@ class AppDrawer extends StatelessWidget {
       );
 }
 
-// ───────── بوابة الحساب: لا يمكن الدخول إلى التطبيق قبل تسجيل جوجل ─────────
+// ───────── البوابة الجذرية: تسجيل الدخول ثم الموافقة ثم واجهة التطبيق ─────────
 class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
 
@@ -1626,35 +1663,16 @@ class AuthGate extends StatefulWidget {
 
 class _AuthGateState extends State<AuthGate> {
   final BynuxSession _session = BynuxSession.instance;
-  String? _profileInitializedFor;
+  int _gateRevision = 0;
+  bool _checkingConsent = true;
+  bool _consented = false;
+  String? _checkedAccountId;
 
   @override
   void initState() {
     super.initState();
     _session.addListener(_onSessionChanged);
-    // الشاشة لا تنتظر شيئًا: الجلسة المحفوظة قُرئت قبل runApp. هذا الاستدعاء
-    // يجهّز جوجل ويجدد الجلسة في الخلفية فقط.
-    unawaited(_session.restoreInBackground());
-    final saved = _session.user;
-    if (saved != null) _ensureProfile(saved);
-  }
-
-  // يحفظ الخادم تاريخ إنشاء الحساب من أول دخول ناجح، لا من تخزين محلي قد يُحذف.
-  void _ensureProfile(BynuxUser user) {
-    if (_profileInitializedFor == user.id) return;
-    _profileInitializedFor = user.id;
-    unawaited(BynuxCloudApi.instance.getProfile().catchError(
-        (Object _) => const CloudProfile(email: '', createdAt: null)));
-  }
-
-  void _onSessionChanged() {
-    final user = _session.user;
-    if (user == null) {
-      _profileInitializedFor = null;
-    } else {
-      _ensureProfile(user);
-    }
-    if (mounted) setState(() {});
+    unawaited(_refreshGate());
   }
 
   @override
@@ -1663,17 +1681,48 @@ class _AuthGateState extends State<AuthGate> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    if (!_session.ready) {
-      return const Scaffold(
+  void _onSessionChanged() => unawaited(_refreshGate());
+
+  Future<void> _refreshGate() async {
+    final revision = ++_gateRevision;
+    final user = _session.user;
+    if (user == null) {
+      if (!mounted) return;
+      setState(() {
+        _checkingConsent = false;
+        _consented = false;
+        _checkedAccountId = null;
+      });
+      return;
+    }
+    if (mounted) setState(() => _checkingConsent = true);
+    final accepted = await _BynuxConsentStore.hasConsent(user.id);
+    if (!mounted || revision != _gateRevision || _session.user?.id != user.id) return;
+    setState(() {
+      _checkingConsent = false;
+      _checkedAccountId = user.id;
+      _consented = accepted;
+    });
+  }
+
+  Widget _loading() => const Scaffold(
         body: Center(
           child: CircularProgressIndicator(strokeWidth: 2.4, color: C.accent),
         ),
       );
-    }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_session.ready) return _loading();
     final user = _session.user;
     if (user == null) return const GoogleLoginScreen();
+    if (_checkingConsent || _checkedAccountId != user.id) return _loading();
+    if (!_consented) {
+      return _ConsentScreen(
+        user: user,
+        onAccepted: _refreshGate,
+      );
+    }
     return HomeScreen(key: ValueKey<String>(user.id));
   }
 }
@@ -1837,6 +1886,13 @@ class _AccountScreenState extends State<AccountScreen> {
     if (confirm != true || !mounted) return;
     setState(() => _signingOut = true);
     try {
+      // لا نترك أي تشغيل حي أو نافذة مصغّرة بعد إنهاء حساب المستخدم.
+      try {
+        await bayanPython.runsStopAll();
+        await runHub.refresh();
+      } catch (_) {}
+      await _windowChannel.invokeMethod<void>('setPipEnabled', false).catchError((Object _) {});
+      await _windowChannel.invokeMethod<void>('dismissPip').catchError((Object _) {});
       await BynuxSession.instance.signOut();
       if (!mounted) return;
       Navigator.of(context).popUntil((route) => route.isFirst);
@@ -1998,18 +2054,25 @@ class _AccountScreenState extends State<AccountScreen> {
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.shield_outlined,
-                  title: 'الخصوصية والأمان',
-                  subtitle: 'هذا القسم قيد التجهيز',
-                  onTap: () => _open(const PlaceholderAccountSection(
-                      title: 'الخصوصية والأمان', icon: Icons.shield_outlined)),
+                  title: 'سياسة الخصوصية',
+                  subtitle: 'البيانات التي نجمعها وكيفية استخدامها',
+                  onTap: () => _open(_LegalDocumentScreen(
+                      title: 'سياسة الخصوصية', document: _privacyDocument)),
+                ),
+                const SizedBox(height: 9),
+                _option(
+                  icon: Icons.gavel_rounded,
+                  title: 'شروط الاستخدام',
+                  subtitle: 'القواعد والمسؤوليات الخاصة باستخدام التطبيق',
+                  onTap: () => _open(_LegalDocumentScreen(
+                      title: 'شروط الاستخدام', document: _termsDocument)),
                 ),
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.info_outline_rounded,
                   title: 'حول التطبيق',
-                  subtitle: 'Bynux · الإصدار 7.1',
-                  onTap: () => _open(const PlaceholderAccountSection(
-                      title: 'حول التطبيق', icon: Icons.info_outline_rounded)),
+                  subtitle: 'Bynux · الإصدار ${_bynuxVersionLabel()}',
+                  onTap: () => _open(const _AboutAppScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
@@ -2028,7 +2091,7 @@ class _AccountScreenState extends State<AccountScreen> {
                 ),
                 const SizedBox(height: 16),
                 const Center(
-                  child: Text('Bynux 7.1',
+                  child: Text('Bynux ${_bynuxVersionLabel()}',
                       style: TextStyle(color: C.dim, fontSize: 12)),
                 ),
               ],
@@ -2488,41 +2551,227 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
       );
 }
 
-// صفحتان شكليتان فقط حسب الاتفاق؛ لا إعدادات خصوصية أو معلومات إضافية بعد.
-class PlaceholderAccountSection extends StatelessWidget {
-  const PlaceholderAccountSection({
-    super.key,
-    required this.title,
-    required this.icon,
-  });
+// ───────── نصوص المستندات القانونية (علامات التنسيق أزيلت دون تغيير الصياغة) ─────────
+const String bynuxAppVersion = '7.1.0+710';
+const int bynuxLegalTextVersion = 1;
+String _bynuxVersionLabel() => bynuxAppVersion.split('.').take(2).join('.');
+
+final String _privacyDocument = '''تطبيق Bynux · الإصدار ${_bynuxVersionLabel()} · آخر تحديث: 15 أكتوبر 2026
+
+توضح هذه السياسة ما نجمعه من بيانات، وكيف نستخدمها ونحميها، وما هي حقوقك. استخدامك للتطبيق يعني موافقتك عليها.
+
+1. البيانات التي نجمعها
+- بيانات الحساب: معرّف حساب جوجل والبريد والاسم. تُحفظ على جهازك، ويُحفظ في السحابة بريدك وتاريخ انضمامك وتاريخ آخر رفع.
+- السكربتات: عند تشغيل سكربت تُرفع نسخة من ملف .py (اسمه ومحتواه كاملًا) إلى السحابة.
+- بيانات الجلسة: رمز جلسة يبقى على جهازك، ويحتفظ الخادم ببصمة مشفّرة منه فقط (وليس الرمز نفسه) مع بريدك ومعرّفك.
+- ما لا نجمعه: مخرجات السكربتات وسجلاتها تبقى على جهازك ولا تُرفع إلينا. لا نستخدم إعلانات ولا أدوات تحليل أو تتبع.
+
+2. كيف نستخدم بياناتك
+لتسجيل دخولك، وتخزين سكربتاتك وعرضها وتنزيلها، وتشغيل الخدمة وحمايتها من إساءة الاستخدام. لا نبيع بياناتك ولا نشاركها لأغراض تسويقية.
+
+3. السحابة
+تُخزَّن نسخ السكربتات في مساحة خاصة بحسابك على خدمة Cloudflare، ولا يستطيع مستخدمون آخرون الوصول إليها عبر التطبيق. مشرف الخدمة يستطيع الوصول تقنيًا إلى التخزين، ولا يطّلع على الملفات إلا للصيانة أو الشكاوى أو الالتزام القانوني.
+
+4. الأذونات
+- الإنترنت: لتسجيل الدخول والسحابة وتثبيت المكتبات واتصالات سكربتاتك.
+- الوصول إلى الملفات: لقراءة سكربتاتك وحفظها.
+- الإشعارات والخدمة الأمامية والتشغيل بالخلفية واستثناء البطارية: لإبقاء سكربتاتك تعمل عند خروجك من التطبيق.
+
+لا نستخدم هذه الأذونات لأي غرض آخر.
+
+5. أطراف ثالثة
+- Google لتسجيل الدخول.
+- Cloudflare للاستضافة والتخزين.
+- PyPI وفهرس مكتبات Chaquopy لتنزيل المكتبات التي تختارها.
+- أي خدمة يتصل بها سكربتك، وهذه خارج سيطرتنا.
+
+لكل جهة سياسة خصوصية خاصة بها.
+
+6. نقل البيانات خارج مصر
+قد تُخزَّن بياناتك وتُعالَج على خوادم خارج مصر. بتسجيل الدخول واستخدام التطبيق، توافق صراحةً على ذلك.
+
+7. الاحتفاظ والحذف
+نحتفظ ببياناتك ما دام حسابك قائمًا. مدة الجلسة 180 يومًا، وتسجيل الخروج ينهيها فورًا. لا يوجد حاليًا زر حذف داخل التطبيق، فيمكنك طلب حذف حسابك وملفاتك عبر وسائل التواصل أدناه، وننفذه خلال 30 يومًا.
+
+8. حقوقك
+وفق قانون حماية البيانات الشخصية المصري رقم 151 لسنة 2020، لك الحق في الاطلاع على بياناتك وتصحيحها وحذفها وسحب موافقتك. أرسل طلبك عبر وسائل التواصل أدناه.
+
+9. الأمان
+يتصل التطبيق بالسحابة عبر HTTPS، وملفات كل حساب معزولة. نتخذ إجراءات معقولة لحماية بياناتك، لكن لا يوجد نظام آمن بالكامل. عند حدوث تسريب يمسّ بياناتك نبلغك والجهات المختصة وفق القانون.
+
+10. الأطفال
+التطبيق غير موجّه لمن هم دون 18 عامًا، ولا نجمع بياناتهم عمدًا.
+
+11. التعديلات
+قد نحدّث هذه السياسة، وتظهر النسخة الجديدة في التطبيق مع تاريخ التحديث. استمرارك بعد التحديث يُعد موافقة عليه.
+
+12. التواصل
+📧 aaro3498@gmail.com
+💬 واتساب: 01096883474''';
+
+final String _termsDocument = '''تطبيق Bynux · الإصدار ${_bynuxVersionLabel()} · آخر تحديث: 15 أكتوبر 2026
+
+1. القبول
+باستخدامك التطبيق أو تسجيل الدخول إليه، تقرّ بأنك قرأت هذه الشروط ووافقت عليها. إذا لم توافق فالرجاء التوقف عن الاستخدام. وتُقرأ هذه الشروط مع «سياسة الخصوصية».
+
+2. الحساب
+- الدخول بحساب جوجل فقط.
+- أنت مسؤول عن حسابك وجهازك وكل ما يجري من خلالهما.
+- يجب أن تكون بعمر 18 عامًا فأكثر.
+
+3. السكربتات
+التطبيق أداة لتشغيل سكربتات بايثون التي تكتبها أو تضيفها أنت. أنت وحدك المسؤول عن محتواها وما تفعله واتصالاتها، وعن احترام شروط الخدمات التي تتصل بها. لا نراجع سكربتاتك ولا نتحكم بها. سكربتاتك ملكك، والتطبيق وهويته ملك المطوّر.
+
+4. الاستخدام الممنوع
+يُمنع استخدام التطبيق أو السحابة في:
+- اختراق أو دخول غير مصرّح به لأجهزة أو حسابات أو أنظمة الآخرين.
+- كتابة أو تشغيل برمجيات خبيثة أو فدية أو تجسس، أو سرقة بيانات أو كلمات مرور.
+- مهاجمة الخدمات (حجب الخدمة، الاستغلال، المسح العدواني)، أو الرسائل المزعجة والاحتيال وانتحال الهوية.
+- مخالفة شروط الخدمات التي يتصل بها السكربت، أو تجاوز حماية أو تشفير أو ترخيص محتوى لا تملك حق التصرف فيه.
+- رفع محتوى غير قانوني أو ينتهك حقوق الآخرين.
+- محاولة تعطيل السحابة أو تجاوز حدودها أو الوصول إلى بيانات غير بياناتك.
+
+5. السحابة
+- المسموح: ملفات .py فقط، حتى 1 ميجابايت للملف و200 ملف للحساب.
+- تُرفع نسخة من السكربت تلقائيًا عند تشغيله.
+- السحابة وسيلة تسهيل وليست ضمانًا للنسخ الاحتياطي، وقد نغيّر حدودها أو نوقفها أو تتعطل.
+
+6. إيقاف الحساب
+يحق لنا عند مخالفة هذه الشروط أن نقيّد حسابك أو نوقفه أو نحذف ملفاته، دون إشعار مسبق. ويمكنك التوقف عن الاستخدام وطلب حذف بياناتك في أي وقت.
+
+7. إخلاء المسؤولية
+النسخة تجريبية، ويُقدَّم التطبيق «كما هو» دون ضمانات. قد تتوقف السكربتات بسبب قيود أندرويد على البطارية والخلفية. لا نتحمل مسؤولية فقدان بيانات، ولا ما تفعله سكربتاتك، ولا أي ضرر ناتج عن استخدامك للتطبيق، إلا بالقدر الذي يفرضه القانون.
+
+8. التعديلات
+قد نعدّل هذه الشروط، وتظهر النسخة الجديدة في التطبيق مع تاريخ التحديث. استمرارك بعد التعديل يُعد موافقة عليه.
+
+9. القانون الحاكم
+تخضع هذه الشروط لقوانين جمهورية مصر العربية، وتختص محاكمها بأي نزاع.
+
+10. التواصل
+📧 aaro3498@gmail.com
+💬 واتساب: 01096883474''';
+
+class _BynuxConsentStore {
+  static String _key(String accountId) =>
+      'bynux_legal_consent_v${bynuxLegalTextVersion}_${base64Url.encode(utf8.encode(accountId)).replaceAll('=', '')}';
+
+  static Future<bool> hasConsent(String accountId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_key(accountId)) == true;
+    } catch (_) {
+      // عند تعذّر قراءة الموافقة لا نسمح بتجاوز شاشة الموافقة.
+      return false;
+    }
+  }
+
+  static Future<void> accept(String accountId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_key(accountId), true);
+  }
+}
+
+Future<void> _launchContact(String url) async {
+  try {
+    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+  } catch (_) {
+    // تعذّر وجود تطبيق مناسب لا ينبغي أن يغلق الشاشة أو يسبب تعطل التطبيق.
+  }
+}
+
+class _LegalDocumentScreen extends StatefulWidget {
+  const _LegalDocumentScreen({required this.title, required this.document});
   final String title;
-  final IconData icon;
+  final String document;
+
+  @override
+  State<_LegalDocumentScreen> createState() => _LegalDocumentScreenState();
+}
+
+class _LegalDocumentScreenState extends State<_LegalDocumentScreen> {
+  late final TapGestureRecognizer _emailTap;
+  late final TapGestureRecognizer _whatsAppTap;
+
+  @override
+  void initState() {
+    super.initState();
+    _emailTap = TapGestureRecognizer()
+      ..onTap = () => unawaited(_launchContact('mailto:aaro3498@gmail.com'));
+    _whatsAppTap = TapGestureRecognizer()
+      ..onTap = () => unawaited(
+          _launchContact('https://wa.me/201096883474'));
+  }
+
+  @override
+  void dispose() {
+    _emailTap.dispose();
+    _whatsAppTap.dispose();
+    super.dispose();
+  }
+
+  Widget _line(String line) {
+    if (line.isEmpty) return const SizedBox(height: 7);
+    if (line == '📧 aaro3498@gmail.com') {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: SelectableText.rich(TextSpan(children: [
+          const WidgetSpan(
+              alignment: PlaceholderAlignment.middle,
+              child: Icon(Icons.mail_outline_rounded,
+                  color: C.accent, size: 19)),
+          const TextSpan(text: '  '),
+          TextSpan(
+              text: 'aaro3498@gmail.com',
+              style: const TextStyle(
+                  color: C.accent, decoration: TextDecoration.underline),
+              recognizer: _emailTap),
+        ])),
+      );
+    }
+    if (line == '💬 واتساب: 01096883474') {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: SelectableText.rich(TextSpan(children: [
+          const WidgetSpan(
+              alignment: PlaceholderAlignment.middle,
+              child: _WhatsAppMark(size: 19)),
+          const TextSpan(text: '  '),
+          const TextSpan(text: 'واتساب: '),
+          TextSpan(
+              text: '01096883474',
+              style: const TextStyle(
+                  color: Color(0xFF25D366),
+                  decoration: TextDecoration.underline),
+              recognizer: _whatsAppTap),
+        ])),
+      );
+    }
+    final isHeading = RegExp(r'^\d+[.:]\s').hasMatch(line);
+    final isMetadata = line.startsWith('تطبيق Bynux · الإصدار ');
+    return Padding(
+      padding: EdgeInsets.only(top: isHeading ? 12 : 2, bottom: 3),
+      child: SelectableText(
+        line,
+        style: TextStyle(
+          color: isHeading ? C.accent : (isMetadata ? C.muted : C.text),
+          fontSize: isHeading ? 17 : (isMetadata ? 12 : 14),
+          fontWeight: isHeading ? FontWeight.w800 : FontWeight.normal,
+          height: 1.65,
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
         body: SafeArea(
           child: Column(children: [
-            Header(title: title, back: true),
+            Header(title: widget.title, back: true),
             Expanded(
-              child: Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(28),
-                  child: Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(24),
-                    decoration: _box(C.surface),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(icon, color: C.dim, size: 42),
-                        const SizedBox(height: 12),
-                        Text(title,
-                            style: const TextStyle(
-                                fontWeight: FontWeight.w800, fontSize: 18)),
-                      ],
-                    ),
-                  ),
-                ),
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(18, 14, 18, 30),
+                children: [for (final line in widget.document.split('\n')) _line(line)],
               ),
             ),
           ]),
@@ -2530,6 +2779,496 @@ class PlaceholderAccountSection extends StatelessWidget {
       );
 }
 
+class _WhatsAppMark extends StatelessWidget {
+  const _WhatsAppMark({this.size = 20});
+  final double size;
+
+  @override
+  Widget build(BuildContext context) => CustomPaint(
+        size: Size.square(size),
+        painter: _WhatsAppPainter(),
+      );
+}
+
+class _WhatsAppPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final scale = size.width / 24;
+    canvas.save();
+    canvas.scale(scale);
+    final green = Paint()
+      ..color = const Color(0xFF25D366)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.8
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final bubble = Path()
+      ..moveTo(5, 19)
+      ..lineTo(3.7, 21)
+      ..lineTo(8.2, 19.8)
+      ..cubicTo(14, 22, 20.5, 17.5, 20.5, 11.8)
+      ..cubicTo(20.5, 6.2, 16.2, 3.3, 11.7, 3.3)
+      ..cubicTo(6.6, 3.3, 3.2, 7.1, 3.2, 11.7)
+      ..cubicTo(3.2, 14.4, 3.8, 16.7, 5, 19)
+      ..close();
+    canvas.drawPath(bubble, green);
+    final phone = Path()
+      ..moveTo(8, 7.8)
+      ..cubicTo(7.2, 8.8, 8.6, 11.8, 10.5, 13.5)
+      ..cubicTo(12.4, 15.4, 15, 16.5, 16, 15.4)
+      ..lineTo(17, 13.9)
+      ..lineTo(14.3, 12.4)
+      ..lineTo(13.2, 13.6)
+      ..cubicTo(11.9, 12.9, 11, 12, 10.4, 10.8)
+      ..lineTo(11.4, 9.7)
+      ..lineTo(9.7, 7.3)
+      ..close();
+    canvas.drawPath(phone, green);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class _AboutAppScreen extends StatelessWidget {
+  const _AboutAppScreen();
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Column(children: [
+            const Header(title: 'حول التطبيق', back: true),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.all(18),
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: _box(C.surface, raised: true),
+                    child: Column(children: [
+                      ClipOval(
+                        child: Image.memory(_logo,
+                            width: 76, height: 76, fit: BoxFit.cover),
+                      ),
+                      const SizedBox(height: 14),
+                      const Text('Bynux',
+                          style: TextStyle(
+                              color: C.text,
+                              fontSize: 24,
+                              fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 5),
+                      Text('الإصدار ${_bynuxVersionLabel()}',
+                          style: const TextStyle(color: C.muted, fontSize: 14)),
+                    ]),
+                  ),
+                  const SizedBox(height: 14),
+                  _AboutContactTile(
+                    icon: Icons.mail_outline_rounded,
+                    title: 'البريد الإلكتروني',
+                    value: 'aaro3498@gmail.com',
+                    color: C.accent,
+                    onTap: () => unawaited(
+                        _launchContact('mailto:aaro3498@gmail.com')),
+                  ),
+                  const SizedBox(height: 10),
+                  _AboutContactTile(
+                    icon: Icons.chat_bubble_outline_rounded,
+                    title: 'واتساب',
+                    value: '01096883474',
+                    color: const Color(0xFF25D366),
+                    onTap: () => unawaited(
+                        _launchContact('https://wa.me/201096883474')),
+                    whatsApp: true,
+                  ),
+                ],
+              ),
+            ),
+          ]),
+        ),
+      );
+}
+
+class _AboutContactTile extends StatelessWidget {
+  const _AboutContactTile({
+    required this.icon,
+    required this.title,
+    required this.value,
+    required this.color,
+    required this.onTap,
+    this.whatsApp = false,
+  });
+
+  final IconData icon;
+  final String title, value;
+  final Color color;
+  final VoidCallback onTap;
+  final bool whatsApp;
+
+  @override
+  Widget build(BuildContext context) => Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(13),
+          child: Container(
+            padding: const EdgeInsets.all(14),
+            decoration: _box(C.surface),
+            child: Row(children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                    color: color.withValues(alpha: .12),
+                    borderRadius: BorderRadius.circular(12)),
+                alignment: Alignment.center,
+                child: whatsApp
+                    ? _WhatsAppMark(size: 22)
+                    : Icon(icon, color: color, size: 22),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title,
+                          style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                              color: C.text)),
+                      const SizedBox(height: 3),
+                      Text(value,
+                          textDirection: TextDirection.ltr,
+                          style: TextStyle(color: color, fontSize: 13)),
+                    ]),
+              ),
+              const Icon(Icons.open_in_new_rounded, color: C.dim, size: 18),
+            ]),
+          ),
+        ),
+      );
+}
+
+class _ConsentScreen extends StatefulWidget {
+  const _ConsentScreen({required this.user, required this.onAccepted});
+  final BynuxUser user;
+  final Future<void> Function() onAccepted;
+
+  @override
+  State<_ConsentScreen> createState() => _ConsentScreenState();
+}
+
+class _ConsentScreenState extends State<_ConsentScreen> {
+  bool _saving = false;
+
+  Future<void> _accept() async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    try {
+      await _BynuxConsentStore.accept(widget.user.id);
+      // صار السماح بالسحابة والعمل بالخلفية ممكنًا بعد حفظ الموافقة فقط.
+      unawaited(BynuxSession.instance.activateAfterConsent().catchError((Object _) {}));
+      await widget.onAccepted();
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('تعذّر حفظ الموافقة. تحقّق من مساحة الجهاز وحاول مجددًا.')));
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, result) {
+          if (!didPop) unawaited(SystemNavigator.pop());
+        },
+        child: Scaffold(
+          body: SafeArea(
+            child: Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(24),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Text('هل تريد استخدام التطبيق؟',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              fontSize: 23,
+                              fontWeight: FontWeight.w800,
+                              color: C.text)),
+                      const SizedBox(height: 24),
+                      SizedBox(
+                        height: 52,
+                        child: ElevatedButton(
+                          onPressed: _saving ? null : _accept,
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: C.accent,
+                            foregroundColor: C.onAccent,
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(13)),
+                          ),
+                          child: _saving
+                              ? const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2, color: C.onAccent))
+                              : const Text('استخدام التطبيق',
+                                  style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w800)),
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+                      const Text(
+                          'باستخدامك التطبيق فإنك توافق على جميع ما ذكر في:',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              color: C.muted, fontSize: 14, height: 1.6)),
+                      const SizedBox(height: 9),
+                      Center(
+                        child: Wrap(
+                          alignment: WrapAlignment.center,
+                          spacing: 18,
+                          runSpacing: 8,
+                          children: [
+                            TextButton(
+                              onPressed: () => Navigator.of(context).push<void>(
+                                  smooth<void>(_LegalDocumentScreen(
+                                      title: 'سياسة الخصوصية',
+                                      document: _privacyDocument))),
+                              child: const Text('سياسة الخصوصية'),
+                            ),
+                            TextButton(
+                              onPressed: () => Navigator.of(context).push<void>(
+                                  smooth<void>(_LegalDocumentScreen(
+                                      title: 'شروط الاستخدام',
+                                      document: _termsDocument))),
+                              child: const Text('شروط الاستخدام'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+}
+
+class _PipOutputLine {
+  const _PipOutputLine(this.text, this.isError);
+  final String text;
+  final bool isError;
+}
+
+class _PipConsoleScreen extends StatefulWidget {
+  const _PipConsoleScreen();
+
+  @override
+  State<_PipConsoleScreen> createState() => _PipConsoleScreenState();
+}
+
+class _PipConsoleScreenState extends State<_PipConsoleScreen> {
+  static const int _maxLines = 36;
+  static const int _maxLineChars = 360;
+  final ScrollController _scroll = ScrollController();
+  Timer? _pollTimer;
+  bool _polling = false;
+  String? _selectedPath;
+  List<_PipOutputLine> _lines = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    runHub.addListener(_runsChanged);
+    _selectLiveScript();
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      unawaited(_poll());
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _poll());
+  }
+
+  void _selectLiveScript() {
+    final lives = runHub.liveRuns;
+    if (lives.isEmpty) {
+      _selectedPath = null;
+      _lines = const [];
+      return;
+    }
+    if (_selectedPath == null || !lives.any((r) => r.scriptPath == _selectedPath)) {
+      _selectedPath = lives.first.scriptPath;
+      _lines = const [];
+    }
+  }
+
+  void _runsChanged() {
+    if (!mounted) return;
+    final old = _selectedPath;
+    setState(_selectLiveScript);
+    if (old != _selectedPath) unawaited(_poll());
+    if (runHub.liveRuns.isEmpty) {
+      unawaited(_windowChannel.invokeMethod<void>('dismissPip').catchError((Object _) {}));
+    }
+  }
+
+  void _switchScript(int direction) {
+    final lives = runHub.liveRuns;
+    if (lives.length < 2) return;
+    var index = lives.indexWhere((r) => r.scriptPath == _selectedPath);
+    if (index < 0) index = 0;
+    final next = (index + direction + lives.length) % lives.length;
+    setState(() {
+      _selectedPath = lives[next].scriptPath;
+      _lines = const [];
+    });
+    unawaited(_poll());
+  }
+
+  Future<void> _poll() async {
+    if (_polling || !mounted || !_pipMode.value) return;
+    _selectLiveScript();
+    final path = _selectedPath;
+    if (path == null) {
+      if (_lines.isNotEmpty && mounted) setState(() => _lines = const []);
+      return;
+    }
+    _polling = true;
+    try {
+      // قراءة آخر جزء من LogStore فقط. نعيد بناء النافذة من tail محدود بدل تجميع
+      // كل حدث في الذاكرة أو إعادة بثه؛ لا يحدث تكرار بين عمليات القراءة.
+      final page = await bayanPython.logsPage(path, maxBytes: 16 * 1024);
+      final next = <_PipOutputLine>[];
+      for (final rawLine in page.text.split('\n')) {
+        if (rawLine.isEmpty) continue;
+        try {
+          final decoded = jsonDecode(rawLine);
+          if (decoded is! Map) continue;
+          final kind = decoded['k']?.toString();
+          if (kind != 'o' && kind != 'e') continue;
+          final output = decoded['s']?.toString() ?? '';
+          final parts = output.split('\n');
+          for (final part in parts) {
+            if (part.isEmpty && parts.length == 1) continue;
+            final clipped = part.length > _maxLineChars
+                ? '${part.substring(0, _maxLineChars)}…'
+                : part;
+            next.add(_PipOutputLine(clipped, kind == 'e'));
+          }
+        } catch (_) {
+          // تجاهل سجل JSONL ناقصًا فقط؛ لا يؤثر في تشغيل السكربت.
+        }
+      }
+      final bounded = next.length > _maxLines
+          ? next.sublist(next.length - _maxLines)
+          : next;
+      if (mounted) {
+        setState(() => _lines = bounded);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scroll.hasClients) {
+            _scroll.jumpTo(_scroll.position.maxScrollExtent);
+          }
+        });
+      }
+    } catch (_) {
+      // السجل مؤقتًا غير متاح؛ تظل النافذة حية وتعيد المحاولة في الدفعة التالية.
+    } finally {
+      _polling = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    runHub.removeListener(_runsChanged);
+    _pollTimer?.cancel();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lives = runHub.liveRuns;
+    RunInfo? current;
+    for (final run in lives) {
+      if (run.scriptPath == _selectedPath) {
+        current = run;
+        break;
+      }
+    }
+    current ??= lives.isEmpty ? null : lives.first;
+    final fullPath = current?.scriptPath ?? '';
+    final scriptName = fullPath.replaceAll('\\', '/').split('/').last;
+    final stateLabel = current?.status == RunStatus.waiting ? 'ينتظر إدخالًا' : 'يعمل';
+    return Scaffold(
+      backgroundColor: C.console,
+      body: SafeArea(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => unawaited(
+              _windowChannel.invokeMethod<void>('expandApp').catchError((Object _) {})),
+          onHorizontalDragEnd: (details) {
+            final velocity = details.primaryVelocity ?? 0;
+            if (velocity.abs() > 80) _switchScript(velocity > 0 ? 1 : -1);
+          },
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(10, 7, 10, 5),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              SizedBox(
+                height: 24,
+                child: Row(children: [
+                  Icon(Icons.circle,
+                      color: current?.status == RunStatus.waiting ? C.warn : C.ok,
+                      size: 8),
+                  const SizedBox(width: 5),
+                  Expanded(
+                    child: Text(
+                      '${scriptName.isEmpty ? 'لا يوجد سكربت' : scriptName} · $stateLabel${lives.length > 1 ? ' · ${lives.indexOf(current!) + 1}/${lives.length} ↔' : ''}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textDirection: TextDirection.ltr,
+                      style: const TextStyle(
+                          color: C.text, fontSize: 10, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                ]),
+              ),
+              const Divider(height: 5, color: C.border),
+              Expanded(
+                child: _lines.isEmpty
+                    ? const SizedBox.shrink()
+                    : ListView.builder(
+                        controller: _scroll,
+                        padding: EdgeInsets.zero,
+                        itemCount: _lines.length,
+                        itemBuilder: (context, index) => Text(
+                          _lines[index].text,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          textDirection: TextDirection.ltr,
+                          style: TextStyle(
+                              color: _lines[index].isError ? C.error : C.text,
+                              fontFamily: 'monospace',
+                              fontSize: 10,
+                              height: 1.2),
+                        ),
+                      ),
+              ),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 // ───────── شاشة الصلاحيات: الترحيب عند أول فتح + «فحص الصلاحيات» من القائمة ─────────
 enum _PermState { granted, missing }
@@ -2600,6 +3339,13 @@ class _PermissionsScreenState extends State<PermissionsScreen>
   Future<void> _grantFiles() => store.requestAccess();
 
   Future<void> _grantNotifications() => bayanSystem.requestNotifications();
+
+  Future<void> _grantMiniWindow() async {
+    final how = await bayanSystem.requestOverlayPermission();
+    if (how == 'failed' && mounted) {
+      _snack('تعذّر فتح إعدادات النافذة العائمة. يمكنك استخدام PiP إذا كان مدعومًا.');
+    }
+  }
 
   Future<void> _grantBattery() async {
     final how = await bayanSystem.requestBattery();
@@ -2923,6 +3669,17 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                             : _PermState.missing,
                         actionLabel: 'منح',
                         onAction: _grantNotifications,
+                      ),
+                      const SizedBox(height: 12),
+                      _card(
+                        index: i++,
+                        id: 'mini-window',
+                        icon: Icons.picture_in_picture_alt_rounded,
+                        title: 'النافذة العائمة للسجلات',
+                        why: 'لإظهار مخرجات السكربت فوق التطبيقات الأخرى. إذن اختياري؛ وPiP بديل عند عدم منحه.',
+                        state: _sys.overlay ? _PermState.granted : _PermState.missing,
+                        actionLabel: _sys.overlay ? 'مفعّل' : 'تفعيل',
+                        onAction: _grantMiniWindow,
                       ),
                       const SizedBox(height: 12),
                       _card(

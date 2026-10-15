@@ -193,16 +193,10 @@ class BynuxSession extends ChangeNotifier {
       if (token == null || token.isEmpty) {
         throw StateError('لم يصل رمز التحقق من جوجل. تحقّق من إعدادات معرّف التطبيق وبصمة التوقيع.');
       }
-      // نحصل على رمز الجلسة الطويل قبل فتح الرئيسية (محاولتان)، ولا نعتمد على
-      // رمز جوجل الذي ينتهي بعد ساعة. هكذا لا يحتاج التطبيق جوجل بعد الآن.
-      final grant = await _mintSession(token, attempts: 2);
+      // لا ننشئ جلسة خادم ولا نستدعي خدمات السحابة قبل موافقة المستخدم على
+      // سياسة الخصوصية وشروط الاستخدام. تُنشأ الجلسة بعد الموافقة من AuthGate.
       _account = account;
       _adoptAccount(account);
-      if (grant != null) {
-        _sessionToken = grant.token;
-        _sessionExpiresAt = grant.expiresAt;
-        await _persist();
-      }
     } catch (error) {
       _initializationError = _friendlyError(error);
       notifyListeners();
@@ -210,6 +204,21 @@ class BynuxSession extends ChangeNotifier {
     } finally {
       _signingIn = false;
     }
+  }
+
+  /// ينشئ جلسة الخادم فقط بعد أن يسجل AuthGate موافقة الحساب على النصوص.
+  /// الفشل الشبكي لا يمنع الاستخدام المحلي؛ ستعيد أول عملية سحابية المحاولة عند الحاجة.
+  Future<void> activateAfterConsent() async {
+    if (_user == null || _sessionIsValid) return;
+    final google = _freshGoogleToken();
+    if (google == null) return;
+    final forUser = _user?.id;
+    final grant = await _mintSession(google, attempts: 1);
+    if (grant == null || _user?.id != forUser) return;
+    _sessionToken = grant.token;
+    _sessionExpiresAt = grant.expiresAt;
+    await _persist();
+    notifyListeners();
   }
 
   Future<void> signOut() async {

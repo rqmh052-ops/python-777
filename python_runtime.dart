@@ -172,6 +172,7 @@ class SystemStatus {
     this.manufacturer = '',
     this.oem = '',
     this.sdk = 0,
+    this.overlay = false,
   });
 
   /// هل الإشعارات مفعّلة للتطبيق؟
@@ -186,12 +187,16 @@ class SystemStatus {
   final String oem;
   final int sdk;
 
+  /// هل منح المستخدم إذن النافذة العائمة الخاصة؟
+  final bool overlay;
+
   factory SystemStatus.fromJson(Map<String, dynamic> json) => SystemStatus(
         notifications: json['notifications'] == true,
         battery: json['battery'] == true,
         manufacturer: json['manufacturer']?.toString() ?? '',
         oem: json['oem']?.toString() ?? '',
         sdk: (json['sdk'] as num?)?.toInt() ?? 0,
+        overlay: json['overlay'] == true,
       );
 }
 
@@ -206,6 +211,12 @@ class BayanSystem {
       return SystemStatus.fromJson(Map<String, dynamic>.from(raw));
     }
     return const SystemStatus();
+  }
+
+  /// صفحة إعدادات الإذن الخاص للنافذة العائمة. النتيجة: granted | settings | failed
+  Future<String> requestOverlayPermission() async {
+    final dynamic raw = await _channel.invokeMethod<dynamic>('requestOverlayPermission');
+    return raw?.toString() ?? 'failed';
   }
 
   /// نافذة النظام لاستثناء البطارية. النتيجة: dialog | list | app | failed

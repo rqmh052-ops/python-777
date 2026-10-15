@@ -348,6 +348,10 @@ class RunHub extends ChangeNotifier {
 
   RunInfo? infoFor(String scriptPath) => _byPath[scriptPath];
 
+  /// جميع التشغيلات الحية؛ تستخدمها النافذة المصغرة لعرض/تبديل السكربت المعروض.
+  List<RunInfo> get liveRuns =>
+      _byPath.values.where((r) => r.isLive).toList(growable: false);
+
   RunInfo? get liveRun {
     for (final r in _byPath.values) {
       if (r.isLive) return r;
