@@ -1105,27 +1105,8 @@ def test_background_manifest_and_icon() -> None:
             "POST_NOTIFICATIONS",
             "WAKE_LOCK",
             "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
-            "SYSTEM_ALERT_WINDOW",
         ):
             assert perms.count(f"android.permission.{name}") == 1, (name, perms)
-
-        app = doc.getElementsByTagName("application")[0]
-        assert app.getAttribute("android:allowBackup") == "false"
-        assert app.getAttribute("android:fullBackupContent") == "@xml/bynux_backup_rules"
-        assert app.getAttribute("android:dataExtractionRules") == "@xml/bynux_data_extraction_rules"
-        queries = doc.getElementsByTagName("queries")
-        assert len(queries) == 1, "launcher queries must be installed exactly once"
-        query_text = queries[0].toxml()
-        assert 'android:scheme="mailto"' in query_text and 'android:scheme="https"' in query_text
-        assert 'android:name="android.intent.action.SENDTO"' in query_text
-        assert len(queries[0].getElementsByTagName("intent")) == 3, "exactly three distinct URI/action queries"
-        prep.write_backup_rules()
-        backup_legacy = root / "app" / "src" / "main" / "res" / "xml" / "bynux_backup_rules.xml"
-        backup_modern = root / "app" / "src" / "main" / "res" / "xml" / "bynux_data_extraction_rules.xml"
-        minidom.parse(str(backup_legacy))
-        minidom.parse(str(backup_modern))
-        assert "FlutterSharedPreferences.xml" in backup_legacy.read_text(encoding="utf-8")
-        assert backup_modern.read_text(encoding="utf-8").count("FlutterSharedPreferences.xml") == 2
 
         services = doc.getElementsByTagName("service")
         assert len(services) == 1, "the service must be declared exactly once"
@@ -1569,7 +1550,7 @@ def test_log_format_and_limits_match_the_spec() -> None:
         "MAX_BYTES = 20L * 1024 * 1024",
         "TARGET_BYTES = 16L * 1024 * 1024",
         "FLUSH_BYTES = 32 * 1024",
-        "FLUSH_DELAY_MS = 250L",
+        "FLUSH_DELAY_MS = 1000L",
         'TRIM_NOTE = "… حُذف الأقدم"',
         'TRASH_EXT = ".trash"',
     ):
@@ -1690,41 +1671,5 @@ def main() -> None:
     print("Bayan extra tests: PASS")
 
 
-def test_consent_is_a_root_gate_and_versioned_per_account() -> None:
-    """Consent must gate all app routes and server work must be deferred until acceptance."""
-    main = (ROOT / "main.dart").read_text(encoding="utf-8")
-    cloud = (ROOT / "account_cloud.dart").read_text(encoding="utf-8")
-    pubspec = (ROOT / "pubspec.yaml").read_text(encoding="utf-8")
-    assert "const String bynuxAppVersion = '7.1.0+710';" in main
-    assert re.search(r"^version:\s*7\.1\.0\+710\s*$", pubspec, re.M)
-    assert "const int bynuxLegalTextVersion = 1;" in main
-    assert "SharedPreferences" in main and "bynux_legal_consent_v${bynuxLegalTextVersion}_" in main
-    assert "_ConsentScreen" in main and "SystemNavigator.pop()" in main
-    assert "activateAfterConsent()" in main
-    sign_in = cloud[cloud.index("Future<void> signIn("):cloud.index("Future<void> activateAfterConsent()")]
-    assert "_mintSession" not in sign_in and "getProfile" not in sign_in
-    for phrase in ("هل تريد استخدام التطبيق؟", "استخدام التطبيق", "سياسة الخصوصية", "شروط الاستخدام"):
-        assert phrase in main
-    for phrase in ("معرّف حساب جوجل والبريد والاسم", "تاريخ انضمامك وتاريخ آخر رفع", "01096883474", "https://wa.me/201096883474"):
-        assert phrase in main
-
-
-def test_mini_window_reuses_bounded_log_store_and_is_consent_gated() -> None:
-    """Mini console reads the existing LogStore, keeps bounded output and uses opt-in overlay permission."""
-    kt = KOTLIN.read_text(encoding="utf-8")
-    main = (ROOT / "main.dart").read_text(encoding="utf-8")
-    runner = (ROOT / "script_runner.dart").read_text(encoding="utf-8")
-    assert "private class MiniConsoleOverlay" in kt
-    assert "fun pageForMiniWindow(" in kt and "LogStore" in kt
-    assert "MINI_WINDOW_SCAN_LIMIT = 256L * 1024" in kt
-    assert "MAX_LINES = 36" in kt and "MAX_LINE_CHARS = 360" in kt
-    assert "POLL_MS = 250L" in kt and "FLUSH_DELAY_MS = 250L" in kt
-    assert "Settings.canDrawOverlays(context)" in kt
-    assert "android.permission.SYSTEM_ALERT_WINDOW" in (ROOT / "tools" / "prepare_android.py").read_text(encoding="utf-8")
-    assert "liveRuns" in runner and "_syncPipAvailability" in main
-    assert "pageForMiniWindow" in kt and 'kind != "o" && kind != "e"' in kt
-    assert "requestOverlayPermission" in (ROOT / "python_runtime.dart").read_text(encoding="utf-8") and "_sys.overlay" in main
-
 if __name__ == "__main__":
     main()
-

@@ -310,6 +310,24 @@ SPECIAL_USE_SUBTYPE = (
     "running in the background until the user stops them"
 )
 
+QUERIES_BLOCK = """    <queries>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="mailto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="mailto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+    </queries>
+"""
+
 
 def service_block() -> str:
     # الاسم كاملًا (لا ".BayanScriptService") حتى لا يعتمد على namespace الذي يولّده flutter create
@@ -333,6 +351,56 @@ def add_script_service(text: str) -> str:
     if end < 0:
         raise RuntimeError("</application> مفقود في AndroidManifest.xml")
     return text[:end] + service_block() + "    " + text[end:]
+
+
+def add_queries_block(text: str) -> str:
+    """يضيف <queries> لروابط البريد (mailto) وواتساب (https) على أندرويد 11+. آمن عند التكرار."""
+    if "android:scheme=\"mailto\"" in text:
+        return text
+    if "<queries>" in text:
+        idx = text.find("</queries>")
+        if idx >= 0:
+            extra = (
+                '        <intent>\n'
+                '            <action android:name="android.intent.action.SENDTO" />\n'
+                '            <data android:scheme="mailto" />\n'
+                '        </intent>\n'
+                '        <intent>\n'
+                '            <action android:name="android.intent.action.VIEW" />\n'
+                '            <data android:scheme="https" />\n'
+                '        </intent>\n'
+                '        <package android:name="com.whatsapp" />\n'
+                '        <package android:name="com.whatsapp.w4b" />\n'
+            )
+            return text[:idx] + extra + "    " + text[idx:]
+    app_match = re.search(r"<application\b", text)
+    if not app_match:
+        return text
+    return text[: app_match.start()] + QUERIES_BLOCK + text[app_match.start() :]
+
+
+def patch_main_activity_pip(text: str) -> str:
+    """يفعّل Picture-in-Picture الرسمي ويمنع إعادة إنشاء MainActivity عند تصغير/تكبير النافذة."""
+    m = re.search(r"<activity\b[^>]*android:name=\"[^\"]*MainActivity\"[^>]*>", text)
+    if not m:
+        return text
+    tag = m.group(0)
+    updated = tag
+    if 'android:supportsPictureInPicture=' not in updated:
+        if updated.endswith("/>"):
+            updated = updated[:-2] + ' android:supportsPictureInPicture="true" />'
+        else:
+            updated = updated[:-1] + ' android:supportsPictureInPicture="true">'
+    if 'android:configChanges=' not in updated:
+        cfg = (
+            'android:configChanges="orientation|keyboardHidden|keyboard|screenSize|'
+            'smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"'
+        )
+        if updated.endswith("/>"):
+            updated = updated[:-2] + f" {cfg} />"
+        else:
+            updated = updated[:-1] + f" {cfg}>"
+    return text[: m.start()] + updated + text[m.end() :]
 
 
 NOTIFICATION_ICON = """<?xml version="1.0" encoding="utf-8"?>
@@ -360,97 +428,6 @@ def write_notification_icon(app_dir: Path | None = None) -> Path:
     return target
 
 
-def write_backup_rules() -> None:
-    # SharedPreferences contains both the consent marker and local session data.
-    # Exclude the plugin preferences file from both legacy and Android 12+ backup.
-    res = ANDROID / "app" / "src" / "main" / "res" / "xml"
-    res.mkdir(parents=True, exist_ok=True)
-    (res / "bynux_backup_rules.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<full-backup-content>\n'
-        '    <exclude domain="sharedpref" path="FlutterSharedPreferences.xml" />\n'
-        '</full-backup-content>\n', encoding="utf-8")
-    (res / "bynux_data_extraction_rules.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<data-extraction-rules>\n'
-        '    <cloud-backup>\n'
-        '        <exclude domain="sharedpref" path="FlutterSharedPreferences.xml" />\n'
-        '    </cloud-backup>\n'
-        '    <device-transfer>\n'
-        '        <exclude domain="sharedpref" path="FlutterSharedPreferences.xml" />\n'
-        '    </device-transfer>\n'
-        '</data-extraction-rules>\n', encoding="utf-8")
-
-
-def _patch_main_activity_manifest(text: str) -> str:
-    # Enable PiP on the existing activity, preserving existing configChanges.
-    pattern = re.compile(r'<activity\b(?=[^>]*android:name="[^"]*MainActivity")[^>]*>', re.S)
-    match = pattern.search(text)
-    if not match:
-        pattern = re.compile(r'<activity\b(?=[^>]*android:name="io\.flutter\.embedding\.android\.FlutterActivity")[^>]*>', re.S)
-        match = pattern.search(text)
-    if not match:
-        raise RuntimeError("تعذر العثور على activity الرئيسي في AndroidManifest.xml")
-    tag = match.group(0)
-
-    def set_attr(source: str, name: str, value: str) -> str:
-        expression = rf'\s+{re.escape(name)}="[^"]*"'
-        if re.search(expression, source):
-            return re.sub(expression, f' {name}="{value}"', source, count=1)
-        if source.rstrip().endswith("/>"):
-            trimmed = source.rstrip()
-            return trimmed[:-2] + f' {name}="{value}" />'
-        return source[:-1] + f' {name}="{value}">'
-
-    tag = set_attr(tag, "android:supportsPictureInPicture", "true")
-    current = re.search(r'android:configChanges="([^"]*)"', tag)
-    needed = ("screenSize", "smallestScreenSize", "screenLayout", "orientation")
-    if current:
-        values = current.group(1).split("|")
-        for item in needed:
-            if item not in values:
-                values.append(item)
-        tag = re.sub(r'android:configChanges="[^"]*"',
-                     'android:configChanges="' + "|".join(values) + '"', tag, count=1)
-    else:
-        tag = set_attr(tag, "android:configChanges", "screenSize|smallestScreenSize|screenLayout|orientation")
-    return text[:match.start()] + tag + text[match.end():]
-
-
-def _ensure_launcher_queries(text: str) -> str:
-    # url_launcher package-visibility checks for Android 11+.
-    # Keep ACTION_VIEW for the URI launch used by the app, and ACTION_SENDTO
-    # for mail handlers that expose only the mail-specific intent.
-    query_intents = [
-        ('android.intent.action.VIEW', 'mailto'),
-        ('android.intent.action.SENDTO', 'mailto'),
-        ('android.intent.action.VIEW', 'https'),
-    ]
-    q = re.search(r'<queries\b[^>]*>([\s\S]*?)</queries>', text)
-    if q:
-        block = q.group(0)
-        intent_blocks = re.findall(r'<intent\b[^>]*>[\s\S]*?</intent>', block)
-        for action, scheme in query_intents:
-            exists = any(
-                f'android:name="{action}"' in intent and f'android:scheme="{scheme}"' in intent
-                for intent in intent_blocks
-            )
-            if not exists:
-                intent = (f'        <intent>\n            <action android:name="{action}" />\n'
-                          f'            <data android:scheme="{scheme}" />\n        </intent>')
-                block = block.replace("</queries>", intent + "\n    </queries>")
-                intent_blocks.append(intent)
-        return text[:q.start()] + block + text[q.end():]
-    insert_at = re.search(r'<application\b', text)
-    if not insert_at:
-        raise RuntimeError("application tag مفقود أثناء إضافة queries")
-    intents = []
-    for action, scheme in query_intents:
-        intents.append(f'        <intent>\n            <action android:name="{action}" />\n            <data android:scheme="{scheme}" />\n        </intent>')
-    block = '<queries>\n' + "\n".join(intents) + '\n    </queries>\n    '
-    return text[:insert_at.start()] + block + text[insert_at.start():]
-
-
 def patch_manifest() -> None:
     path = ANDROID / "app" / "src" / "main" / "AndroidManifest.xml"
     if not path.exists():
@@ -466,35 +443,28 @@ def patch_manifest() -> None:
         '<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>',
         '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>',
         '<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>',
-        '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>',
     ] + BACKGROUND_PERMISSIONS
     missing = [p for p in permissions if p not in text]
     if missing:
         insert = "\n    " + "\n    ".join(missing) + "\n"
         text = text[: application.start()] + insert + text[application.start() :]
 
-    # Keep the account-specific consent strictly local and never restore it from backup.
-    app_tag = re.search(r"<application\b[^>]*>", text, re.S)
-    if not app_tag:
-        raise RuntimeError("تعذر العثور على application opening tag")
-    tag = app_tag.group(0)
+    text = add_queries_block(text)
 
-    def set_app_attr(name: str, value: str) -> None:
-        nonlocal tag
-        expression = rf'\s+{re.escape(name)}="[^"]*"'
-        if re.search(expression, tag):
-            tag = re.sub(expression, f' {name}="{value}"', tag, count=1)
-        else:
-            tag = tag[:-1] + f' {name}="{value}">'
+    if "android:requestLegacyExternalStorage=" not in text:
+        text = text.replace("<application", '<application android:requestLegacyExternalStorage="true"', 1)
 
-    set_app_attr("android:allowBackup", "false")
-    set_app_attr("android:fullBackupContent", "@xml/bynux_backup_rules")
-    set_app_attr("android:dataExtractionRules", "@xml/bynux_data_extraction_rules")
-    if "android:requestLegacyExternalStorage=" not in tag:
-        set_app_attr("android:requestLegacyExternalStorage", "true")
-    text = text[:app_tag.start()] + tag + text[app_tag.end():]
-    text = _patch_main_activity_manifest(text)
-    text = _ensure_launcher_queries(text)
+    # تعطيل النسخ الاحتياطي التلقائي لأندرويد كي لا يستعيد حالة الموافقة في SharedPreferences بعد حذف التطبيق وتثبيته.
+    if "android:allowBackup=" in text:
+        text = re.sub(r'android:allowBackup="[^"]*"', 'android:allowBackup="false"', text, count=1)
+    else:
+        text = text.replace("<application", '<application android:allowBackup="false"', 1)
+    if "android:fullBackupContent=" in text:
+        text = re.sub(r'android:fullBackupContent="[^"]*"', 'android:fullBackupContent="false"', text, count=1)
+    else:
+        text = text.replace("<application", '<application android:fullBackupContent="false"', 1)
+
+    text = patch_main_activity_pip(text)
     text = add_script_service(text)
     path.write_text(text, encoding="utf-8")
 
@@ -672,7 +642,6 @@ def main() -> None:
     patch_gradle_properties()
     print_final_app_build()
     report_versions()
-    write_backup_rules()
     patch_manifest()
     write_notification_icon()
     icons = install_launcher_icons()
