@@ -172,7 +172,6 @@ class SystemStatus {
     this.manufacturer = '',
     this.oem = '',
     this.sdk = 0,
-    this.overlay = false,
   });
 
   /// هل الإشعارات مفعّلة للتطبيق؟
@@ -187,16 +186,12 @@ class SystemStatus {
   final String oem;
   final int sdk;
 
-  /// هل منح المستخدم إذن النافذة العائمة الخاصة؟
-  final bool overlay;
-
   factory SystemStatus.fromJson(Map<String, dynamic> json) => SystemStatus(
         notifications: json['notifications'] == true,
         battery: json['battery'] == true,
         manufacturer: json['manufacturer']?.toString() ?? '',
         oem: json['oem']?.toString() ?? '',
         sdk: (json['sdk'] as num?)?.toInt() ?? 0,
-        overlay: json['overlay'] == true,
       );
 }
 
@@ -211,12 +206,6 @@ class BayanSystem {
       return SystemStatus.fromJson(Map<String, dynamic>.from(raw));
     }
     return const SystemStatus();
-  }
-
-  /// صفحة إعدادات الإذن الخاص للنافذة العائمة. النتيجة: granted | settings | failed
-  Future<String> requestOverlayPermission() async {
-    final dynamic raw = await _channel.invokeMethod<dynamic>('requestOverlayPermission');
-    return raw?.toString() ?? 'failed';
   }
 
   /// نافذة النظام لاستثناء البطارية. النتيجة: dialog | list | app | failed
@@ -253,6 +242,39 @@ class BayanSystem {
     final dynamic raw =
         await _channel.invokeMethod<dynamic>('openDeveloperOptions');
     return raw?.toString() ?? 'failed';
+  }
+
+  /// يبلّغ طبقة أندرويد بحالة موافقة المستخدم (فلا تُفتح النافذة المصغّرة ولا يعمل شيء قبل الموافقة).
+  Future<bool> setConsent(bool allowed) async {
+    try {
+      final dynamic raw = await _channel.invokeMethod<dynamic>(
+        'setConsent',
+        <String, dynamic>{'allowed': allowed},
+      );
+      return raw == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// هل التطبيق حالياً داخل النافذة المصغّرة (Picture-in-Picture)؟
+  Future<bool> pipStatus() async {
+    try {
+      final dynamic raw = await _channel.invokeMethod<dynamic>('pipStatus');
+      return raw == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// يعيد فتح واجهة التطبيق الكاملة عند لمس النافذة المصغّرة.
+  Future<bool> expandFromPip() async {
+    try {
+      final dynamic raw = await _channel.invokeMethod<dynamic>('expandFromPip');
+      return raw == true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// أندرويد 13+: نافذة إذن الإشعارات. بعد الرفض النهائي (أو قبل أندرويد 13) نفتح إعدادات الإشعارات.

@@ -1,20 +1,18 @@
 package com.bynux.app
 
-import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
 import android.app.Service
 import android.content.ComponentName
 import android.content.Context
-import android.content.res.Configuration
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.Color
-import android.graphics.PixelFormat
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.content.res.Configuration
 import android.graphics.drawable.Icon
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -23,20 +21,9 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.util.Rational
 import android.provider.Settings
-import android.text.SpannableStringBuilder
-import android.text.style.ForegroundColorSpan
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
-import android.view.WindowManager
-import android.util.TypedValue
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import org.json.JSONObject
 import android.util.Log
+import android.util.Rational
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import io.flutter.embedding.android.FlutterActivity
@@ -57,97 +44,42 @@ import java.util.concurrent.TimeUnit
 class MainActivity : FlutterActivity() {
     private var attachedEngine: FlutterEngine? = null
     private var system: BayanSystem? = null
-    private var windowChannel: MethodChannel? = null
-    @Volatile private var miniWindowEnabled = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         attachedEngine = flutterEngine
-        BayanPythonBridge.get(applicationContext).attach(flutterEngine)
+        val bridge = BayanPythonBridge.get(applicationContext)
+        bridge.attach(flutterEngine)
+        bridge.bindActivity(this)
         system = BayanSystem(applicationContext).also { it.attach(flutterEngine) }
-        windowChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "bynux/window").also { channel ->
-            channel.setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "setPipEnabled" -> {
-                        // الاسم محفوظ للتوافق مع Dart؛ التفعيل يأتي من HomeScreen بعد الموافقة فقط.
-                        miniWindowEnabled = call.arguments == true
-                        updatePictureInPictureParams()
-                        result.success(null)
-                    }
-                    "expandApp" -> {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode) {
-                            runCatching {
-                                getSystemService(ActivityManager::class.java).appTasks.firstOrNull()?.moveToFront()
-                            }
-                        }
-                        result.success(null)
-                    }
-                    "dismissPip" -> {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isInPictureInPictureMode) {
-                            moveTaskToBack(true)
-                        }
-                        result.success(null)
-                    }
-                    else -> result.notImplemented()
-                }
-            }
-        }
-        updatePictureInPictureParams()
-    }
-
-    private fun updatePictureInPictureParams() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
-            !packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE)) return
-        val canOverlay = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
-        val builder = android.app.PictureInPictureParams.Builder()
-            .setAspectRatio(Rational(16, 9))
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // النافذة العائمة هي الأساسية عند منح صلاحيتها؛ PiP بديل بلا إذن خاص.
-            builder.setAutoEnterEnabled(miniWindowEnabled && !canOverlay)
-        }
-        setPictureInPictureParams(builder.build())
-    }
-
-    // Android 8–11 لا يملك auto-enter؛ ننفذ الانتقال عند خروج المستخدم إذا كان
-    // هناك تشغيل حي فقط. Android 12+ يستخدم auto-enter لانتقال الإيماءات السلس.
-    override fun onUserLeaveHint() {
-        super.onUserLeaveHint()
-        if (!miniWindowEnabled) return
-        val overlayAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
-        if (overlayAllowed) {
-            BayanScriptService.showMiniWindow(applicationContext)
-            return
-        }
-        // البديل عند رفض إذن النافذة العائمة: PiP الرسمي متى كان مدعومًا.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.S &&
-            packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-            runCatching { enterPictureInPictureMode(android.app.PictureInPictureParams.Builder()
-                .setAspectRatio(Rational(16, 9)).build()) }
-        }
     }
 
     override fun onResume() {
         super.onResume()
-        updatePictureInPictureParams()
-        // عند العودة للتطبيق، إزالة النافذة العائمة فورًا؛ لا تؤثر على السكربت نفسه.
-        BayanScriptService.hideMiniWindow()
+        val bridge = BayanPythonBridge.get(applicationContext)
+        bridge.bindActivity(this)
+        bridge.syncPipState(this)
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        BayanPythonBridge.get(applicationContext).onUserLeave(this)
     }
 
     override fun onPictureInPictureModeChanged(
         isInPictureInPictureMode: Boolean,
-        newConfig: Configuration
+        newConfig: Configuration,
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
-        runCatching { windowChannel?.invokeMethod("pipModeChanged", isInPictureInPictureMode) }
+        BayanPythonBridge.get(applicationContext).onPipModeChanged(this, isInPictureInPictureMode)
     }
 
     // الواجهة وحدها تنفصل هنا. السكربتات الشغّالة لا تتوقف: الجسر يعيش مع العملية
     // وBayanScriptService يبقيها حيّة (إشعار دائم + WakeLock).
     override fun onDestroy() {
-        windowChannel?.setMethodCallHandler(null)
-        windowChannel = null
-        attachedEngine?.let { BayanPythonBridge.get(applicationContext).detach(it) }
+        val bridge = BayanPythonBridge.get(applicationContext)
+        bridge.unbindActivity(this)
+        attachedEngine?.let { bridge.detach(it) }
         system?.detach()
         attachedEngine = null
         system = null
@@ -201,11 +133,9 @@ class LogStore(private val dir: File) {
         const val MAX_BYTES = 20L * 1024 * 1024
         const val TARGET_BYTES = 16L * 1024 * 1024
 
-        /** التفريغ: كل 250 مللي ثانية تقريبًا، أو عند 32KB، أو عند نهاية التشغيل.
-         * الكتابة تبقى على خيط LogStore الخلفي؛ لا يُحجب خيط تشغيل بايثون أو واجهة أندرويد.
-         */
+        /** التفريغ: كل ثانية، أو عند 32KB، أو عند نهاية التشغيل. */
         const val FLUSH_BYTES = 32 * 1024
-        const val FLUSH_DELAY_MS = 250L
+        const val FLUSH_DELAY_MS = 1000L
 
         /** دفعة أكبر من هذا تُحفظ على عدة أحداث متتالية (المحتوى والترتيب كما هما) كي يبقى حجم السطر محدودًا. */
         const val MAX_EVENT_CHARS = 64 * 1024
@@ -214,8 +144,6 @@ class LogStore(private val dir: File) {
         const val PAGE_MIN_BYTES = 4 * 1024
         const val PAGE_MAX_BYTES = 1024 * 1024
         private const val LINE_SCAN_LIMIT = 8L * 1024 * 1024
-        // لا نسمح لنافذة السجلات العائمة بتوسيع القراءة عدة ميغابايت عند سطر إخراج استثنائي كبير.
-        private const val MINI_WINDOW_SCAN_LIMIT = 256L * 1024
 
         const val TRIM_NOTE = "… حُذف الأقدم"
         const val FILE_EXT = ".jsonl"
@@ -438,13 +366,6 @@ class LogStore(private val dir: File) {
         err: (Throwable) -> Unit,
     ) = io(ok, err) { pageNow(keyOf(scriptPath), before, maxBytes, epoch) }
 
-    /** نسخة bounded لنافذة المخرجات؛ تتوقف عند 256KB حتى عند سطر واحد غير معتاد الطول. */
-    fun pageForMiniWindow(
-        scriptPath: String,
-        ok: (Map<String, Any?>) -> Unit,
-        err: (Throwable) -> Unit,
-    ) = io(ok, err) { pageNow(keyOf(scriptPath), null, 64 * 1024, null, MINI_WINDOW_SCAN_LIMIT) }
-
     fun clear(scriptPath: String, ok: (Boolean) -> Unit, err: (Throwable) -> Unit) =
         io(ok, err) { clearNow(keyOf(scriptPath)) }
 
@@ -632,13 +553,7 @@ class LogStore(private val dir: File) {
      * لا يحمّل الملف كاملًا. المواضع بالبايت من أول الملف وتتغير عند القص أو المسح، لذلك يعاد epoch؛
      * إن مرّر العميل epoch قديمًا يعود الرد بـ stale=true ليبدأ من النهاية من جديد.
      */
-    private fun pageNow(
-        key: String,
-        before: Long?,
-        maxBytes: Int,
-        epoch: Long?,
-        scanLimit: Long = LINE_SCAN_LIMIT,
-    ): Map<String, Any?> {
+    private fun pageNow(key: String, before: Long?, maxBytes: Int, epoch: Long?): Map<String, Any?> {
         val file = fileFor(key)
         val current = epochOf(key)
         val size = if (file.exists()) file.length() else 0L
@@ -687,7 +602,7 @@ class LogStore(private val dir: File) {
                     if (newline >= 0) {
                         val text = String(bytes, newline + 1, bytes.size - newline - 1, Charsets.UTF_8)
                         result = reply(text, readFrom + newline + 1, end, false)
-                    } else if (window >= scanLimit) {
+                    } else if (window >= LINE_SCAN_LIMIT) {
                         result = reply(String(bytes, Charsets.UTF_8), readFrom, end, false)
                     } else {
                         window *= 2
@@ -792,7 +707,7 @@ class BayanPythonBridge private constructor(private val context: Context) :
             "هناك سكربت يعمل الآن، وقد يكون في الخلفية. أوقفه من إشعار «مشغّل بايثون» (زر «إيقاف الكل») ثم أعد المحاولة"
     }
 
-    data class RunInfo(val runId: String, val name: String, val startedAt: Long, val scriptPath: String, val waiting: Boolean)
+    data class RunInfo(val runId: String, val name: String, val startedAt: Long)
 
     private val main = Handler(Looper.getMainLooper())
     private val pythonExecutor = Executors.newSingleThreadExecutor { runnable ->
@@ -805,6 +720,11 @@ class BayanPythonBridge private constructor(private val context: Context) :
     private val sessions = mutableMapOf<String, RunSession>()
     private val sessionsLock = Any()
     private var environmentReady = false
+
+    // حالة موافقة المستخدم ووضع النافذة المصغّرة (Picture-in-Picture)
+    @Volatile var consentGranted = false
+    @Volatile var inPipMode = false
+    @Volatile private var hostActivity: MainActivity? = null
 
     // سجل الإخراج الدائم (2.5D1): يعيش مع الجسر، فيستمر التسجيل والواجهة مغلقة. كل عمل الملفات على خيطه الخلفي.
     private val logs = LogStore(File(context.filesDir, "logs")).also { it.start() }
@@ -828,6 +748,147 @@ class BayanPythonBridge private constructor(private val context: Context) :
         if (attachedEngine !== engine) return
         releaseChannels()
         attachedEngine = null
+    }
+
+    fun bindActivity(activity: MainActivity) {
+        hostActivity = activity
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            inPipMode = activity.isInPictureInPictureMode
+        }
+        refreshPipParams()
+    }
+
+    fun unbindActivity(activity: MainActivity) {
+        if (hostActivity === activity) {
+            hostActivity = null
+            inPipMode = false
+        }
+    }
+
+    private fun canEnterPip(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            consentGranted &&
+            activeRuns().isNotEmpty()
+
+    private fun buildPipParams(activity: MainActivity): PictureInPictureParams? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
+        if (!activity.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
+            return null
+        }
+        val runs = activeRuns()
+        val builder = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(16, 10))
+        if (runs.size > 1) {
+            val iconId = activity.resources.getIdentifier("ic_bayan_notify", "drawable", activity.packageName)
+            val icon = Icon.createWithResource(
+                activity,
+                if (iconId != 0) iconId else android.R.drawable.ic_popup_sync,
+            )
+            val nextIntent = Intent(activity, BayanScriptService::class.java)
+                .setAction(BayanScriptService.ACTION_PIP_NEXT)
+            val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            val pending = PendingIntent.getService(activity, 2, nextIntent, flags)
+            val action = RemoteAction(icon, "تبديل السكربت", "تبديل السكربت المعروض", pending)
+            builder.setActions(listOf(action))
+        } else {
+            builder.setActions(emptyList())
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setAutoEnterEnabled(consentGranted && runs.isNotEmpty())
+            builder.setSeamlessResizeEnabled(false)
+        }
+        return builder.build()
+    }
+
+    fun refreshPipParams() {
+        main.post {
+            val act = hostActivity ?: return@post
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return@post
+            try {
+                val params = buildPipParams(act)
+                if (params != null) {
+                    act.setPictureInPictureParams(params)
+                }
+                if (act.isInPictureInPictureMode && !canEnterPip()) {
+                    // توقفت جميع السكربتات (أو ألغيت الموافقة) والتطبيق في وضع النافذة المصغّرة: نخفي النافذة فوراً.
+                    act.moveTaskToBack(true)
+                }
+            } catch (t: Throwable) {
+                Log.w("BayanPip", "refreshPipParams failed: ${t.message}")
+            }
+        }
+    }
+
+    fun onUserLeave(activity: MainActivity) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        if (!canEnterPip() || activity.isInPictureInPictureMode) return
+        try {
+            val params = buildPipParams(activity) ?: return
+            val entered = activity.enterPictureInPictureMode(params)
+            if (entered) {
+                onPipModeChanged(activity, true)
+            }
+        } catch (t: Throwable) {
+            Log.w("BayanPip", "enterPictureInPictureMode failed: ${t.message}")
+        }
+    }
+
+    fun onPipModeChanged(activity: MainActivity, active: Boolean) {
+        inPipMode = active
+        emit(
+            mapOf(
+                "channel" to "pip",
+                "type" to "mode",
+                "text" to if (active) "1" else "0",
+            )
+        )
+        if (active && !canEnterPip()) {
+            try {
+                activity.moveTaskToBack(true)
+            } catch (_: Throwable) {}
+        }
+        refreshPipParams()
+    }
+
+    fun syncPipState(activity: MainActivity) {
+        val active = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activity.isInPictureInPictureMode
+        if (inPipMode != active) {
+            inPipMode = active
+            emit(
+                mapOf(
+                    "channel" to "pip",
+                    "type" to "mode",
+                    "text" to if (active) "1" else "0",
+                )
+            )
+        }
+        refreshPipParams()
+    }
+
+    fun requestPipNextScript() {
+        emit(
+            mapOf(
+                "channel" to "pip",
+                "type" to "next",
+                "text" to "",
+            )
+        )
+    }
+
+    fun expandFromPip(): Boolean {
+        return try {
+            val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                ?: Intent(context, MainActivity::class.java)
+            launch.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
+            context.startActivity(launch)
+            true
+        } catch (t: Throwable) {
+            false
+        }
     }
 
     private fun releaseChannels() {
@@ -909,18 +970,9 @@ class BayanPythonBridge private constructor(private val context: Context) :
         main.post { result.error(code, message, null) }
     }
 
-    /** السكربتات الجارية الآن (للخدمة والإشعار والنافذة المصغرة). */
+    /** السكربتات الجارية الآن (للخدمة والإشعار). */
     fun activeRuns(): List<RunInfo> = synchronized(sessionsLock) {
-        sessions.values.filter { !it.finished }
-            .map { RunInfo(it.runId, it.displayName, it.startedAt, it.scriptPath, it.waiting) }
-            .sortedBy { it.startedAt }
-    }
-
-    /** آخر جزء من LogStore نفسه؛ لا يوجد مصدر سجلات ثانٍ للنافذة المصغرة. */
-    fun pageLogsForMiniWindow(scriptPath: String, callback: (Map<String, Any?>?) -> Unit) {
-        logs.pageForMiniWindow(scriptPath,
-            { page -> main.post { callback(page) } },
-            { _ -> main.post { callback(null) } })
+        sessions.values.filter { !it.finished }.map { RunInfo(it.runId, it.displayName, it.startedAt) }
     }
 
     /** زر «إيقاف الكل» في الإشعار. */
@@ -1583,268 +1635,23 @@ class BayanPythonBridge private constructor(private val context: Context) :
 }
 
 /**
- * نافذة سجلات عائمة صغيرة. تعتمد على LogStore المشترك ولا تكتب السجلات بنفسها.
- * تعمل فقط بإذن SYSTEM_ALERT_WINDOW الذي يفعّله المستخدم من إعدادات أندرويد.
- */
-private class MiniConsoleOverlay(private val service: BayanScriptService) {
-    companion object {
-        private const val MAX_LINES = 36
-        private const val MAX_LINE_CHARS = 360
-        private const val POLL_MS = 250L
-        private const val PAGE_BYTES = 64 * 1024
-        private const val BG = 0xFF060A11.toInt()
-        private const val FG = 0xFFE8EEF8.toInt()
-        private const val ERR = 0xFFFF6B6B.toInt()
-        private const val BORDER = 0xFF2A3A58.toInt()
-        private const val MUTED = 0xFF8FA0BC.toInt()
-        private const val OK = 0xFF5BD68A.toInt()
-        private const val WARN = 0xFFFFB86B.toInt()
-    }
-
-    private val main = Handler(Looper.getMainLooper())
-    private val windowManager = service.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-    private var root: LinearLayout? = null
-    private var title: TextView? = null
-    private var output: TextView? = null
-    private var scroll: ScrollView? = null
-    private var selectedPath: String? = null
-    private var loading = false
-    private var removed = false
-    private var downX = 0f
-    private var downY = 0f
-    private val poll = object : Runnable {
-        override fun run() {
-            if (removed || root == null) return
-            refresh()
-            main.postDelayed(this, POLL_MS)
-        }
-    }
-
-    private fun dp(v: Int): Int = (v * service.resources.displayMetrics.density).toInt()
-
-    fun show() {
-        if (root != null) {
-            removed = false
-            refresh()
-            return
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(service)) return
-        val panel = LinearLayout(service).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(10), dp(6), dp(10), dp(6))
-            background = GradientDrawable().apply {
-                setColor(BG)
-                cornerRadius = dp(14).toFloat()
-                setStroke(dp(1), BORDER)
-            }
-        }
-        val header = TextView(service).apply {
-            setTextColor(FG)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-            typeface = Typeface.create("sans-serif", Typeface.BOLD)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(1), 0, dp(1), dp(3))
-        }
-        val divider = View(service).apply {
-            setBackgroundColor(BORDER)
-        }
-        val body = TextView(service).apply {
-            setTextColor(FG)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-            typeface = Typeface.MONOSPACE
-            setLineSpacing(0f, 1.08f)
-            setPadding(0, dp(3), 0, 0)
-            text = ""
-        }
-        val scroller = ScrollView(service).apply {
-            isFillViewport = true
-            isVerticalScrollBarEnabled = false
-            addView(body, ScrollView.LayoutParams(-1, -2))
-        }
-        panel.addView(header, LinearLayout.LayoutParams(-1, dp(22)))
-        panel.addView(divider, LinearLayout.LayoutParams(-1, dp(1)))
-        panel.addView(scroller, LinearLayout.LayoutParams(-1, 0, 1f))
-        val listener = View.OnTouchListener { _, event ->
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX
-                    downY = event.rawY
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    val dx = event.rawX - downX
-                    val dy = event.rawY - downY
-                    if (kotlin.math.abs(dx) > dp(45) && kotlin.math.abs(dx) > kotlin.math.abs(dy)) {
-                        switchScript(if (dx < 0) 1 else -1)
-                    } else if (kotlin.math.abs(dx) < dp(16) && kotlin.math.abs(dy) < dp(16)) {
-                        openApp()
-                    }
-                    true
-                }
-                MotionEvent.ACTION_CANCEL -> true
-                else -> true
-            }
-        }
-        panel.setOnTouchListener(listener)
-        header.setOnTouchListener(listener)
-        divider.setOnTouchListener(listener)
-        scroller.setOnTouchListener(listener)
-        body.setOnTouchListener(listener)
-
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
-        val params = WindowManager.LayoutParams(
-            dp(320), dp(226), type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT,
-        ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = dp(12)
-            y = dp(96)
-        }
-        try {
-            windowManager.addView(panel, params)
-            root = panel
-            title = header
-            output = body
-            scroll = scroller
-            removed = false
-            main.removeCallbacks(poll)
-            main.post(poll)
-        } catch (t: Throwable) {
-            Log.w("BynuxMiniWindow", "could not show mini window: ${t.message}")
-            root = null
-            title = null
-            output = null
-            scroll = null
-        }
-    }
-
-    fun remove() {
-        removed = true
-        main.removeCallbacks(poll)
-        val view = root
-        root = null
-        title = null
-        output = null
-        scroll = null
-        selectedPath = null
-        loading = false
-        if (view != null) runCatching { windowManager.removeView(view) }
-    }
-
-    private fun currentRuns(): List<BayanPythonBridge.RunInfo> =
-        BayanPythonBridge.peek()?.activeRuns().orEmpty()
-
-    private fun refresh() {
-        if (removed || root == null || loading) return
-        val lives = currentRuns()
-        if (lives.isEmpty()) {
-            remove()
-            service.stopMiniWindowForNoRuns()
-            return
-        }
-        if (selectedPath == null || lives.none { it.scriptPath == selectedPath }) {
-            selectedPath = lives.first().scriptPath
-        }
-        val current = lives.firstOrNull { it.scriptPath == selectedPath } ?: lives.first()
-        val index = lives.indexOf(current) + 1
-        val state = if (current.waiting) "ينتظر إدخالًا" else "يعمل"
-        title?.text = "${current.name} · $state${if (lives.size > 1) " · $index/${lives.size} ↔" else ""}"
-        val bridge = BayanPythonBridge.peek() ?: return
-        loading = true
-        bridge.pageLogsForMiniWindow(current.scriptPath) { page ->
-            loading = false
-            if (removed || root == null || current.scriptPath != selectedPath) return@pageLogsForMiniWindow
-            val text = page?.get("text") as? String ?: ""
-            val lines = ArrayList<Pair<String, Boolean>>()
-            for (raw in text.lineSequence()) {
-                if (raw.isBlank()) continue
-                try {
-                    val event = JSONObject(raw)
-                    val kind = event.optString("k")
-                    if (kind != "o" && kind != "e") continue
-                    val body = event.optString("s", "")
-                    val split = body.split('\n')
-                    for (piece in split) {
-                        val line = piece.removeSuffix("\r").let {
-                            if (it.length > MAX_LINE_CHARS) it.take(MAX_LINE_CHARS) + "…" else it
-                        }
-                        if (line.isNotEmpty() || split.size > 1) lines.add(line to (kind == "e"))
-                    }
-                } catch (_: Throwable) {
-                    // صفحة مقطوعة عند تدفق ضخم: نتجاهل سطر JSON غير المكتمل بدل عرض بيانات مشوهة.
-                }
-            }
-            val tail = lines.takeLast(MAX_LINES)
-            val styled = SpannableStringBuilder()
-            tail.forEachIndexed { idx, line ->
-                if (idx > 0) styled.append('\n')
-                val start = styled.length
-                styled.append(line.first)
-                styled.setSpan(
-                    ForegroundColorSpan(if (line.second) ERR else FG), start, styled.length,
-                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
-                )
-            }
-            output?.text = styled
-            scroll?.post { scroll?.fullScroll(View.FOCUS_DOWN) }
-        }
-    }
-
-    private fun switchScript(direction: Int) {
-        val lives = currentRuns()
-        if (lives.size < 2) return
-        val index = lives.indexOfFirst { it.scriptPath == selectedPath }.let { if (it < 0) 0 else it }
-        selectedPath = lives[(index + direction + lives.size) % lives.size].scriptPath
-        loading = false
-        refresh()
-    }
-
-    private fun openApp() {
-        try {
-            val intent = service.packageManager.getLaunchIntentForPackage(service.packageName) ?: return
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            val pending = PendingIntent.getActivity(
-                service, 12, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-            pending.send()
-        } catch (t: Throwable) {
-            Log.w("BynuxMiniWindow", "could not reopen app: ${t.message}")
-        }
-    }
-}
-
-/**
  * خدمة أمامية (Foreground Service) تبقي العملية حيّة أثناء عمل السكربتات.
  * النوع specialUse: غير مشمول بحدود dataSync (6 ساعات) ولا بقيود BOOT_COMPLETED.
  * تبدأ مع أول سكربت وتتوقف بعد آخر سكربت. الإشعار فيه «فتح التطبيق» و«إيقاف الكل».
  */
 class BayanScriptService : Service() {
-
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-    private var stopping = false
-    private var inForeground = false
-    private var miniWindow: MiniConsoleOverlay? = null
-
     companion object {
         private const val TAG = "BayanScriptService"
         const val CHANNEL_ID = "bayan_scripts"
         const val NOTIFICATION_ID = 7771
         const val ACTION_STOP_ALL = "com.bynux.app.action.STOP_ALL"
+        const val ACTION_PIP_NEXT = "com.bynux.app.action.PIP_NEXT"
 
         @Volatile private var instance: BayanScriptService? = null
 
+        /** تُستدعى من الخيط الرئيسي عند بدء سكربت. */
         fun ensureStarted(context: Context) {
+            BayanPythonBridge.peek()?.refreshPipParams()
             val running = instance
             if (running != null) {
                 running.refresh()
@@ -1852,25 +1659,28 @@ class BayanScriptService : Service() {
             }
             try {
                 val intent = Intent(context, BayanScriptService::class.java)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
-                else context.startService(intent)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
             } catch (t: Throwable) {
+                // السكربت يعمل بدون خدمة، لكن قد يُقتل عند خروج التطبيق من الشاشة
                 Log.w(TAG, "foreground service could not start: ${t.message}")
             }
         }
 
-        fun onRunsChanged() { instance?.refresh() }
-
-        fun showMiniWindow(context: Context) {
-            val current = instance ?: return
-            Handler(Looper.getMainLooper()).post { current.showMiniWindowNow() }
-        }
-
-        fun hideMiniWindow() {
-            val current = instance ?: return
-            Handler(Looper.getMainLooper()).post { current.miniWindow?.remove(); current.miniWindow = null }
+        /** تُستدعى من الخيط الرئيسي كلما تغيّرت قائمة السكربتات الجارية. */
+        fun onRunsChanged() {
+            BayanPythonBridge.peek()?.refreshPipParams()
+            instance?.refresh()
         }
     }
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var stopping = false
+    private var inForeground = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -1894,28 +1704,17 @@ class BayanScriptService : Service() {
         if (intent?.action == ACTION_STOP_ALL) {
             stopping = true
             BayanPythonBridge.peek()?.stopAll()
+        } else if (intent?.action == ACTION_PIP_NEXT) {
+            BayanPythonBridge.peek()?.requestPipNextScript()
         }
         refresh()
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
-        miniWindow?.remove()
-        miniWindow = null
         if (instance === this) instance = null
         releaseLocks()
         super.onDestroy()
-    }
-
-    private fun showMiniWindowNow() {
-        if (currentRuns().isEmpty() || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this))) return
-        miniWindow = miniWindow ?: MiniConsoleOverlay(this)
-        miniWindow?.show()
-    }
-
-    fun stopMiniWindowForNoRuns() {
-        miniWindow?.remove()
-        miniWindow = null
     }
 
     private fun currentRuns(): List<BayanPythonBridge.RunInfo> =
@@ -1924,7 +1723,6 @@ class BayanScriptService : Service() {
     private fun refresh() {
         val runs = currentRuns()
         if (runs.isEmpty()) {
-            stopMiniWindowForNoRuns()
             shutDown()
             return
         }
@@ -2089,7 +1887,6 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
         try {
             when (call.method) {
                 "status" -> result.success(status())
-                "requestOverlayPermission" -> result.success(requestOverlayPermission())
                 "requestBattery" -> result.success(requestBatteryExemption())
                 "openBatterySettings" ->
                     result.success(launch(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)))
@@ -2098,6 +1895,16 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
                 "openAutoStart" -> result.success(openAutoStart())
                 "openBrandBattery" -> result.success(openBrandBattery())
                 "openDeveloperOptions" -> result.success(openDeveloperOptions())
+                "setConsent" -> {
+                    val allowed = call.argument<Boolean>("allowed") == true
+                    val bridge = BayanPythonBridge.get(context)
+                    bridge.consentGranted = allowed
+                    if (!allowed) bridge.stopAll()
+                    bridge.refreshPipParams()
+                    result.success(true)
+                }
+                "pipStatus" -> result.success(BayanPythonBridge.peek()?.inPipMode == true)
+                "expandFromPip" -> result.success(BayanPythonBridge.get(context).expandFromPip())
                 else -> result.notImplemented()
             }
         } catch (t: Throwable) {
@@ -2132,15 +1939,7 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
             "brand" to Build.BRAND.orEmpty(),
             "oem" to oemKey(),
             "sdk" to Build.VERSION.SDK_INT,
-            "overlay" to (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)),
         )
-    }
-
-    /** إذن خاص؛ لا يُمنح تلقائيًا، بل يفتح صفحة إعدادات النظام ليختار المستخدم بنفسه. */
-    private fun requestOverlayPermission(): String {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)) return "granted"
-        val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${context.packageName}"))
-        return if (launch(intent)) "settings" else "failed"
     }
 
     private fun launch(intent: Intent): Boolean {
@@ -2271,6 +2070,6 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
             false
         }
         if (enabled && launch(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) return "dev"
-        return if (launch(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS))) "about" else "failed"
+        return if (launch(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS))) return "about" else "failed"
     }
 }

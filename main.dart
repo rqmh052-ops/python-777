@@ -1,9 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -64,12 +62,15 @@ final _ob = OutlineInputBorder(
 final _obFocus =
     _ob.copyWith(borderSide: const BorderSide(color: C.accent));
 
+const String kAppName = 'Bynux';
+const String kAppVersion = '7.1';
+const String kSupportEmail = 'aaro3498@gmail.com';
+const String kSupportPhone = '01096883474';
+const String kSupportWhatsAppUrl = 'https://wa.me/201096883474';
+
 const youtubeUrl = 'https://youtube.com/channel/UC4Ox1C-_DWCbIeiWJ_6rV9Q';
 const telegramUrl = 'https://t.me/Bayan_x777';
 final _logo = base64Decode(kLogoBase64);
-
-const MethodChannel _windowChannel = MethodChannel('bynux/window');
-final ValueNotifier<bool> _pipMode = ValueNotifier<bool>(false);
 
 // ───────── كتالوج المكتبات (التثبيت حقيقي داخل بيئة Python المشتركة) ─────────
 class Lib {
@@ -513,11 +514,6 @@ class MissingLibCard extends StatelessWidget {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  _windowChannel.setMethodCallHandler((call) async {
-    if (call.method == 'pipModeChanged') {
-      _pipMode.value = call.arguments == true;
-    }
-  });
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
@@ -536,7 +532,7 @@ class App extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
         debugShowCheckedModeBanner: false,
-        title: 'Bynux',
+        title: kAppName,
         theme: ThemeData(
           fontFamily: 'Tajawal',
           brightness: Brightness.dark,
@@ -554,10 +550,400 @@ class App extends StatelessWidget {
                 side: const BorderSide(color: C.border)),
           ),
         ),
-        builder: (context, child) =>
-            Directionality(textDirection: TextDirection.rtl, child: child!),
+        builder: (context, child) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: PipMiniWindowHost(child: child!),
+        ),
         home: const AuthGate(),
       );
+}
+
+// ───────── النافذة المصغّرة العائمة (Picture-in-Picture) لعرض مخرجات السكربتات فقط ─────────
+class PipMiniWindowHost extends StatefulWidget {
+  const PipMiniWindowHost({super.key, required this.child});
+  final Widget child;
+
+  @override
+  State<PipMiniWindowHost> createState() => _PipMiniWindowHostState();
+}
+
+class _PipMiniWindowHostState extends State<PipMiniWindowHost>
+    with WidgetsBindingObserver {
+  StreamSubscription<BayanEvent>? _pipSub;
+  bool _inPip = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    BynuxSession.instance.addListener(_onStateChanged);
+    runHub.addListener(_onStateChanged);
+    _pipSub = bayanPython.events
+        .where((e) => e.channel == 'pip')
+        .listen(_onPipEvent, onError: (Object _) {});
+    unawaited(_syncPipStatus());
+  }
+
+  Future<void> _syncPipStatus() async {
+    final status = await bayanSystem.pipStatus();
+    if (mounted && _inPip != status) {
+      setState(() => _inPip = status);
+    }
+  }
+
+  void _onPipEvent(BayanEvent e) {
+    if (!mounted) return;
+    if (e.type == 'mode') {
+      final next = e.text == '1' || e.text == 'true';
+      if (_inPip != next) setState(() => _inPip = next);
+    }
+  }
+
+  void _onStateChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (_inPip && mounted) setState(() => _inPip = false);
+      unawaited(_syncPipStatus());
+    } else if (state == AppLifecycleState.inactive) {
+      unawaited(_syncPipStatus());
+    }
+  }
+
+  @override
+  void didChangeMetrics() {
+    unawaited(_syncPipStatus());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    BynuxSession.instance.removeListener(_onStateChanged);
+    runHub.removeListener(_onStateChanged);
+    _pipSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final showMini =
+        _inPip && BynuxSession.instance.hasConsented && runHub.hasLive;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Offstage(offstage: showMini, child: widget.child),
+        if (showMini) const Positioned.fill(child: MiniScriptConsole()),
+      ],
+    );
+  }
+}
+
+class MiniScriptConsole extends StatefulWidget {
+  const MiniScriptConsole({super.key});
+
+  @override
+  State<MiniScriptConsole> createState() => _MiniScriptConsoleState();
+}
+
+class _MiniScriptConsoleState extends State<MiniScriptConsole> {
+  // تجميع التحديثات كل 250ms (ضمن النطاق 200–300ms) مع سقف صارم للذاكرة
+  static const int _batchIntervalMs = 250;
+  static const int _maxLogTailBytes = 16 * 1024;
+  static const int _maxDisplayLines = 36;
+  static const int _maxLineChars = 220;
+
+  final ScrollController _scroll = ScrollController();
+  List<Line> _lines = const <Line>[];
+  String _activeScriptPath = '';
+  String _activeRunId = '';
+  int _lastSize = -1;
+  int _lastEpoch = -1;
+  Timer? _batchTimer;
+  bool _fetching = false;
+  bool _pendingFetch = false;
+  StreamSubscription<BayanEvent>? _runSub;
+  StreamSubscription<BayanEvent>? _pipSub;
+
+  @override
+  void initState() {
+    super.initState();
+    runHub.addListener(_onHubChanged);
+    _runSub = bayanPython.events
+        .where((e) => e.channel == 'run')
+        .listen(_onRunEvent, onError: (Object _) {});
+    _pipSub = bayanPython.events
+        .where((e) => e.channel == 'pip' && e.type == 'next')
+        .listen((_) => _cycleScript(), onError: (Object _) {});
+    _syncTargetScript(immediate: true);
+  }
+
+  @override
+  void dispose() {
+    runHub.removeListener(_onHubChanged);
+    _batchTimer?.cancel();
+    _runSub?.cancel();
+    _pipSub?.cancel();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _onHubChanged() {
+    if (!mounted) return;
+    _syncTargetScript(immediate: false);
+    setState(() {});
+  }
+
+  void _syncTargetScript({required bool immediate}) {
+    final live = runHub.liveRuns;
+    if (live.isEmpty) return;
+    final current = live.where((r) => r.scriptPath == _activeScriptPath).firstOrNull ?? live.first;
+    final changed = current.scriptPath != _activeScriptPath || current.runId != _activeRunId;
+    _activeScriptPath = current.scriptPath;
+    _activeRunId = current.runId;
+    if (changed) {
+      _lastSize = -1;
+      _lastEpoch = -1;
+      if (immediate) {
+        unawaited(_pullFromLogStore());
+      } else {
+        _scheduleBatchPull();
+      }
+    } else if (immediate) {
+      unawaited(_pullFromLogStore());
+    }
+  }
+
+  void _cycleScript() {
+    final live = runHub.liveRuns;
+    if (live.length <= 1) return;
+    final idx = live.indexWhere((r) => r.scriptPath == _activeScriptPath);
+    final next = live[(idx + 1) % live.length];
+    setState(() {
+      _activeScriptPath = next.scriptPath;
+      _activeRunId = next.runId;
+      _lastSize = -1;
+      _lastEpoch = -1;
+      _lines = const <Line>[];
+    });
+    unawaited(_pullFromLogStore());
+  }
+
+  void _onRunEvent(BayanEvent e) {
+    if (!mounted) return;
+    if (e.runId.isNotEmpty && _activeRunId.isNotEmpty && e.runId != _activeRunId) {
+      return;
+    }
+    if (e.type == 'stdout' ||
+        e.type == 'stderr' ||
+        e.type == 'error' ||
+        e.type == 'started' ||
+        e.type == 'exit') {
+      _scheduleBatchPull();
+    }
+  }
+
+  void _scheduleBatchPull() {
+    _pendingFetch = true;
+    if (_batchTimer != null) return;
+    _batchTimer = Timer(const Duration(milliseconds: _batchIntervalMs), () {
+      _batchTimer = null;
+      if (_pendingFetch && mounted) {
+        _pendingFetch = false;
+        unawaited(_pullFromLogStore());
+      }
+    });
+  }
+
+  Future<void> _pullFromLogStore() async {
+    final path = _activeScriptPath;
+    final runId = _activeRunId;
+    if (path.isEmpty || !mounted) return;
+    if (_fetching) {
+      _pendingFetch = true;
+      return;
+    }
+    _fetching = true;
+    try {
+      final page = await bayanPython.logsPage(path, maxBytes: _maxLogTailBytes);
+      if (!mounted || path != _activeScriptPath) return;
+      if (page.size == _lastSize && page.epoch == _lastEpoch && _lines.isNotEmpty) {
+        return;
+      }
+      _lastSize = page.size;
+      _lastEpoch = page.epoch;
+
+      final records = _StoredLogRecord.parsePage(page.text);
+      var startIdx = 0;
+      for (var i = records.length - 1; i >= 0; i--) {
+        final r = records[i];
+        if (r.type == 'start' && (runId.isEmpty || r.runId == runId)) {
+          startIdx = i + 1;
+          break;
+        }
+      }
+
+      final built = <Line>[];
+      for (var i = startIdx; i < records.length; i++) {
+        final r = records[i];
+        if (r.type != 'event') continue;
+        if (r.kind == 'o' || r.kind == 'e') {
+          appendOutputEventLines(
+            built,
+            r.text,
+            r.kind == 'e' ? 3 : 0,
+            maxLines: _maxDisplayLines,
+          );
+        }
+      }
+      for (var i = 0; i < built.length; i++) {
+        final t = built[i].text;
+        if (t.length > _maxLineChars) {
+          built[i] = Line('${t.substring(0, _maxLineChars)}…', built[i].kind);
+        }
+      }
+      setState(() => _lines = built);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _scroll.hasClients) {
+          _scroll.jumpTo(_scroll.position.maxScrollExtent);
+        }
+      });
+    } catch (_) {
+    } finally {
+      _fetching = false;
+      if (_pendingFetch && mounted) {
+        _scheduleBatchPull();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final live = runHub.liveRuns;
+    final current = live.where((r) => r.scriptPath == _activeScriptPath).firstOrNull ??
+        (live.isNotEmpty ? live.first : null);
+    final name = current == null
+        ? kAppName
+        : current.scriptPath.substring(current.scriptPath.lastIndexOf('/') + 1);
+    final status = current?.status ?? RunStatus.running;
+    final activeIdx = current == null ? 0 : live.indexOf(current);
+
+    return Material(
+      color: C.console,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => unawaited(bayanSystem.expandFromPip()),
+        child: Container(
+          decoration: BoxDecoration(
+            color: C.console,
+            border: Border.all(color: C.borderHi, width: 1),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // سطر علوي صغير فقط: اسم السكربت وحالته، ومبدّل السكربتات عند تعددها
+              Container(
+                height: 24,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                decoration: const BoxDecoration(
+                  color: C.surface,
+                  border: Border(bottom: BorderSide(color: C.border)),
+                ),
+                child: Row(
+                  children: [
+                    RunDot(status: status),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        name,
+                        textDirection: TextDirection.ltr,
+                        textAlign: TextAlign.right,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: mono.copyWith(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          height: 1.1,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      RunDot.labelOf(status),
+                      maxLines: 1,
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        color: RunDot.colorOf(status),
+                      ),
+                    ),
+                    if (live.length > 1) ...[
+                      const SizedBox(width: 6),
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: _cycleScript,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: C.accent.withValues(alpha: .16),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: C.accent.withValues(alpha: .45)),
+                          ),
+                          child: Text(
+                            '${activeIdx + 1}/${live.length} ⇄',
+                            textDirection: TextDirection.ltr,
+                            style: const TextStyle(
+                              fontSize: 9.5,
+                              fontWeight: FontWeight.w700,
+                              color: C.accent,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              // مخرجات stdout/stderr فقط مع تمرير تلقائي لآخر سطر وتمييز الأخطاء باللون الأحمر
+              Expanded(
+                child: _lines.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'بانتظار مخرجات السكربت…',
+                          style: TextStyle(fontSize: 10.5, color: C.dim),
+                        ),
+                      )
+                    : Directionality(
+                        textDirection: TextDirection.ltr,
+                        child: ListView.builder(
+                          controller: _scroll,
+                          physics: const NeverScrollableScrollPhysics(),
+                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                          itemCount: _lines.length,
+                          itemBuilder: (context, index) {
+                            final line = _lines[index];
+                            return Text(
+                              line.text.isEmpty ? ' ' : line.text,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: mono.copyWith(
+                                fontSize: 10.5,
+                                height: 1.32,
+                                color: line.kind == 3 ? C.error : C.text,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // ───────── مكونات مشتركة ─────────
@@ -820,7 +1206,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     fallbackMode.addListener(_onMode);
-    runHub.addListener(_onRunHubChanged);
     // تحديث الأوقات النسبية واكتشاف الملفات الجديدة أثناء بقاء التطبيق مفتوحاً
     _tick = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!mounted) return;
@@ -833,9 +1218,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _boot() async {
     await store.init();
     if (!mounted) return;
-    await runHub.init();
-    if (!mounted) return;
-    _syncPipAvailability();
+    unawaited(runHub.init());
     if (!store.getFlag(_welcomeFlag)) {
       // الترحيب يشمل إذن الملفات، فلا نعرض نافذته المنفصلة في هذه المرة
       _asked = true;
@@ -845,20 +1228,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (fallbackMode.value && !_asked) {
       _asked = true;
       _showAccessDialog();
-    }
-  }
-
-  void _onRunHubChanged() => _syncPipAvailability();
-
-  void _syncPipAvailability() {
-    final enabled = runHub.hasLive;
-    unawaited(_windowChannel
-        .invokeMethod<void>('setPipEnabled', enabled)
-        .catchError((Object _) {}));
-    if (!enabled && _pipMode.value) {
-      unawaited(_windowChannel
-          .invokeMethod<void>('dismissPip')
-          .catchError((Object _) {}));
     }
   }
 
@@ -882,10 +1251,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     fallbackMode.removeListener(_onMode);
-    runHub.removeListener(_onRunHubChanged);
-    unawaited(_windowChannel
-        .invokeMethod<void>('setPipEnabled', false)
-        .catchError((Object _) {}));
     _tick?.cancel();
     super.dispose();
   }
@@ -956,11 +1321,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   @override
-  Widget build(BuildContext context) => ValueListenableBuilder<bool>(
-        valueListenable: _pipMode,
-        builder: (context, inPip, _) {
-          if (inPip) return const _PipConsoleScreen();
-          return Scaffold(
+  Widget build(BuildContext context) => Scaffold(
         key: _key,
         endDrawer: AppDrawer(
             onLibraries: _openLibraries,
@@ -1032,8 +1393,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ]),
         ),
-      );
-        },
       );
 }
 
@@ -1653,7 +2012,7 @@ class AppDrawer extends StatelessWidget {
       );
 }
 
-// ───────── البوابة الجذرية: تسجيل الدخول ثم الموافقة ثم واجهة التطبيق ─────────
+// ───────── بوابة الحساب والموافقة: نقطة التوجيه الجذري الوحيدة في التطبيق ─────────
 class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
 
@@ -1663,16 +2022,41 @@ class AuthGate extends StatefulWidget {
 
 class _AuthGateState extends State<AuthGate> {
   final BynuxSession _session = BynuxSession.instance;
-  int _gateRevision = 0;
-  bool _checkingConsent = true;
-  bool _consented = false;
-  String? _checkedAccountId;
+  String? _profileInitializedFor;
 
   @override
   void initState() {
     super.initState();
     _session.addListener(_onSessionChanged);
-    unawaited(_refreshGate());
+    // الشاشة لا تنتظر شيئًا: الجلسة المحفوظة قُرئت قبل runApp. هذا الاستدعاء
+    // يجهّز جوجل ويجدد الجلسة في الخلفية فقط.
+    unawaited(_session.restoreInBackground());
+    _syncSessionAndConsent();
+  }
+
+  // يحفظ الخادم تاريخ إنشاء الحساب بعد الموافقة فقط، ولا يُستدعى قبل موافقة المستخدم.
+  void _ensureProfile(BynuxUser user) {
+    if (!_session.hasConsented) return;
+    if (_profileInitializedFor == user.id) return;
+    _profileInitializedFor = user.id;
+    unawaited(BynuxCloudApi.instance.getProfile().catchError(
+        (Object _) => const CloudProfile(email: '', createdAt: null)));
+  }
+
+  void _syncSessionAndConsent() {
+    final user = _session.user;
+    final allowed = user != null && _session.hasConsented;
+    unawaited(bayanSystem.setConsent(allowed));
+    if (!allowed) {
+      _profileInitializedFor = null;
+    } else {
+      _ensureProfile(user);
+    }
+  }
+
+  void _onSessionChanged() {
+    _syncSessionAndConsent();
+    if (mounted) setState(() {});
   }
 
   @override
@@ -1681,50 +2065,153 @@ class _AuthGateState extends State<AuthGate> {
     super.dispose();
   }
 
-  void _onSessionChanged() => unawaited(_refreshGate());
-
-  Future<void> _refreshGate() async {
-    final revision = ++_gateRevision;
-    final user = _session.user;
-    if (user == null) {
-      if (!mounted) return;
-      setState(() {
-        _checkingConsent = false;
-        _consented = false;
-        _checkedAccountId = null;
-      });
-      return;
-    }
-    if (mounted) setState(() => _checkingConsent = true);
-    final accepted = await _BynuxConsentStore.hasConsent(user.id);
-    if (!mounted || revision != _gateRevision || _session.user?.id != user.id) return;
-    setState(() {
-      _checkingConsent = false;
-      _checkedAccountId = user.id;
-      _consented = accepted;
-    });
-  }
-
-  Widget _loading() => const Scaffold(
+  @override
+  Widget build(BuildContext context) {
+    if (!_session.ready) {
+      return const Scaffold(
         body: Center(
           child: CircularProgressIndicator(strokeWidth: 2.4, color: C.accent),
         ),
       );
-
-  @override
-  Widget build(BuildContext context) {
-    if (!_session.ready) return _loading();
+    }
     final user = _session.user;
     if (user == null) return const GoogleLoginScreen();
-    if (_checkingConsent || _checkedAccountId != user.id) return _loading();
-    if (!_consented) {
-      return _ConsentScreen(
-        user: user,
-        onAccepted: _refreshGate,
-      );
+    if (!_session.hasConsented) {
+      return ConsentScreen(key: ValueKey<String>('consent_${user.id}'));
     }
     return HomeScreen(key: ValueKey<String>(user.id));
   }
+}
+
+// ───────── شاشة الموافقة بعد تسجيل الدخول (جذر التنقل قبل فتح الرئيسية) ─────────
+class ConsentScreen extends StatefulWidget {
+  const ConsentScreen({super.key});
+
+  @override
+  State<ConsentScreen> createState() => _ConsentScreenState();
+}
+
+class _ConsentScreenState extends State<ConsentScreen> {
+  bool _submitting = false;
+
+  Future<void> _accept() async {
+    if (_submitting) return;
+    setState(() => _submitting = true);
+    try {
+      await BynuxSession.instance.acceptConsent();
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  void _openPrivacy() {
+    Navigator.of(context).push<void>(smooth<void>(const PrivacyPolicyScreen()));
+  }
+
+  void _openTerms() {
+    Navigator.of(context).push<void>(smooth<void>(const TermsOfUseScreen()));
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) {
+            SystemNavigator.pop();
+          }
+        },
+        child: Scaffold(
+          body: SafeArea(
+            child: Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(24),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 420),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 28),
+                    decoration: _box(C.surface, raised: true),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'هل تريد استخدام التطبيق؟',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.w800,
+                            color: C.text,
+                            height: 1.4,
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        PButton(
+                          label: 'استخدام التطبيق',
+                          onPressed: _submitting ? null : _accept,
+                        ),
+                        const SizedBox(height: 20),
+                        const Text(
+                          'باستخدامك التطبيق فإنك توافق على جميع ما ذكر في:',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            color: C.muted,
+                            height: 1.6,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          alignment: WrapAlignment.center,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          spacing: 8,
+                          runSpacing: 6,
+                          children: [
+                            InkWell(
+                              onTap: _openPrivacy,
+                              borderRadius: BorderRadius.circular(8),
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                child: Text(
+                                  'سياسة الخصوصية',
+                                  style: TextStyle(
+                                    color: C.accent,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w700,
+                                    decoration: TextDecoration.underline,
+                                    decorationColor: C.accent,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const Text('·', style: TextStyle(color: C.dim, fontSize: 16)),
+                            InkWell(
+                              onTap: _openTerms,
+                              borderRadius: BorderRadius.circular(8),
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                child: Text(
+                                  'شروط الاستخدام',
+                                  style: TextStyle(
+                                    color: C.accent,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w700,
+                                    decoration: TextDecoration.underline,
+                                    decorationColor: C.accent,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
 }
 
 class GoogleLoginScreen extends StatefulWidget {
@@ -1886,13 +2373,6 @@ class _AccountScreenState extends State<AccountScreen> {
     if (confirm != true || !mounted) return;
     setState(() => _signingOut = true);
     try {
-      // لا نترك أي تشغيل حي أو نافذة مصغّرة بعد إنهاء حساب المستخدم.
-      try {
-        await bayanPython.runsStopAll();
-        await runHub.refresh();
-      } catch (_) {}
-      await _windowChannel.invokeMethod<void>('setPipEnabled', false).catchError((Object _) {});
-      await _windowChannel.invokeMethod<void>('dismissPip').catchError((Object _) {});
       await BynuxSession.instance.signOut();
       if (!mounted) return;
       Navigator.of(context).popUntil((route) => route.isFirst);
@@ -2055,24 +2535,22 @@ class _AccountScreenState extends State<AccountScreen> {
                 _option(
                   icon: Icons.shield_outlined,
                   title: 'سياسة الخصوصية',
-                  subtitle: 'البيانات التي نجمعها وكيفية استخدامها',
-                  onTap: () => _open(_LegalDocumentScreen(
-                      title: 'سياسة الخصوصية', document: _privacyDocument)),
+                  subtitle: 'ما نجمعه من بيانات وكيف نستخدمها ونحميها وحقوقك',
+                  onTap: () => _open(const PrivacyPolicyScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
-                  icon: Icons.gavel_rounded,
+                  icon: Icons.description_outlined,
                   title: 'شروط الاستخدام',
-                  subtitle: 'القواعد والمسؤوليات الخاصة باستخدام التطبيق',
-                  onTap: () => _open(_LegalDocumentScreen(
-                      title: 'شروط الاستخدام', document: _termsDocument)),
+                  subtitle: 'القواعد والضوابط المنظّمة لاستخدام التطبيق والسحابة',
+                  onTap: () => _open(const TermsOfUseScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.info_outline_rounded,
                   title: 'حول التطبيق',
-                  subtitle: 'Bynux · الإصدار ${_bynuxVersionLabel()}',
-                  onTap: () => _open(const _AboutAppScreen()),
+                  subtitle: '$kAppName · الإصدار $kAppVersion',
+                  onTap: () => _open(const AboutAppScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
@@ -2090,9 +2568,9 @@ class _AccountScreenState extends State<AccountScreen> {
                       : const Icon(Icons.chevron_left, color: C.error),
                 ),
                 const SizedBox(height: 16),
-                Center(
-                  child: Text('Bynux ${_bynuxVersionLabel()}',
-                      style: const TextStyle(color: C.dim, fontSize: 12)),
+                const Center(
+                  child: Text('$kAppName $kAppVersion',
+                      style: TextStyle(color: C.dim, fontSize: 12)),
                 ),
               ],
             ),
@@ -2551,724 +3029,707 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
       );
 }
 
-// ───────── نصوص المستندات القانونية (علامات التنسيق أزيلت دون تغيير الصياغة) ─────────
-const String bynuxAppVersion = '7.1.0+710';
-const int bynuxLegalTextVersion = 1;
-String _bynuxVersionLabel() => bynuxAppVersion.split('.').take(2).join('.');
-
-final String _privacyDocument = '''تطبيق Bynux · الإصدار ${_bynuxVersionLabel()} · آخر تحديث: 15 أكتوبر 2026
-
-توضح هذه السياسة ما نجمعه من بيانات، وكيف نستخدمها ونحميها، وما هي حقوقك. استخدامك للتطبيق يعني موافقتك عليها.
-
-1. البيانات التي نجمعها
-- بيانات الحساب: معرّف حساب جوجل والبريد والاسم. تُحفظ على جهازك، ويُحفظ في السحابة بريدك وتاريخ انضمامك وتاريخ آخر رفع.
-- السكربتات: عند تشغيل سكربت تُرفع نسخة من ملف .py (اسمه ومحتواه كاملًا) إلى السحابة.
-- بيانات الجلسة: رمز جلسة يبقى على جهازك، ويحتفظ الخادم ببصمة مشفّرة منه فقط (وليس الرمز نفسه) مع بريدك ومعرّفك.
-- ما لا نجمعه: مخرجات السكربتات وسجلاتها تبقى على جهازك ولا تُرفع إلينا. لا نستخدم إعلانات ولا أدوات تحليل أو تتبع.
-
-2. كيف نستخدم بياناتك
-لتسجيل دخولك، وتخزين سكربتاتك وعرضها وتنزيلها، وتشغيل الخدمة وحمايتها من إساءة الاستخدام. لا نبيع بياناتك ولا نشاركها لأغراض تسويقية.
-
-3. السحابة
-تُخزَّن نسخ السكربتات في مساحة خاصة بحسابك على خدمة Cloudflare، ولا يستطيع مستخدمون آخرون الوصول إليها عبر التطبيق. مشرف الخدمة يستطيع الوصول تقنيًا إلى التخزين، ولا يطّلع على الملفات إلا للصيانة أو الشكاوى أو الالتزام القانوني.
-
-4. الأذونات
-- الإنترنت: لتسجيل الدخول والسحابة وتثبيت المكتبات واتصالات سكربتاتك.
-- الوصول إلى الملفات: لقراءة سكربتاتك وحفظها.
-- الإشعارات والخدمة الأمامية والتشغيل بالخلفية واستثناء البطارية: لإبقاء سكربتاتك تعمل عند خروجك من التطبيق.
-
-لا نستخدم هذه الأذونات لأي غرض آخر.
-
-5. أطراف ثالثة
-- Google لتسجيل الدخول.
-- Cloudflare للاستضافة والتخزين.
-- PyPI وفهرس مكتبات Chaquopy لتنزيل المكتبات التي تختارها.
-- أي خدمة يتصل بها سكربتك، وهذه خارج سيطرتنا.
-
-لكل جهة سياسة خصوصية خاصة بها.
-
-6. نقل البيانات خارج مصر
-قد تُخزَّن بياناتك وتُعالَج على خوادم خارج مصر. بتسجيل الدخول واستخدام التطبيق، توافق صراحةً على ذلك.
-
-7. الاحتفاظ والحذف
-نحتفظ ببياناتك ما دام حسابك قائمًا. مدة الجلسة 180 يومًا، وتسجيل الخروج ينهيها فورًا. لا يوجد حاليًا زر حذف داخل التطبيق، فيمكنك طلب حذف حسابك وملفاتك عبر وسائل التواصل أدناه، وننفذه خلال 30 يومًا.
-
-8. حقوقك
-وفق قانون حماية البيانات الشخصية المصري رقم 151 لسنة 2020، لك الحق في الاطلاع على بياناتك وتصحيحها وحذفها وسحب موافقتك. أرسل طلبك عبر وسائل التواصل أدناه.
-
-9. الأمان
-يتصل التطبيق بالسحابة عبر HTTPS، وملفات كل حساب معزولة. نتخذ إجراءات معقولة لحماية بياناتك، لكن لا يوجد نظام آمن بالكامل. عند حدوث تسريب يمسّ بياناتك نبلغك والجهات المختصة وفق القانون.
-
-10. الأطفال
-التطبيق غير موجّه لمن هم دون 18 عامًا، ولا نجمع بياناتهم عمدًا.
-
-11. التعديلات
-قد نحدّث هذه السياسة، وتظهر النسخة الجديدة في التطبيق مع تاريخ التحديث. استمرارك بعد التحديث يُعد موافقة عليه.
-
-12. التواصل
-📧 aaro3498@gmail.com
-💬 واتساب: 01096883474''';
-
-final String _termsDocument = '''تطبيق Bynux · الإصدار ${_bynuxVersionLabel()} · آخر تحديث: 15 أكتوبر 2026
-
-1. القبول
-باستخدامك التطبيق أو تسجيل الدخول إليه، تقرّ بأنك قرأت هذه الشروط ووافقت عليها. إذا لم توافق فالرجاء التوقف عن الاستخدام. وتُقرأ هذه الشروط مع «سياسة الخصوصية».
-
-2. الحساب
-- الدخول بحساب جوجل فقط.
-- أنت مسؤول عن حسابك وجهازك وكل ما يجري من خلالهما.
-- يجب أن تكون بعمر 18 عامًا فأكثر.
-
-3. السكربتات
-التطبيق أداة لتشغيل سكربتات بايثون التي تكتبها أو تضيفها أنت. أنت وحدك المسؤول عن محتواها وما تفعله واتصالاتها، وعن احترام شروط الخدمات التي تتصل بها. لا نراجع سكربتاتك ولا نتحكم بها. سكربتاتك ملكك، والتطبيق وهويته ملك المطوّر.
-
-4. الاستخدام الممنوع
-يُمنع استخدام التطبيق أو السحابة في:
-- اختراق أو دخول غير مصرّح به لأجهزة أو حسابات أو أنظمة الآخرين.
-- كتابة أو تشغيل برمجيات خبيثة أو فدية أو تجسس، أو سرقة بيانات أو كلمات مرور.
-- مهاجمة الخدمات (حجب الخدمة، الاستغلال، المسح العدواني)، أو الرسائل المزعجة والاحتيال وانتحال الهوية.
-- مخالفة شروط الخدمات التي يتصل بها السكربت، أو تجاوز حماية أو تشفير أو ترخيص محتوى لا تملك حق التصرف فيه.
-- رفع محتوى غير قانوني أو ينتهك حقوق الآخرين.
-- محاولة تعطيل السحابة أو تجاوز حدودها أو الوصول إلى بيانات غير بياناتك.
-
-5. السحابة
-- المسموح: ملفات .py فقط، حتى 1 ميجابايت للملف و200 ملف للحساب.
-- تُرفع نسخة من السكربت تلقائيًا عند تشغيله.
-- السحابة وسيلة تسهيل وليست ضمانًا للنسخ الاحتياطي، وقد نغيّر حدودها أو نوقفها أو تتعطل.
-
-6. إيقاف الحساب
-يحق لنا عند مخالفة هذه الشروط أن نقيّد حسابك أو نوقفه أو نحذف ملفاته، دون إشعار مسبق. ويمكنك التوقف عن الاستخدام وطلب حذف بياناتك في أي وقت.
-
-7. إخلاء المسؤولية
-النسخة تجريبية، ويُقدَّم التطبيق «كما هو» دون ضمانات. قد تتوقف السكربتات بسبب قيود أندرويد على البطارية والخلفية. لا نتحمل مسؤولية فقدان بيانات، ولا ما تفعله سكربتاتك، ولا أي ضرر ناتج عن استخدامك للتطبيق، إلا بالقدر الذي يفرضه القانون.
-
-8. التعديلات
-قد نعدّل هذه الشروط، وتظهر النسخة الجديدة في التطبيق مع تاريخ التحديث. استمرارك بعد التعديل يُعد موافقة عليه.
-
-9. القانون الحاكم
-تخضع هذه الشروط لقوانين جمهورية مصر العربية، وتختص محاكمها بأي نزاع.
-
-10. التواصل
-📧 aaro3498@gmail.com
-💬 واتساب: 01096883474''';
-
-class _BynuxConsentStore {
-  static String _key(String accountId) =>
-      'bynux_legal_consent_v${bynuxLegalTextVersion}_${base64Url.encode(utf8.encode(accountId)).replaceAll('=', '')}';
-
-  static Future<bool> hasConsent(String accountId) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      return prefs.getBool(_key(accountId)) == true;
-    } catch (_) {
-      // عند تعذّر قراءة الموافقة لا نسمح بتجاوز شاشة الموافقة.
-      return false;
-    }
-  }
-
-  static Future<void> accept(String accountId) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_key(accountId), true);
-  }
-}
-
-Future<void> _launchContact(String url) async {
-  try {
-    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
-  } catch (_) {
-    // تعذّر وجود تطبيق مناسب لا ينبغي أن يغلق الشاشة أو يسبب تعطل التطبيق.
-  }
-}
-
-class _LegalDocumentScreen extends StatefulWidget {
-  const _LegalDocumentScreen({required this.title, required this.document});
-  final String title;
-  final String document;
-
-  @override
-  State<_LegalDocumentScreen> createState() => _LegalDocumentScreenState();
-}
-
-class _LegalDocumentScreenState extends State<_LegalDocumentScreen> {
-  late final TapGestureRecognizer _emailTap;
-  late final TapGestureRecognizer _whatsAppTap;
-
-  @override
-  void initState() {
-    super.initState();
-    _emailTap = TapGestureRecognizer()
-      ..onTap = () => unawaited(_launchContact('mailto:aaro3498@gmail.com'));
-    _whatsAppTap = TapGestureRecognizer()
-      ..onTap = () => unawaited(
-          _launchContact('https://wa.me/201096883474'));
-  }
-
-  @override
-  void dispose() {
-    _emailTap.dispose();
-    _whatsAppTap.dispose();
-    super.dispose();
-  }
-
-  Widget _line(String line) {
-    if (line.isEmpty) return const SizedBox(height: 7);
-    if (line == '📧 aaro3498@gmail.com') {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: SelectableText.rich(TextSpan(children: [
-          const WidgetSpan(
-              alignment: PlaceholderAlignment.middle,
-              child: Icon(Icons.mail_outline_rounded,
-                  color: C.accent, size: 19)),
-          const TextSpan(text: '  '),
-          TextSpan(
-              text: 'aaro3498@gmail.com',
-              style: const TextStyle(
-                  color: C.accent, decoration: TextDecoration.underline),
-              recognizer: _emailTap),
-        ])),
-      );
-    }
-    if (line == '💬 واتساب: 01096883474') {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: SelectableText.rich(TextSpan(children: [
-          const WidgetSpan(
-              alignment: PlaceholderAlignment.middle,
-              child: _WhatsAppMark(size: 19)),
-          const TextSpan(text: '  '),
-          const TextSpan(text: 'واتساب: '),
-          TextSpan(
-              text: '01096883474',
-              style: const TextStyle(
-                  color: Color(0xFF25D366),
-                  decoration: TextDecoration.underline),
-              recognizer: _whatsAppTap),
-        ])),
-      );
-    }
-    final isHeading = RegExp(r'^\d+[.:]\s').hasMatch(line);
-    final isMetadata = line.startsWith('تطبيق Bynux · الإصدار ');
-    return Padding(
-      padding: EdgeInsets.only(top: isHeading ? 12 : 2, bottom: 3),
-      child: SelectableText(
-        line,
-        style: TextStyle(
-          color: isHeading ? C.accent : (isMetadata ? C.muted : C.text),
-          fontSize: isHeading ? 17 : (isMetadata ? 12 : 14),
-          fontWeight: isHeading ? FontWeight.w800 : FontWeight.normal,
-          height: 1.65,
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) => Scaffold(
-        body: SafeArea(
-          child: Column(children: [
-            Header(title: widget.title, back: true),
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.fromLTRB(18, 14, 18, 30),
-                children: [for (final line in widget.document.split('\n')) _line(line)],
-              ),
-            ),
-          ]),
-        ),
-      );
-}
-
-class _WhatsAppMark extends StatelessWidget {
-  const _WhatsAppMark({this.size = 20});
+// ───────── أيقونة واتساب محلية (مورد متجهي مرسوم محلياً بلا حزم إضافية) ─────────
+class WhatsAppIcon extends StatelessWidget {
+  const WhatsAppIcon({
+    super.key,
+    this.size = 22,
+    this.color = const Color(0xFF25D366),
+  });
   final double size;
+  final Color color;
 
   @override
-  Widget build(BuildContext context) => CustomPaint(
-        size: Size.square(size),
-        painter: _WhatsAppPainter(),
+  Widget build(BuildContext context) => SizedBox(
+        width: size,
+        height: size,
+        child: CustomPaint(
+          painter: _WhatsAppPainter(color),
+        ),
       );
 }
 
 class _WhatsAppPainter extends CustomPainter {
+  const _WhatsAppPainter(this.color);
+  final Color color;
+
   @override
   void paint(Canvas canvas, Size size) {
-    final scale = size.width / 24;
-    canvas.save();
-    canvas.scale(scale);
-    final green = Paint()
-      ..color = const Color(0xFF25D366)
+    final s = size.shortestSide;
+    final center = Offset(s * 0.52, s * 0.48);
+    final radius = s * 0.40;
+
+    final strokePaint = Paint()
+      ..color = color
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.8
+      ..strokeWidth = s * 0.095
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
+
+    // فقاعة المحادثة الدائرية مع الذيل السفلي الأيسر
     final bubble = Path()
-      ..moveTo(5, 19)
-      ..lineTo(3.7, 21)
-      ..lineTo(8.2, 19.8)
-      ..cubicTo(14, 22, 20.5, 17.5, 20.5, 11.8)
-      ..cubicTo(20.5, 6.2, 16.2, 3.3, 11.7, 3.3)
-      ..cubicTo(6.6, 3.3, 3.2, 7.1, 3.2, 11.7)
-      ..cubicTo(3.2, 14.4, 3.8, 16.7, 5, 19)
-      ..close();
-    canvas.drawPath(bubble, green);
+      ..addArc(
+        Rect.fromCircle(center: center, radius: radius),
+        2.62,
+        5.50,
+      )
+      ..lineTo(s * 0.14, s * 0.88)
+      ..lineTo(s * 0.25, s * 0.68);
+    canvas.drawPath(bubble, strokePaint);
+
+    // سماعة الهاتف داخل الفقاعة
+    final phonePaint = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
     final phone = Path()
-      ..moveTo(8, 7.8)
-      ..cubicTo(7.2, 8.8, 8.6, 11.8, 10.5, 13.5)
-      ..cubicTo(12.4, 15.4, 15, 16.5, 16, 15.4)
-      ..lineTo(17, 13.9)
-      ..lineTo(14.3, 12.4)
-      ..lineTo(13.2, 13.6)
-      ..cubicTo(11.9, 12.9, 11, 12, 10.4, 10.8)
-      ..lineTo(11.4, 9.7)
-      ..lineTo(9.7, 7.3)
+      ..moveTo(s * 0.39, s * 0.33)
+      ..quadraticBezierTo(s * 0.35, s * 0.33, s * 0.34, s * 0.39)
+      ..quadraticBezierTo(s * 0.33, s * 0.49, s * 0.44, s * 0.59)
+      ..quadraticBezierTo(s * 0.54, s * 0.68, s * 0.64, s * 0.66)
+      ..quadraticBezierTo(s * 0.70, s * 0.64, s * 0.70, s * 0.59)
+      ..lineTo(s * 0.62, s * 0.54)
+      ..lineTo(s * 0.57, s * 0.58)
+      ..quadraticBezierTo(s * 0.49, s * 0.54, s * 0.45, s * 0.46)
+      ..lineTo(s * 0.49, s * 0.41)
       ..close();
-    canvas.drawPath(phone, green);
-    canvas.restore();
+    canvas.drawPath(phone, phonePaint);
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _WhatsAppPainter oldDelegate) =>
+      oldDelegate.color != color;
 }
 
-class _AboutAppScreen extends StatelessWidget {
-  const _AboutAppScreen();
-
-  @override
-  Widget build(BuildContext context) => Scaffold(
-        body: SafeArea(
-          child: Column(children: [
-            const Header(title: 'حول التطبيق', back: true),
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.all(18),
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(20),
-                    decoration: _box(C.surface, raised: true),
-                    child: Column(children: [
-                      ClipOval(
-                        child: Image.memory(_logo,
-                            width: 76, height: 76, fit: BoxFit.cover),
-                      ),
-                      const SizedBox(height: 14),
-                      const Text('Bynux',
-                          style: TextStyle(
-                              color: C.text,
-                              fontSize: 24,
-                              fontWeight: FontWeight.w800)),
-                      const SizedBox(height: 5),
-                      Text('الإصدار ${_bynuxVersionLabel()}',
-                          style: const TextStyle(color: C.muted, fontSize: 14)),
-                    ]),
-                  ),
-                  const SizedBox(height: 14),
-                  _AboutContactTile(
-                    icon: Icons.mail_outline_rounded,
-                    title: 'البريد الإلكتروني',
-                    value: 'aaro3498@gmail.com',
-                    color: C.accent,
-                    onTap: () => unawaited(
-                        _launchContact('mailto:aaro3498@gmail.com')),
-                  ),
-                  const SizedBox(height: 10),
-                  _AboutContactTile(
-                    icon: Icons.chat_bubble_outline_rounded,
-                    title: 'واتساب',
-                    value: '01096883474',
-                    color: const Color(0xFF25D366),
-                    onTap: () => unawaited(
-                        _launchContact('https://wa.me/201096883474')),
-                    whatsApp: true,
-                  ),
-                ],
-              ),
-            ),
-          ]),
-        ),
-      );
+Future<void> _launchSupportEmail(BuildContext context) async {
+  final uri = Uri(scheme: 'mailto', path: kSupportEmail);
+  try {
+    final launched =
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched && context.mounted) {
+      _toast(context, 'تعذّر فتح تطبيق البريد');
+    }
+  } catch (_) {
+    if (context.mounted) _toast(context, 'تعذّر فتح تطبيق البريد');
+  }
 }
 
-class _AboutContactTile extends StatelessWidget {
-  const _AboutContactTile({
-    required this.icon,
+Future<void> _launchSupportWhatsApp(BuildContext context) async {
+  final uri = Uri.parse(kSupportWhatsAppUrl);
+  try {
+    final launched =
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched && context.mounted) {
+      _toast(context, 'تعذّر فتح محادثة واتساب');
+    }
+  } catch (_) {
+    if (context.mounted) _toast(context, 'تعذّر فتح محادثة واتساب');
+  }
+}
+
+class _LegalDocSection {
+  const _LegalDocSection({
     required this.title,
-    required this.value,
-    required this.color,
-    required this.onTap,
-    this.whatsApp = false,
+    this.paragraphs = const <String>[],
+    this.bullets = const <String>[],
+    this.footer,
+  });
+  final String title;
+  final List<String> paragraphs;
+  final List<String> bullets;
+  final String? footer;
+}
+
+class _LegalDocumentView extends StatelessWidget {
+  const _LegalDocumentView({
+    required this.title,
+    required this.subtitle,
+    this.intro,
+    required this.sections,
+    required this.contactTitle,
   });
 
-  final IconData icon;
-  final String title, value;
-  final Color color;
-  final VoidCallback onTap;
-  final bool whatsApp;
+  final String title;
+  final String subtitle;
+  final String? intro;
+  final List<_LegalDocSection> sections;
+  final String contactTitle;
 
-  @override
-  Widget build(BuildContext context) => Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(13),
-          child: Container(
-            padding: const EdgeInsets.all(14),
-            decoration: _box(C.surface),
-            child: Row(children: [
-              Container(
-                width: 42,
-                height: 42,
-                decoration: BoxDecoration(
-                    color: color.withValues(alpha: .12),
-                    borderRadius: BorderRadius.circular(12)),
-                alignment: Alignment.center,
-                child: whatsApp
-                    ? _WhatsAppMark(size: 22)
-                    : Icon(icon, color: color, size: 22),
+  Widget _sectionCard(_LegalDocSection sec) => Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(15),
+        decoration: _box(C.surface),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              sec.title,
+              style: const TextStyle(
+                color: C.accent,
+                fontSize: 16,
+                fontWeight: FontWeight.w800,
+                height: 1.4,
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
+            ),
+            if (sec.paragraphs.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              for (var i = 0; i < sec.paragraphs.length; i++) ...[
+                if (i > 0) const SizedBox(height: 6),
+                Text(
+                  sec.paragraphs[i],
+                  style: const TextStyle(
+                    color: C.text,
+                    fontSize: 14,
+                    height: 1.7,
+                  ),
+                ),
+              ],
+            ],
+            if (sec.bullets.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              for (final item in sec.bullets)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(title,
-                          style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w700,
-                              color: C.text)),
-                      const SizedBox(height: 3),
-                      Text(value,
-                          textDirection: TextDirection.ltr,
-                          style: TextStyle(color: color, fontSize: 13)),
-                    ]),
-              ),
-              const Icon(Icons.open_in_new_rounded, color: C.dim, size: 18),
-            ]),
-          ),
-        ),
-      );
-}
-
-class _ConsentScreen extends StatefulWidget {
-  const _ConsentScreen({required this.user, required this.onAccepted});
-  final BynuxUser user;
-  final Future<void> Function() onAccepted;
-
-  @override
-  State<_ConsentScreen> createState() => _ConsentScreenState();
-}
-
-class _ConsentScreenState extends State<_ConsentScreen> {
-  bool _saving = false;
-
-  Future<void> _accept() async {
-    if (_saving) return;
-    setState(() => _saving = true);
-    try {
-      await _BynuxConsentStore.accept(widget.user.id);
-      // صار السماح بالسحابة والعمل بالخلفية ممكنًا بعد حفظ الموافقة فقط.
-      unawaited(BynuxSession.instance.activateAfterConsent().catchError((Object _) {}));
-      await widget.onAccepted();
-    } catch (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('تعذّر حفظ الموافقة. تحقّق من مساحة الجهاز وحاول مجددًا.')));
-      }
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) => PopScope(
-        canPop: false,
-        onPopInvokedWithResult: (didPop, result) {
-          if (!didPop) unawaited(SystemNavigator.pop());
-        },
-        child: Scaffold(
-          body: SafeArea(
-            child: Center(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(24),
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 420),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      const Text('هل تريد استخدام التطبيق؟',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                              fontSize: 23,
-                              fontWeight: FontWeight.w800,
-                              color: C.text)),
-                      const SizedBox(height: 24),
-                      SizedBox(
-                        height: 52,
-                        child: ElevatedButton(
-                          onPressed: _saving ? null : _accept,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: C.accent,
-                            foregroundColor: C.onAccent,
-                            shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(13)),
+                      const Padding(
+                        padding: EdgeInsets.only(top: 9, left: 8),
+                        child: SizedBox(
+                          width: 6,
+                          height: 6,
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: C.accent,
+                              shape: BoxShape.circle,
+                            ),
                           ),
-                          child: _saving
-                              ? const SizedBox(
-                                  width: 20,
-                                  height: 20,
-                                  child: CircularProgressIndicator(
-                                      strokeWidth: 2, color: C.onAccent))
-                              : const Text('استخدام التطبيق',
-                                  style: TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w800)),
                         ),
                       ),
-                      const SizedBox(height: 18),
-                      const Text(
-                          'باستخدامك التطبيق فإنك توافق على جميع ما ذكر في:',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                              color: C.muted, fontSize: 14, height: 1.6)),
-                      const SizedBox(height: 9),
-                      Center(
-                        child: Wrap(
-                          alignment: WrapAlignment.center,
-                          spacing: 18,
-                          runSpacing: 8,
-                          children: [
-                            TextButton(
-                              onPressed: () => Navigator.of(context).push<void>(
-                                  smooth<void>(_LegalDocumentScreen(
-                                      title: 'سياسة الخصوصية',
-                                      document: _privacyDocument))),
-                              child: const Text('سياسة الخصوصية'),
-                            ),
-                            TextButton(
-                              onPressed: () => Navigator.of(context).push<void>(
-                                  smooth<void>(_LegalDocumentScreen(
-                                      title: 'شروط الاستخدام',
-                                      document: _termsDocument))),
-                              child: const Text('شروط الاستخدام'),
-                            ),
-                          ],
+                      Expanded(
+                        child: Text(
+                          item,
+                          style: const TextStyle(
+                            color: C.text,
+                            fontSize: 14,
+                            height: 1.68,
+                          ),
                         ),
                       ),
                     ],
                   ),
                 ),
+            ],
+            if (sec.footer != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                sec.footer!,
+                style: const TextStyle(
+                  color: C.muted,
+                  fontSize: 13.5,
+                  height: 1.6,
+                ),
               ),
+            ],
+          ],
+        ),
+      );
+
+  Widget _contactCard(BuildContext context) => Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(15),
+        decoration: _box(C.surface, raised: true),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              contactTitle,
+              style: const TextStyle(
+                color: C.accent,
+                fontSize: 16,
+                fontWeight: FontWeight.w800,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () => _launchSupportEmail(context),
+                borderRadius: BorderRadius.circular(10),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: C.bg,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: C.border),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.email_outlined, color: C.accent, size: 20),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          kSupportEmail,
+                          textDirection: TextDirection.ltr,
+                          textAlign: TextAlign.right,
+                          style: TextStyle(
+                            color: C.accent,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Icon(Icons.open_in_new_rounded, color: C.dim, size: 16),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () => _launchSupportWhatsApp(context),
+                borderRadius: BorderRadius.circular(10),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: C.bg,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: C.border),
+                  ),
+                  child: const Row(
+                    children: [
+                      WhatsAppIcon(size: 20),
+                      SizedBox(width: 10),
+                      Text(
+                        'واتساب:',
+                        style: TextStyle(
+                          color: C.muted,
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          kSupportPhone,
+                          textDirection: TextDirection.ltr,
+                          textAlign: TextAlign.right,
+                          style: TextStyle(
+                            color: Color(0xFF25D366),
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Icon(Icons.open_in_new_rounded, color: C.dim, size: 16),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: Scaffold(
+          body: SafeArea(
+            child: Column(
+              children: [
+                Header(title: title, back: true),
+                Expanded(
+                  child: SelectionArea(
+                    contextMenuBuilder: arSelectionContextMenu,
+                    child: ListView(
+                      padding: const EdgeInsets.all(16),
+                      children: [
+                        Container(
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.all(15),
+                          decoration: _box(C.surface, raised: true),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                title,
+                                style: const TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w800,
+                                  color: C.text,
+                                ),
+                              ),
+                              const SizedBox(height: 5),
+                              Text(
+                                subtitle,
+                                style: const TextStyle(
+                                  color: C.muted,
+                                  fontSize: 12.5,
+                                  height: 1.5,
+                                ),
+                              ),
+                              if (intro != null) ...[
+                                const SizedBox(height: 10),
+                                Text(
+                                  intro!,
+                                  style: const TextStyle(
+                                    color: C.text,
+                                    fontSize: 14,
+                                    height: 1.7,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                        for (final sec in sections) _sectionCard(sec),
+                        _contactCard(context),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ),
       );
 }
 
-class _PipOutputLine {
-  const _PipOutputLine(this.text, this.isError);
-  final String text;
-  final bool isError;
+// ───────── شاشة سياسة الخصوصية ─────────
+class PrivacyPolicyScreen extends StatelessWidget {
+  const PrivacyPolicyScreen({super.key});
+
+  static const List<_LegalDocSection> _sections = <_LegalDocSection>[
+    _LegalDocSection(
+      title: '1. البيانات التي نجمعها',
+      bullets: <String>[
+        'بيانات الحساب: معرّف حساب جوجل والبريد والاسم. تُحفظ على جهازك، ويُحفظ في السحابة بريدك وتاريخ انضمامك وتاريخ آخر رفع.',
+        'السكربتات: عند تشغيل سكربت تُرفع نسخة من ملف .py (اسمه ومحتواه كاملًا) إلى السحابة.',
+        'بيانات الجلسة: رمز جلسة يبقى على جهازك، ويحتفظ الخادم ببصمة مشفّرة منه فقط (وليس الرمز نفسه) مع بريدك ومعرّفك.',
+        'ما لا نجمعه: مخرجات السكربتات وسجلاتها تبقى على جهازك ولا تُرفع إلينا. لا نستخدم إعلانات ولا أدوات تحليل أو تتبع.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '2. كيف نستخدم بياناتك',
+      paragraphs: <String>[
+        'لتسجيل دخولك، وتخزين سكربتاتك وعرضها وتنزيلها، وتشغيل الخدمة وحمايتها من إساءة الاستخدام. لا نبيع بياناتك ولا نشاركها لأغراض تسويقية.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '3. السحابة',
+      paragraphs: <String>[
+        'تُخزَّن نسخ السكربتات في مساحة خاصة بحسابك على خدمة Cloudflare، ولا يستطيع مستخدمون آخرون الوصول إليها عبر التطبيق. مشرف الخدمة يستطيع الوصول تقنيًا إلى التخزين، ولا يطّلع على الملفات إلا للصيانة أو الشكاوى أو الالتزام القانوني.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '4. الأذونات',
+      bullets: <String>[
+        'الإنترنت: لتسجيل الدخول والسحابة وتثبيت المكتبات واتصالات سكربتاتك.',
+        'الوصول إلى الملفات: لقراءة سكربتاتك وحفظها.',
+        'الإشعارات والخدمة الأمامية والتشغيل بالخلفية واستثناء البطارية: لإبقاء سكربتاتك تعمل عند خروجك من التطبيق.',
+      ],
+      footer: 'لا نستخدم هذه الأذونات لأي غرض آخر.',
+    ),
+    _LegalDocSection(
+      title: '5. أطراف ثالثة',
+      bullets: <String>[
+        'Google لتسجيل الدخول.',
+        'Cloudflare للاستضافة والتخزين.',
+        'PyPI وفهرس مكتبات Chaquopy لتنزيل المكتبات التي تختارها.',
+        'أي خدمة يتصل بها سكربتك، وهذه خارج سيطرتنا.',
+      ],
+      footer: 'لكل جهة سياسة خصوصية خاصة بها.',
+    ),
+    _LegalDocSection(
+      title: '6. نقل البيانات خارج مصر',
+      paragraphs: <String>[
+        'قد تُخزَّن بياناتك وتُعالَج على خوادم خارج مصر. بتسجيل الدخول واستخدام التطبيق، توافق صراحةً على ذلك.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '7. الاحتفاظ والحذف',
+      paragraphs: <String>[
+        'نحتفظ ببياناتك ما دام حسابك قائمًا. مدة الجلسة 180 يومًا، وتسجيل الخروج ينهيها فورًا. لا يوجد حاليًا زر حذف داخل التطبيق، فيمكنك طلب حذف حسابك وملفاتك عبر وسائل التواصل أدناه، وننفذه خلال 30 يومًا.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '8. حقوقك',
+      paragraphs: <String>[
+        'وفق قانون حماية البيانات الشخصية المصري رقم 151 لسنة 2020، لك الحق في الاطلاع على بياناتك وتصحيحها وحذفها وسحب موافقتك. أرسل طلبك عبر وسائل التواصل أدناه.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '9. الأمان',
+      paragraphs: <String>[
+        'يتصل التطبيق بالسحابة عبر HTTPS، وملفات كل حساب معزولة. نتخذ إجراءات معقولة لحماية بياناتك، لكن لا يوجد نظام آمن بالكامل. عند حدوث تسريب يمسّ بياناتك نبلغك والجهات المختصة وفق القانون.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '10. الأطفال',
+      paragraphs: <String>[
+        'التطبيق غير موجّه لمن هم دون 18 عامًا، ولا نجمع بياناتهم عمدًا.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '11. التعديلات',
+      paragraphs: <String>[
+        'قد نحدّث هذه السياسة، وتظهر النسخة الجديدة في التطبيق مع تاريخ التحديث. استمرارك بعد التحديث يُعد موافقة عليه.',
+      ],
+    ),
+  ];
+
+  @override
+  Widget build(BuildContext context) => const _LegalDocumentView(
+        title: 'سياسة الخصوصية',
+        subtitle: 'تطبيق $kAppName · الإصدار $kAppVersion · آخر تحديث: 15 أكتوبر 2026',
+        intro: 'توضح هذه السياسة ما نجمعه من بيانات، وكيف نستخدمها ونحميها، وما هي حقوقك. استخدامك للتطبيق يعني موافقتك عليها.',
+        sections: _sections,
+        contactTitle: '12. التواصل',
+      );
 }
 
-class _PipConsoleScreen extends StatefulWidget {
-  const _PipConsoleScreen();
+// ───────── شاشة شروط الاستخدام ─────────
+class TermsOfUseScreen extends StatelessWidget {
+  const TermsOfUseScreen({super.key});
+
+  static const List<_LegalDocSection> _sections = <_LegalDocSection>[
+    _LegalDocSection(
+      title: '1. القبول',
+      paragraphs: <String>[
+        'باستخدامك التطبيق أو تسجيل الدخول إليه، تقرّ بأنك قرأت هذه الشروط ووافقت عليها. إذا لم توافق فالرجاء التوقف عن الاستخدام. وتُقرأ هذه الشروط مع «سياسة الخصوصية».',
+      ],
+    ),
+    _LegalDocSection(
+      title: '2. الحساب',
+      bullets: <String>[
+        'الدخول بحساب جوجل فقط.',
+        'أنت مسؤول عن حسابك وجهازك وكل ما يجري من خلالهما.',
+        'يجب أن تكون بعمر 18 عامًا فأكثر.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '3. السكربتات',
+      paragraphs: <String>[
+        'التطبيق أداة لتشغيل سكربتات بايثون التي تكتبها أو تضيفها أنت. أنت وحدك المسؤول عن محتواها وما تفعله واتصالاتها، وعن احترام شروط الخدمات التي تتصل بها. لا نراجع سكربتاتك ولا نتحكم بها. سكربتاتك ملكك، والتطبيق وهويته ملك المطوّر.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '4. الاستخدام الممنوع',
+      paragraphs: <String>[
+        'يُمنع استخدام التطبيق أو السحابة في:',
+      ],
+      bullets: <String>[
+        'اختراق أو دخول غير مصرّح به لأجهزة أو حسابات أو أنظمة الآخرين.',
+        'كتابة أو تشغيل برمجيات خبيثة أو فدية أو تجسس، أو سرقة بيانات أو كلمات مرور.',
+        'مهاجمة الخدمات (حجب الخدمة، الاستغلال، المسح العدواني)، أو الرسائل المزعجة والاحتيال وانتحال الهوية.',
+        'مخالفة شروط الخدمات التي يتصل بها السكربت، أو تجاوز حماية أو تشفير أو ترخيص محتوى لا تملك حق التصرف فيه.',
+        'رفع محتوى غير قانوني أو ينتهك حقوق الآخرين.',
+        'محاولة تعطيل السحابة أو تجاوز حدودها أو الوصول إلى بيانات غير بياناتك.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '5. السحابة',
+      bullets: <String>[
+        'المسموح: ملفات .py فقط، حتى 1 ميجابايت للملف و200 ملف للحساب.',
+        'تُرفع نسخة من السكربت تلقائيًا عند تشغيله.',
+        'السحابة وسيلة تسهيل وليست ضمانًا للنسخ الاحتياطي، وقد نغيّر حدودها أو نوقفها أو تتعطل.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '6. إيقاف الحساب',
+      paragraphs: <String>[
+        'يحق لنا عند مخالفة هذه الشروط أن نقيّد حسابك أو نوقفه أو نحذف ملفاته، دون إشعار مسبق. ويمكنك التوقف عن الاستخدام وطلب حذف بياناتك في أي وقت.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '7. إخلاء المسؤولية',
+      paragraphs: <String>[
+        'النسخة تجريبية، ويُقدَّم التطبيق «كما هو» دون ضمانات. قد تتوقف السكربتات بسبب قيود أندرويد على البطارية والخلفية. لا نتحمل مسؤولية فقدان بيانات، ولا ما تفعله سكربتاتك، ولا أي ضرر ناتج عن استخدامك للتطبيق، إلا بالقدر الذي يفرضه القانون.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '8. التعديلات',
+      paragraphs: <String>[
+        'قد نعدّل هذه الشروط، وتظهر النسخة الجديدة في التطبيق مع تاريخ التحديث. استمرارك بعد التعديل يُعد موافقة عليه.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '9. القانون الحاكم',
+      paragraphs: <String>[
+        'تخضع هذه الشروط لقوانين جمهورية مصر العربية، وتختص محاكمها بأي نزاع.',
+      ],
+    ),
+  ];
 
   @override
-  State<_PipConsoleScreen> createState() => _PipConsoleScreenState();
+  Widget build(BuildContext context) => const _LegalDocumentView(
+        title: 'شروط الاستخدام',
+        subtitle: 'تطبيق $kAppName · الإصدار $kAppVersion · آخر تحديث: 15 أكتوبر 2026',
+        sections: _sections,
+        contactTitle: '10. التواصل',
+      );
 }
 
-class _PipConsoleScreenState extends State<_PipConsoleScreen> {
-  static const int _maxLines = 36;
-  static const int _maxLineChars = 360;
-  final ScrollController _scroll = ScrollController();
-  Timer? _pollTimer;
-  bool _polling = false;
-  String? _selectedPath;
-  List<_PipOutputLine> _lines = const [];
+// ───────── شاشة حول التطبيق ─────────
+class AboutAppScreen extends StatelessWidget {
+  const AboutAppScreen({super.key});
 
-  @override
-  void initState() {
-    super.initState();
-    runHub.addListener(_runsChanged);
-    _selectLiveScript();
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
-      unawaited(_poll());
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) => _poll());
-  }
-
-  void _selectLiveScript() {
-    final lives = runHub.liveRuns;
-    if (lives.isEmpty) {
-      _selectedPath = null;
-      _lines = const [];
-      return;
-    }
-    if (_selectedPath == null || !lives.any((r) => r.scriptPath == _selectedPath)) {
-      _selectedPath = lives.first.scriptPath;
-      _lines = const [];
-    }
-  }
-
-  void _runsChanged() {
-    if (!mounted) return;
-    final old = _selectedPath;
-    setState(_selectLiveScript);
-    if (old != _selectedPath) unawaited(_poll());
-    if (runHub.liveRuns.isEmpty) {
-      unawaited(_windowChannel.invokeMethod<void>('dismissPip').catchError((Object _) {}));
-    }
-  }
-
-  void _switchScript(int direction) {
-    final lives = runHub.liveRuns;
-    if (lives.length < 2) return;
-    var index = lives.indexWhere((r) => r.scriptPath == _selectedPath);
-    if (index < 0) index = 0;
-    final next = (index + direction + lives.length) % lives.length;
-    setState(() {
-      _selectedPath = lives[next].scriptPath;
-      _lines = const [];
-    });
-    unawaited(_poll());
-  }
-
-  Future<void> _poll() async {
-    if (_polling || !mounted || !_pipMode.value) return;
-    _selectLiveScript();
-    final path = _selectedPath;
-    if (path == null) {
-      if (_lines.isNotEmpty && mounted) setState(() => _lines = const []);
-      return;
-    }
-    _polling = true;
-    try {
-      // قراءة آخر جزء من LogStore فقط. نعيد بناء النافذة من tail محدود بدل تجميع
-      // كل حدث في الذاكرة أو إعادة بثه؛ لا يحدث تكرار بين عمليات القراءة.
-      final page = await bayanPython.logsPage(path, maxBytes: 16 * 1024);
-      final next = <_PipOutputLine>[];
-      for (final rawLine in page.text.split('\n')) {
-        if (rawLine.isEmpty) continue;
-        try {
-          final decoded = jsonDecode(rawLine);
-          if (decoded is! Map) continue;
-          final kind = decoded['k']?.toString();
-          if (kind != 'o' && kind != 'e') continue;
-          final output = decoded['s']?.toString() ?? '';
-          final parts = output.split('\n');
-          for (final part in parts) {
-            if (part.isEmpty && parts.length == 1) continue;
-            final clipped = part.length > _maxLineChars
-                ? '${part.substring(0, _maxLineChars)}…'
-                : part;
-            next.add(_PipOutputLine(clipped, kind == 'e'));
-          }
-        } catch (_) {
-          // تجاهل سجل JSONL ناقصًا فقط؛ لا يؤثر في تشغيل السكربت.
-        }
-      }
-      final bounded = next.length > _maxLines
-          ? next.sublist(next.length - _maxLines)
-          : next;
-      if (mounted) {
-        setState(() => _lines = bounded);
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scroll.hasClients) {
-            _scroll.jumpTo(_scroll.position.maxScrollExtent);
-          }
-        });
-      }
-    } catch (_) {
-      // السجل مؤقتًا غير متاح؛ تظل النافذة حية وتعيد المحاولة في الدفعة التالية.
-    } finally {
-      _polling = false;
-    }
-  }
-
-  @override
-  void dispose() {
-    runHub.removeListener(_runsChanged);
-    _pollTimer?.cancel();
-    _scroll.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final lives = runHub.liveRuns;
-    RunInfo? current;
-    for (final run in lives) {
-      if (run.scriptPath == _selectedPath) {
-        current = run;
-        break;
-      }
-    }
-    current ??= lives.isEmpty ? null : lives.first;
-    final fullPath = current?.scriptPath ?? '';
-    final scriptName = fullPath.replaceAll('\\', '/').split('/').last;
-    final stateLabel = current?.status == RunStatus.waiting ? 'ينتظر إدخالًا' : 'يعمل';
-    return Scaffold(
-      backgroundColor: C.console,
-      body: SafeArea(
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => unawaited(
-              _windowChannel.invokeMethod<void>('expandApp').catchError((Object _) {})),
-          onHorizontalDragEnd: (details) {
-            final velocity = details.primaryVelocity ?? 0;
-            if (velocity.abs() > 80) _switchScript(velocity > 0 ? 1 : -1);
-          },
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(10, 7, 10, 5),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              SizedBox(
-                height: 24,
-                child: Row(children: [
-                  Icon(Icons.circle,
-                      color: current?.status == RunStatus.waiting ? C.warn : C.ok,
-                      size: 8),
-                  const SizedBox(width: 5),
-                  Expanded(
-                    child: Text(
-                      '${scriptName.isEmpty ? 'لا يوجد سكربت' : scriptName} · $stateLabel${lives.length > 1 ? ' · ${lives.indexOf(current!) + 1}/${lives.length} ↔' : ''}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      textDirection: TextDirection.ltr,
-                      style: const TextStyle(
-                          color: C.text, fontSize: 10, fontWeight: FontWeight.w700),
-                    ),
+  Widget _contactRow({
+    required Widget leading,
+    required String title,
+    required String value,
+    required Color valueColor,
+    required VoidCallback onTap,
+  }) =>
+      Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(13),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+            decoration: _box(C.surface),
+            child: Row(
+              children: [
+                Container(
+                  width: 42,
+                  height: 42,
+                  decoration: BoxDecoration(
+                    color: valueColor.withValues(alpha: .12),
+                    borderRadius: BorderRadius.circular(12),
                   ),
-                ]),
-              ),
-              const Divider(height: 5, color: C.border),
-              Expanded(
-                child: _lines.isEmpty
-                    ? const SizedBox.shrink()
-                    : ListView.builder(
-                        controller: _scroll,
-                        padding: EdgeInsets.zero,
-                        itemCount: _lines.length,
-                        itemBuilder: (context, index) => Text(
-                          _lines[index].text,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          textDirection: TextDirection.ltr,
-                          style: TextStyle(
-                              color: _lines[index].isError ? C.error : C.text,
-                              fontFamily: 'monospace',
-                              fontSize: 10,
-                              height: 1.2),
+                  alignment: Alignment.center,
+                  child: leading,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          color: C.muted,
+                          fontSize: 12,
                         ),
                       ),
-              ),
-            ]),
+                      const SizedBox(height: 3),
+                      Text(
+                        value,
+                        textDirection: TextDirection.ltr,
+                        textAlign: TextAlign.right,
+                        style: TextStyle(
+                          color: valueColor,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Icon(Icons.open_in_new_rounded, color: C.dim, size: 18),
+              ],
+            ),
           ),
         ),
-      ),
-    );
-  }
+      );
+
+  @override
+  Widget build(BuildContext context) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: Scaffold(
+          body: SafeArea(
+            child: Column(
+              children: [
+                const Header(title: 'حول التطبيق', back: true),
+                Expanded(
+                  child: ListView(
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+                        decoration: _box(C.surface, raised: true),
+                        child: Column(
+                          children: [
+                            ClipOval(
+                              child: Image.memory(
+                                _logo,
+                                width: 72,
+                                height: 72,
+                                fit: BoxFit.cover,
+                                gaplessPlayback: true,
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            const Text(
+                              kAppName,
+                              style: TextStyle(
+                                fontSize: 24,
+                                fontWeight: FontWeight.w800,
+                                color: C.text,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: C.accent.withValues(alpha: .12),
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: C.accent.withValues(alpha: .35)),
+                              ),
+                              child: const Text(
+                                'الإصدار $kAppVersion',
+                                style: TextStyle(
+                                  color: C.accent,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 4),
+                        child: Text(
+                          'التواصل',
+                          style: TextStyle(
+                            color: C.muted,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      _contactRow(
+                        leading: const Icon(Icons.email_outlined, color: C.accent, size: 22),
+                        title: 'البريد الإلكتروني',
+                        value: kSupportEmail,
+                        valueColor: C.accent,
+                        onTap: () => _launchSupportEmail(context),
+                      ),
+                      const SizedBox(height: 10),
+                      _contactRow(
+                        leading: const WhatsAppIcon(size: 22),
+                        title: 'واتساب',
+                        value: kSupportPhone,
+                        valueColor: const Color(0xFF25D366),
+                        onTap: () => _launchSupportWhatsApp(context),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
 }
+
 
 // ───────── شاشة الصلاحيات: الترحيب عند أول فتح + «فحص الصلاحيات» من القائمة ─────────
 enum _PermState { granted, missing }
@@ -3339,13 +3800,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
   Future<void> _grantFiles() => store.requestAccess();
 
   Future<void> _grantNotifications() => bayanSystem.requestNotifications();
-
-  Future<void> _grantMiniWindow() async {
-    final how = await bayanSystem.requestOverlayPermission();
-    if (how == 'failed' && mounted) {
-      _snack('تعذّر فتح إعدادات النافذة العائمة. يمكنك استخدام PiP إذا كان مدعومًا.');
-    }
-  }
 
   Future<void> _grantBattery() async {
     final how = await bayanSystem.requestBattery();
@@ -3669,17 +4123,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                             : _PermState.missing,
                         actionLabel: 'منح',
                         onAction: _grantNotifications,
-                      ),
-                      const SizedBox(height: 12),
-                      _card(
-                        index: i++,
-                        id: 'mini-window',
-                        icon: Icons.picture_in_picture_alt_rounded,
-                        title: 'النافذة العائمة للسجلات',
-                        why: 'لإظهار مخرجات السكربت فوق التطبيقات الأخرى. إذن اختياري؛ وPiP بديل عند عدم منحه.',
-                        state: _sys.overlay ? _PermState.granted : _PermState.missing,
-                        actionLabel: _sys.overlay ? 'مفعّل' : 'تفعيل',
-                        onAction: _grantMiniWindow,
                       ),
                       const SizedBox(height: 12),
                       _card(
@@ -6071,7 +6514,7 @@ class _OutputScreenState extends State<OutputScreen> {
   }
 
   Future<void> _startRun() async {
-    if (!mounted || _starting) return;
+    if (!mounted || _starting || !BynuxSession.instance.hasConsented) return;
     _starting = true;
     _stopRequested = false;
     setState(() {

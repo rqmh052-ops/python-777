@@ -13,6 +13,10 @@ const String bynuxCloudApiBase =
     'https://bayan-storage-api.aaro3498.workers.dev';
 const int bynuxMaxScriptBytes = 1024 * 1024;
 
+/// رقم إصدار نصوص سياسة الخصوصية وشروط الاستخدام.
+/// تغيير هذا الثابت مستقبلاً يعيد طلب الموافقة تلقائياً لكل الحسابات على الجهاز.
+const String bynuxLegalTermsVersion = '7.1_2026-10-15';
+
 /// هوية المستخدم المحفوظة على الجهاز. بعد أول دخول لا يعتمد التطبيق على جوجل
 /// ليعرف أنك مسجّل، فيفتح الرئيسية مباشرة حتى لو كان الإنترنت بطيئًا أو مقطوعًا.
 class BynuxUser {
@@ -56,12 +60,20 @@ class BynuxSession extends ChangeNotifier {
   static final BynuxSession instance = BynuxSession._();
 
   static const String _prefsKey = 'bynux_session_v1';
+  static const String _consentPrefix =
+      'bynux_consent_${bynuxLegalTermsVersion}_';
+
+  /// مفتاح حفظ الموافقة محلياً مرتبط بمعرّف حساب جوجل وإصدار نصوص الشروط.
+  static String consentPrefsKey(String userId) => '$_consentPrefix$userId';
+
   final GoogleSignIn _google = GoogleSignIn.instance;
   StreamSubscription<GoogleSignInAuthenticationEvent>? _events;
   GoogleSignInAccount? _account;
   BynuxUser? _user;
   String? _sessionToken;
   DateTime? _sessionExpiresAt;
+  String? _pendingGoogleToken;
+  bool _consented = false;
   bool _googleReady = false;
   bool _ready = false;
   bool _signingIn = false;
@@ -72,6 +84,7 @@ class BynuxSession extends ChangeNotifier {
 
   BynuxUser? get user => _user;
   bool get ready => _ready;
+  bool get hasConsented => _user != null && _consented;
   String? get initializationError => _initializationError;
 
   bool get _sessionIsValid {
@@ -81,8 +94,9 @@ class BynuxSession extends ChangeNotifier {
     return expiresAt.isAfter(DateTime.now().add(const Duration(minutes: 1)));
   }
 
-  /// يقرأ الجلسة المحفوظة من ملف محلي (بدون شبكة). يُستدعى قبل runApp ليظهر أول إطار
-  /// صحيحًا: الرئيسية إن كان هناك حساب محفوظ، وإلا شاشة الدخول، بلا دوران انتظار.
+  /// يقرأ الجلسة المحفوظة وحالة موافقة الحساب من ملف محلي (بدون شبكة).
+  /// يُستدعى قبل runApp ليظهر أول إطار صحيحًا: الرئيسية إن كان الحساب موافقًا،
+  /// أو شاشة الموافقة إن لم يوافق بعد، أو شاشة الدخول إن لم يكن هناك حساب.
   Future<void> loadSaved() async {
     if (_ready) return;
     try {
@@ -93,6 +107,7 @@ class BynuxSession extends ChangeNotifier {
         if (data is Map) {
           _user = BynuxUser.tryParse(data['user']);
           if (_user != null) {
+            _consented = prefs.getBool(consentPrefsKey(_user!.id)) == true;
             final token = data['session']?.toString();
             final expMs = data['sessionExp'];
             if (token != null && token.isNotEmpty && expMs is num) {
@@ -108,9 +123,20 @@ class BynuxSession extends ChangeNotifier {
       _user = null;
       _sessionToken = null;
       _sessionExpiresAt = null;
+      _consented = false;
     }
     _ready = true;
     notifyListeners();
+  }
+
+  Future<bool> _readConsent(String userId) async {
+    if (userId.isEmpty) return false;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(consentPrefsKey(userId)) == true;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> _persist() async {
@@ -134,6 +160,23 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
+  /// يحفظ موافقة الحساب الحالي محلياً ويستكمل إنشاء جلسة الخادم المؤجّلة.
+  Future<void> acceptConsent() async {
+    final current = _user;
+    if (current == null) return;
+    _consented = true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(consentPrefsKey(current.id), true);
+    } catch (_) {}
+    notifyListeners();
+    final pendingToken = _pendingGoogleToken ?? _freshGoogleToken();
+    _pendingGoogleToken = null;
+    if (!_sessionIsValid && pendingToken != null) {
+      unawaited(_obtainSession(pendingToken));
+    }
+  }
+
   /// تهيئة مكتبة جوجل فقط (سريعة). لا شيء ظاهر ينتظرها.
   Future<void> initialize() => _initializationFuture ??= _initializeOnce();
 
@@ -145,7 +188,7 @@ class BynuxSession extends ChangeNotifier {
           // نتجاهل حدث الخروج القادم من المكتبة عمدًا: الخروج الوحيد المعتمد هو
           // ضغطة «تسجيل الخروج» من المستخدم، حتى لا تضيع الجلسة بسبب حدث عابر.
           if (event is GoogleSignInAuthenticationEventSignIn && !_signingIn) {
-            _adoptAccount(event.user);
+            unawaited(_adoptAccountAsync(event.user));
           }
         },
         onError: (Object error) {
@@ -166,7 +209,12 @@ class BynuxSession extends ChangeNotifier {
   /// واجهة جوجل لا تظهر إلا من زر «تسجيل الدخول» اليدوي. بقيت الدالة لأن الشاشة تستدعيها.
   Future<void> restoreInBackground() async {}
 
-  void _adoptAccount(GoogleSignInAccount account) {
+  Future<void> _adoptAccountAsync(GoogleSignInAccount account) async {
+    final consented = await _readConsent(account.id);
+    _adoptAccount(account, consented: consented);
+  }
+
+  void _adoptAccount(GoogleSignInAccount account, {required bool consented}) {
     _account = account;
     final next = BynuxUser.fromGoogle(account);
     final current = _user;
@@ -176,6 +224,7 @@ class BynuxSession extends ChangeNotifier {
       _sessionExpiresAt = null;
     }
     _user = next;
+    _consented = consented;
     _initializationError = null;
     unawaited(_persist());
     notifyListeners();
@@ -193,10 +242,22 @@ class BynuxSession extends ChangeNotifier {
       if (token == null || token.isEmpty) {
         throw StateError('لم يصل رمز التحقق من جوجل. تحقّق من إعدادات معرّف التطبيق وبصمة التوقيع.');
       }
-      // لا ننشئ جلسة خادم ولا نستدعي خدمات السحابة قبل موافقة المستخدم على
-      // سياسة الخصوصية وشروط الاستخدام. تُنشأ الجلسة بعد الموافقة من AuthGate.
-      _account = account;
-      _adoptAccount(account);
+      final alreadyConsented = await _readConsent(account.id);
+      if (alreadyConsented) {
+        // الحساب وافق مسبقًا على هذا الجهاز: ننشئ جلسة الخادم مباشرة.
+        final grant = await _mintSession(token, attempts: 2);
+        _pendingGoogleToken = null;
+        _adoptAccount(account, consented: true);
+        if (grant != null) {
+          _sessionToken = grant.token;
+          _sessionExpiresAt = grant.expiresAt;
+          await _persist();
+        }
+      } else {
+        // الحساب لم يوافق بعد: نؤجّل إنشاء جلسة الخادم وأي اتصال بالسحابة إلى ما بعد الموافقة.
+        _pendingGoogleToken = token;
+        _adoptAccount(account, consented: false);
+      }
     } catch (error) {
       _initializationError = _friendlyError(error);
       notifyListeners();
@@ -206,27 +267,14 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
-  /// ينشئ جلسة الخادم فقط بعد أن يسجل AuthGate موافقة الحساب على النصوص.
-  /// الفشل الشبكي لا يمنع الاستخدام المحلي؛ ستعيد أول عملية سحابية المحاولة عند الحاجة.
-  Future<void> activateAfterConsent() async {
-    if (_user == null || _sessionIsValid) return;
-    final google = _freshGoogleToken();
-    if (google == null) return;
-    final forUser = _user?.id;
-    final grant = await _mintSession(google, attempts: 1);
-    if (grant == null || _user?.id != forUser) return;
-    _sessionToken = grant.token;
-    _sessionExpiresAt = grant.expiresAt;
-    await _persist();
-    notifyListeners();
-  }
-
   Future<void> signOut() async {
     final token = _sessionToken;
     _user = null;
     _account = null;
     _sessionToken = null;
     _sessionExpiresAt = null;
+    _pendingGoogleToken = null;
+    _consented = false;
     _initializationError = null;
     await _persist();
     notifyListeners();
@@ -260,14 +308,14 @@ class BynuxSession extends ChangeNotifier {
     return null;
   }
 
-  /// نسخة الخلفية: تُستدعى عندما يتوفر رمز جوجل صالح في الذاكرة ولا توجد جلسة.
+  /// نسخة الخلفية: تُستدعى عندما يتوفر رمز جوجل صالح في الذاكرة ولا توجد جلسة (بعد الموافقة فقط).
   Future<void> _obtainSession(String googleToken) async {
-    if (_obtainingSession || _user == null || _sessionIsValid) return;
+    if (_obtainingSession || _user == null || !_consented || _sessionIsValid) return;
     _obtainingSession = true;
     final forUser = _user?.id;
     try {
-      final grant = await _mintSession(googleToken);
-      if (grant != null && forUser != null && _user?.id == forUser) {
+      final grant = await _mintSession(googleToken, attempts: 2);
+      if (grant != null && forUser != null && _user?.id == forUser && _consented) {
         _sessionToken = grant.token;
         _sessionExpiresAt = grant.expiresAt;
         await _persist();
@@ -304,8 +352,11 @@ class BynuxSession extends ChangeNotifier {
   }
 
   /// الرمز الذي يُرسل للخادم: رمز الجلسة المحفوظ إن كان صالحًا، وإلا رمز جوجل إن كان
-  /// ما زال في الذاكرة. لا نفتح واجهة جوجل هنا أبدًا.
+  /// ما زال في الذاكرة. لا نفتح واجهة جوجل هنا أبدًا، ولا نسمح بأي طلب قبل موافقة المستخدم.
   Future<String> authToken() async {
+    if (!hasConsented) {
+      throw const CloudApiException('يلزم الموافقة على شروط الاستخدام وسياسة الخصوصية أولاً.');
+    }
     final saved = _sessionToken;
     if (saved != null && _sessionIsValid) return saved;
     final google = _freshGoogleToken();
@@ -319,7 +370,7 @@ class BynuxSession extends ChangeNotifier {
   }
 
   String? _freshGoogleToken() {
-    final token = _account?.authentication.idToken;
+    final token = _account?.authentication.idToken ?? _pendingGoogleToken;
     return _idTokenIsFresh(token) ? token : null;
   }
 
