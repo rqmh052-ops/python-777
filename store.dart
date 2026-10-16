@@ -42,6 +42,11 @@ class DeletedScript {
   final DateTime? lastRun;
 }
 
+/// الحد الأقصى لحجم ملف السكربت (بايت): أقل بقليل من حد السيرفر (1 MiB) لتفادي أي احتكاك.
+/// يطابق bynuxMaxScriptBytes في account_cloud.dart.
+const int kMaxScriptBytes = 1000000;
+const String kTooLargeMessage = 'حجم الملف أكبر من الحد المسموح (1 ميجابايت)';
+
 class PickedPy {
   PickedPy(this.name, this.bytes);
   final String name;
@@ -112,7 +117,12 @@ Future<PickedPy?> pickPythonFile() async {
   if (!isPyName(f.name)) {
     throw const FormatException('الملف المختار ليس ملف بايثون (.py)');
   }
+  // نفحص الحجم قبل قراءة الملف كاملاً في الذاكرة
+  if (f.size > kMaxScriptBytes) throw const FormatException(kTooLargeMessage);
   final bytes = await f.readAsBytes();
+  if (bytes.length > kMaxScriptBytes) {
+    throw const FormatException(kTooLargeMessage);
+  }
   return PickedPy(f.name, bytes);
 }
 
@@ -449,16 +459,33 @@ class ScriptStore {
 
   // ───── القراءة والكتابة ─────
   Future<String> readCode(Script s) => _serial<String>(() async {
-        final bytes = await File(s.path).readAsBytes();
+        final file = File(s.path);
+        // ملف أكبر من الحد لا يُفتح في المحرر (يبقى قابلاً للتشغيل)
+        if (await file.length() > kMaxScriptBytes) {
+          throw const FormatException(kTooLargeMessage);
+        }
+        final bytes = await file.readAsBytes();
         var t = utf8.decode(bytes, allowMalformed: true);
         if (t.isNotEmpty && t.codeUnitAt(0) == 0xFEFF) t = t.substring(1);
         return t.replaceAll('\r\n', '\n');
       });
 
+  // حفظ آمن لملف السكربت فقط: نكتب في ملف مؤقت بنفس المجلد ثم نستبدل به الأصل،
+  // فإن امتلأ التخزين أو أُغلق التطبيق أثناء الكتابة يبقى الملف الأصلي سليماً.
   Future<bool> writeCode(Script s, String text) => _serial<bool>(() async {
+        final f = File(s.path);
+        final tmp = File('${s.path}.tmp');
         try {
-          final f = File(s.path);
-          await f.writeAsString(text, flush: true);
+          await tmp.writeAsString(text, flush: true);
+          try {
+            await tmp.rename(s.path);
+          } on FileSystemException {
+            // بعض أنظمة الملفات ترفض الاستبدال بالتسمية: كحل أخير نكتب مباشرة
+            await f.writeAsString(text, flush: true);
+            try {
+              await tmp.delete();
+            } catch (_) {}
+          }
           try {
             s.modified = (await f.stat()).modified;
           } catch (_) {
@@ -468,6 +495,9 @@ class ScriptStore {
           return true;
         } catch (e) {
           debugPrint('writeCode: $e');
+          try {
+            if (await tmp.exists()) await tmp.delete();
+          } catch (_) {}
           return false;
         }
       });
@@ -521,6 +551,9 @@ class ScriptStore {
   // ───── إنشاء / استيراد ─────
   Future<Script> createFromBytes(String rawName, List<int> bytes) =>
       _serial<Script>(() async {
+        if (bytes.length > kMaxScriptBytes) {
+          throw const FormatException(kTooLargeMessage);
+        }
         final f = await _createUnique(rawName, bytes);
         await _doRefresh();
         return _find(f, DateTime.now());

@@ -70,6 +70,7 @@ const String kSupportWhatsAppUrl = 'https://wa.me/201096883474';
 
 const youtubeUrl = 'https://youtube.com/channel/UC4Ox1C-_DWCbIeiWJ_6rV9Q';
 const telegramUrl = 'https://t.me/Bayan_x777';
+const appChannelUrl = 'https://t.me/Bynux_777';
 final _logo = base64Decode(kLogoBase64);
 
 // ───────── كتالوج المكتبات (التثبيت حقيقي داخل بيئة Python المشتركة) ─────────
@@ -1944,7 +1945,8 @@ class AppDrawer extends StatelessWidget {
         child: SafeArea(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 28, 16, 16),
-            child: Column(
+            child: SingleChildScrollView(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   const Padding(
@@ -1962,6 +1964,48 @@ class AppDrawer extends StatelessWidget {
                   const SizedBox(height: 4),
                   _nav(Icons.verified_user_outlined, 'فحص الصلاحيات', false,
                       onPermissions),
+                  const SizedBox(height: 24),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: _box(C.bg),
+                    child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(children: [
+                            ClipOval(
+                              child: Image.memory(_logo,
+                                  width: 52,
+                                  height: 52,
+                                  fit: BoxFit.cover,
+                                  gaplessPlayback: true),
+                            ),
+                            const SizedBox(width: 12),
+                            const Expanded(
+                              child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(kAppName,
+                                        style: TextStyle(
+                                            fontSize: 18,
+                                            fontWeight: FontWeight.w600)),
+                                    SizedBox(height: 2),
+                                    Text('قناة التحديثات',
+                                        style: TextStyle(
+                                            fontSize: 12, color: C.muted)),
+                                  ]),
+                            ),
+                          ]),
+                          const SizedBox(height: 14),
+                          OButton(
+                            label: 'تليجرام',
+                            icon: Icons.send_outlined,
+                            height: 44,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            onPressed: () => launchUrl(Uri.parse(appChannelUrl),
+                                mode: LaunchMode.externalApplication),
+                          ),
+                        ]),
+                  ),
                   const Padding(
                     padding: EdgeInsets.fromLTRB(4, 24, 4, 8),
                     child: Text('حول التطبيق',
@@ -1986,7 +2030,7 @@ class AppDrawer extends StatelessWidget {
                               child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text('Bynux',
+                                    Text('بيان',
                                         style: TextStyle(
                                             fontSize: 18,
                                             fontWeight: FontWeight.w600)),
@@ -2007,6 +2051,7 @@ class AppDrawer extends StatelessWidget {
                         ]),
                   ),
                 ]),
+            ),
           ),
         ),
       );
@@ -2183,7 +2228,6 @@ class _ConsentScreenState extends State<ConsentScreen> {
                                 ),
                               ),
                             ),
-                            const Text('·', style: TextStyle(color: C.dim, fontSize: 16)),
                             InkWell(
                               onTap: _openTerms,
                               borderRadius: BorderRadius.circular(8),
@@ -3342,53 +3386,50 @@ class _LegalDocumentView extends StatelessWidget {
               children: [
                 Header(title: title, back: true),
                 Expanded(
-                  child: SelectionArea(
-                    contextMenuBuilder: arSelectionContextMenu,
-                    child: ListView(
-                      padding: const EdgeInsets.all(16),
-                      children: [
-                        Container(
-                          margin: const EdgeInsets.only(bottom: 12),
-                          padding: const EdgeInsets.all(15),
-                          decoration: _box(C.surface, raised: true),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
+                  child: ListView(
+                    padding: const EdgeInsets.all(16),
+                    children: [
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.all(15),
+                        decoration: _box(C.surface, raised: true),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              title,
+                              style: const TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w800,
+                                color: C.text,
+                              ),
+                            ),
+                            const SizedBox(height: 5),
+                            Text(
+                              subtitle,
+                              style: const TextStyle(
+                                color: C.muted,
+                                fontSize: 12.5,
+                                height: 1.5,
+                              ),
+                            ),
+                            if (intro != null) ...[
+                              const SizedBox(height: 10),
                               Text(
-                                title,
+                                intro!,
                                 style: const TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w800,
                                   color: C.text,
+                                  fontSize: 14,
+                                  height: 1.7,
                                 ),
                               ),
-                              const SizedBox(height: 5),
-                              Text(
-                                subtitle,
-                                style: const TextStyle(
-                                  color: C.muted,
-                                  fontSize: 12.5,
-                                  height: 1.5,
-                                ),
-                              ),
-                              if (intro != null) ...[
-                                const SizedBox(height: 10),
-                                Text(
-                                  intro!,
-                                  style: const TextStyle(
-                                    color: C.text,
-                                    fontSize: 14,
-                                    height: 1.7,
-                                  ),
-                                ),
-                              ],
                             ],
-                          ),
+                          ],
                         ),
-                        for (final sec in sections) _sectionCard(sec),
-                        _contactCard(context),
-                      ],
-                    ),
+                      ),
+                      for (final sec in sections) _sectionCard(sec),
+                      _contactCard(context),
+                    ],
                   ),
                 ),
               ],
@@ -4909,6 +4950,10 @@ class _CreateScreenState extends State<CreateScreen> {
         messenger.showSnackBar(SnackBar(
             content: Text('الاسم موجود مسبقاً، تم الحفظ باسم ${s.name}')));
       }
+    } on FormatException catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      _snack(e.message);
     } catch (_) {
       if (!mounted) return;
       setState(() => _busy = false);
@@ -5325,6 +5370,7 @@ class _ScriptScreenState extends State<ScriptScreen>
   final _focus = FocusNode();
   final _undo = UndoHistoryController();
   final _scroll = ScrollController();
+  final _hScroll = ScrollController(); // تمرير أفقي للأسطر الطويلة (بدون التفاف)
   final _fieldKey = GlobalKey();
   final _viewKey = GlobalKey();
   final _searchCtl = TextEditingController();
@@ -5368,6 +5414,12 @@ class _ScriptScreenState extends State<ScriptScreen>
       setState(() => _loading = false);
       final line = widget.initialLine;
       if (line != null) jumpToLine(line, delay: const Duration(milliseconds: 380));
+    } on FormatException catch (e) {
+      // ملف أكبر من الحد المسموح: لا يُفتح في المحرر (والتشغيل يعمل كالمعتاد)
+      if (!mounted) return;
+      final m = ScaffoldMessenger.of(context);
+      Navigator.pop(context);
+      m.showSnackBar(SnackBar(content: Text(e.message)));
     } catch (_) {
       if (!mounted) return;
       final m = ScaffoldMessenger.of(context);
@@ -5437,6 +5489,7 @@ class _ScriptScreenState extends State<ScriptScreen>
     _focus.dispose();
     _undo.dispose();
     _scroll.dispose();
+    _hScroll.dispose();
     _searchCtl.dispose();
     _searchFocus.dispose();
     super.dispose();
@@ -5547,7 +5600,34 @@ class _ScriptScreenState extends State<ScriptScreen>
     return found;
   }
 
-  // يمرّر المحرر بحيث يصبح الموضع في منتصف المساحة الظاهرة (يراعي التفاف الأسطر الطويلة)
+  // عرض أطول سطر بالبكسل. الحقل يأخذ هذا العرض على الأقل فلا يلتفّ أي سطر،
+  // فيطابق كل رقم في عمود الأرقام سطراً واحداً، ويُمرَّر السطر الطويل أفقياً.
+  double _longestLineWidth(String text) {
+    var bestStart = 0, bestLen = 0, start = 0;
+    final n = text.length;
+    for (var i = 0; i <= n; i++) {
+      if (i == n || text.codeUnitAt(i) == 10) {
+        final len = i - start;
+        if (len > bestLen) {
+          bestLen = len;
+          bestStart = start;
+        }
+        start = i + 1;
+      }
+    }
+    if (bestLen == 0) return 0;
+    final tp = TextPainter(
+      text: TextSpan(
+          text: text.substring(bestStart, bestStart + bestLen), style: mono),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    )..layout();
+    final w = tp.width;
+    tp.dispose();
+    return w;
+  }
+
+  // يمرّر المحرر بحيث يصبح الموضع في منتصف المساحة الظاهرة (رأسياً وأفقياً)
   void _scrollToOffset(int offset) {
     try {
       final editable = _findEditable();
@@ -5567,6 +5647,17 @@ class _ScriptScreenState extends State<ScriptScreen>
         duration: const Duration(milliseconds: 320),
         curve: Curves.easeOutCubic,
       ));
+      if (_hScroll.hasClients) {
+        final hp = _hScroll.position;
+        final targetX = (caret.center.dx - hp.viewportDimension / 2)
+            .clamp(hp.minScrollExtent, hp.maxScrollExtent)
+            .toDouble();
+        unawaited(_hScroll.animateTo(
+          targetX,
+          duration: const Duration(milliseconds: 320),
+          curve: Curves.easeOutCubic,
+        ));
+      }
     } catch (_) {
       // التمرير تحسين فقط؛ لا نكسر المحرر إن تعذّر حسابه
     }
@@ -5797,21 +5888,38 @@ class _ScriptScreenState extends State<ScriptScreen>
                 ),
                 const SizedBox(width: 14),
                 Expanded(
-                  child: TextField(
-                    key: _fieldKey,
-                    contextMenuBuilder: arContextMenu,
-                    controller: _code,
-                    focusNode: _focus,
-                    undoController: _undo,
-                    inputFormatters: const [PyEditFormatter()],
-                    maxLines: null,
-                    keyboardType: TextInputType.multiline,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    cursorColor: C.accent,
-                    onTapOutside: (_) {},
-                    style: mono,
-                    decoration: const InputDecoration.collapsed(hintText: null),
+                  child: LayoutBuilder(
+                    builder: (context, box) => ListenableBuilder(
+                      listenable: _code,
+                      builder: (_, __) {
+                        final need = _longestLineWidth(_code.text) + 48;
+                        final width = need > box.maxWidth ? need : box.maxWidth;
+                        return SingleChildScrollView(
+                          controller: _hScroll,
+                          scrollDirection: Axis.horizontal,
+                          child: SizedBox(
+                            width: width,
+                            child: TextField(
+                              key: _fieldKey,
+                              contextMenuBuilder: arContextMenu,
+                              controller: _code,
+                              focusNode: _focus,
+                              undoController: _undo,
+                              inputFormatters: const [PyEditFormatter()],
+                              maxLines: null,
+                              keyboardType: TextInputType.multiline,
+                              autocorrect: false,
+                              enableSuggestions: false,
+                              cursorColor: C.accent,
+                              onTapOutside: (_) {},
+                              style: mono,
+                              decoration: const InputDecoration.collapsed(
+                                  hintText: null),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
                   ),
                 ),
               ]),

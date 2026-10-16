@@ -11,7 +11,12 @@ const String bynuxGoogleWebClientId =
     '501306408801-thefnjkh78jm27nr3q4h0i6ose0vpehg.apps.googleusercontent.com';
 const String bynuxCloudApiBase =
     'https://bayan-storage-api.aaro3498.workers.dev';
-const int bynuxMaxScriptBytes = 1024 * 1024;
+/// حد حجم السكربت في التطبيق (بايت): أقل بقليل من حد السيرفر (1 MiB) لتفادي أي احتكاك.
+/// يطابق kMaxScriptBytes في store.dart.
+const int bynuxMaxScriptBytes = 1000000;
+
+/// حد السيرفر الفعلي (MAX_FILE_BYTES في worker.js). يُستعمل لفحص ما يُنزَّل من السحابة فقط.
+const int bynuxServerMaxBytes = 1024 * 1024;
 
 /// رقم إصدار نصوص سياسة الخصوصية وشروط الاستخدام.
 /// تغيير هذا الثابت مستقبلاً يعيد طلب الموافقة تلقائياً لكل الحسابات على الجهاز.
@@ -600,6 +605,9 @@ class BynuxCloudApi {
         name.contains('\\')) {
       throw const CloudApiException('اسم السكربت غير صالح للنسخ السحابي.');
     }
+    if (await file.length() > bynuxMaxScriptBytes) {
+      throw const CloudApiException('حجم السكربت أكبر من الحد المسموح وهو 1 ميجابايت.');
+    }
     final bytes = await file.readAsBytes();
     if (bytes.length > bynuxMaxScriptBytes) {
       throw const CloudApiException('حجم السكربت أكبر من الحد المسموح وهو 1 ميجابايت.');
@@ -650,7 +658,7 @@ class BynuxCloudApi {
     final bytes = <int>[];
     await for (final chunk in response) {
       bytes.addAll(chunk);
-      if (bytes.length > bynuxMaxScriptBytes) {
+      if (bytes.length > bynuxServerMaxBytes) {
         throw const CloudApiException('حجم الملف المستلم تجاوز الحد الآمن.');
       }
     }
