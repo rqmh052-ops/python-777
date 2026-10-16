@@ -117,8 +117,6 @@ Future<PickedPy?> pickPythonFile() async {
   if (!isPyName(f.name)) {
     throw const FormatException('الملف المختار ليس ملف بايثون (.py)');
   }
-  // نفحص الحجم قبل قراءة الملف كاملاً في الذاكرة
-  if (f.size > kMaxScriptBytes) throw const FormatException(kTooLargeMessage);
   final bytes = await f.readAsBytes();
   if (bytes.length > kMaxScriptBytes) {
     throw const FormatException(kTooLargeMessage);
