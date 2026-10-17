@@ -266,9 +266,6 @@ class BynuxSession extends ChangeNotifier {
   String? _sessionToken;
   DateTime? _sessionExpiresAt;
   String? _pendingGoogleToken;
-  Timer? _readyFailsafe;
-  Future<void>? _restoreFuture;
-  Future<String?>? _refreshFuture;
   bool _consented = false;
   bool _signedOut = false;
   bool _googleReady = false;
@@ -308,19 +305,9 @@ class BynuxSession extends ChangeNotifier {
         signedOut: _signedOut,
       ));
 
-  void _finishReady() {
-    _readyFailsafe?.cancel();
-    _readyFailsafe = null;
-    if (_ready) return;
-    _ready = true;
-    notifyListeners();
-  }
-
-  /// يقرأ الحالة المحفوظة (بدون شبكة) من المكانين ويدمجهما. يُستدعى قبل runApp.
-  /// - حساب محفوظ: الرئيسية (أو الموافقة) من أول إطار.
-  /// - خروج صريح سابق: شاشة الدخول مباشرة.
-  /// - لا شيء محفوظ: تبقى شاشة انتظار قصيرة حتى تنتهي الاستعادة الهادئة من جوجل
-  ///   (نفس سلوك النسخة القديمة التي كانت تعمل على هاتفك)، بسقف 10 ثوانٍ.
+  /// يقرأ الحالة المحفوظة (بدون شبكة) من المكانين ويدمجهما. يُستدعى قبل runApp،
+  /// فتظهر من أول إطار: الرئيسية (أو الموافقة) إن كان هناك حساب محفوظ، وإلا شاشة الدخول
+  /// مباشرة، بلا دوران انتظار وبلا أي نافذة جوجل تظهر وحدها.
   Future<void> loadSaved() async {
     if (_ready) return;
     try {
@@ -343,12 +330,8 @@ class BynuxSession extends ChangeNotifier {
       _sessionExpiresAt = null;
       _consented = false;
     }
-    if (_user != null || _signedOut) {
-      _ready = true;
-      notifyListeners();
-    } else {
-      _readyFailsafe = Timer(const Duration(seconds: 10), _finishReady);
-    }
+    _ready = true;
+    notifyListeners();
   }
 
   /// يحفظ موافقة الحساب الحالي على المكانين ويستكمل إنشاء جلسة الخادم المؤجّلة.
@@ -365,7 +348,9 @@ class BynuxSession extends ChangeNotifier {
     final pendingToken = _pendingGoogleToken ?? _freshGoogleToken();
     _pendingGoogleToken = null;
     if (!_sessionIsValid && pendingToken != null) {
-      unawaited(_obtainSession(pendingToken));
+      // الجلسة الطويلة هي ما يمنع طلب الدخول لاحقًا، فنحاول إنشاءها هنا بإصرار.
+      await _obtainSession(pendingToken, attempts: 3)
+          .timeout(const Duration(seconds: 15), onTimeout: () {});
     }
   }
 
@@ -399,79 +384,13 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
-  /// الاستعادة الهادئة من جوجل عند فتح التطبيق (هذا ما كان يحفظ الدخول في النسخة القديمة).
-  /// تعمل في الخلفية مع إعادة محاولة وصبر أطول، وإذا نجحت بعد ظهور شاشة الدخول
-  /// تنتقل الشاشة تلقائيًا للرئيسية (أو الموافقة). تُنفَّذ مرة واحدة لكل تشغيل.
-  Future<void> restoreInBackground() => _restoreFuture ??= _restoreOnce();
-
-  Future<void> _restoreOnce() async {
-    try {
-      if (_signedOut) return;
-      await initialize();
-      if (!_googleReady) return;
-      final account = await _silentRestore(attempts: 3);
-      if (account != null && !_signedOut && !_signingIn) {
-        await _adoptAccount(account);
-      }
-    } catch (error) {
-      debugPrint('restoreInBackground failed: $error');
-    } finally {
-      _finishReady();
-    }
-  }
-
-  /// محاولة استعادة هادئة من جوجل. null = لا حساب سابق أو فشلت كل المحاولات.
-  /// المهلة لكل محاولة طويلة نسبيًا: الاستعادة قد تتأخر على بعض الأجهزة، وهذا كان
-  /// سبب فشلها سابقًا حين كانت مهلتها 8 ثوانٍ.
-  Future<GoogleSignInAccount?> _silentRestore({required int attempts}) async {
-    var emptyAnswers = 0;
-    for (var i = 0; i < attempts; i++) {
-      try {
-        final attempt = _google.attemptLightweightAuthentication();
-        if (attempt == null) return null; // المنصة لا تدعمها.
-        final account = await attempt.timeout(const Duration(seconds: 25));
-        if (account != null) return account;
-        // جواب فارغ مرتين = لا يوجد حساب سابق فعلًا (أول تثبيت): لا داعي لإبطاء شاشة الدخول.
-        if (++emptyAnswers >= 2) return null;
-      } on TimeoutException {
-        // سنعيد المحاولة؛ وإن اكتملت المحاولة المتأخرة يلتقطها مستمع الأحداث.
-      } catch (error) {
-        debugPrint('silent restore attempt ${i + 1} failed: $error');
-      }
-      if (i + 1 < attempts) {
-        await Future<void>.delayed(Duration(milliseconds: 1500 * (i + 1)));
-      }
-    }
-    return null;
-  }
-
-  /// رمز جوجل جديد بدون أي واجهة: يُستعمل عندما ينتهي رمز جوجل في الذاكرة ولا توجد جلسة صالحة.
-  Future<String?> _refreshGoogleSilently() {
-    final running = _refreshFuture;
-    if (running != null) return running;
-    final next = _doRefreshGoogle().whenComplete(() => _refreshFuture = null);
-    _refreshFuture = next;
-    return next;
-  }
-
-  Future<String?> _doRefreshGoogle() async {
-    if (_signedOut) return null;
-    try {
-      await initialize();
-      if (!_googleReady) return null;
-      final account = await _silentRestore(attempts: 2);
-      if (account == null) return null;
-      _account = account;
-      final token = account.authentication.idToken;
-      return _idTokenIsFresh(token) ? token : null;
-    } catch (error) {
-      debugPrint('silent refresh failed: $error');
-      return null;
-    }
-  }
+  /// لا استعادة هادئة من جوجل إطلاقًا: كانت تُظهر نافذة «حسابات محددة» وحدها وتؤخر الفتح.
+  /// الحساب يُحفظ محليًا، وصلاحية السحابة يحفظها رمز جلسة الخادم (180 يومًا).
+  /// الدالة تبقى لأن الشاشة تستدعيها؛ تجهّز مكتبة جوجل فقط ليكون زر الدخول سريعًا.
+  Future<void> restoreInBackground() => initialize();
 
   /// يعتمد حسابًا جاء من جوجل (استعادة هادئة أو حدث) ويحفظه على المكانين.
-  Future<void> _adoptAccount(GoogleSignInAccount account) async {
+  Future<void> _adoptAccount(GoogleSignInAccount account, {bool mint = true}) async {
     _account = account;
     final next = BynuxUser.fromGoogle(account);
     final current = _user;
@@ -490,11 +409,9 @@ class BynuxSession extends ChangeNotifier {
     _consented = _isConsentedFor(next.id, next.email);
     _initializationError = null;
     _ready = true;
-    _readyFailsafe?.cancel();
-    _readyFailsafe = null;
     notifyListeners();
     await _persist();
-    if (_consented && !_sessionIsValid) {
+    if (mint && _consented && !_sessionIsValid) {
       final google = _freshGoogleToken();
       if (google != null) unawaited(_obtainSession(google));
     }
@@ -518,7 +435,7 @@ class BynuxSession extends ChangeNotifier {
         // الحساب وافق مسبقًا على هذا الجهاز: ننشئ جلسة الخادم مباشرة.
         final grant = await _mintSession(token, attempts: 2);
         _pendingGoogleToken = null;
-        await _adoptAccount(account);
+        await _adoptAccount(account, mint: false);
         if (grant != null) {
           _sessionToken = grant.token;
           _sessionExpiresAt = grant.expiresAt;
@@ -527,7 +444,7 @@ class BynuxSession extends ChangeNotifier {
       } else {
         // الحساب لم يوافق بعد: نؤجّل إنشاء جلسة الخادم وأي اتصال بالسحابة إلى ما بعد الموافقة.
         _pendingGoogleToken = token;
-        await _adoptAccount(account);
+        await _adoptAccount(account, mint: false);
       }
     } catch (error) {
       _initializationError = _friendlyError(error);
@@ -580,20 +497,32 @@ class BynuxSession extends ChangeNotifier {
     return null;
   }
 
-  /// نسخة الخلفية: تُستدعى عندما يتوفر رمز جوجل صالح في الذاكرة ولا توجد جلسة (بعد الموافقة فقط).
-  Future<void> _obtainSession(String googleToken) async {
+  /// يطلب جلسة الخادم الطويلة ويحفظها (بعد الموافقة فقط). إن فشل الاتصال والرمز ما زال
+  /// صالحًا نعيد المحاولة بعد 30 ثانية حتى 3 مرات، فلا تضيع الجلسة بسبب انقطاع عابر.
+  Future<void> _obtainSession(String googleToken,
+      {int attempts = 2, int retriesLeft = 3}) async {
     if (_obtainingSession || _user == null || !_consented || _sessionIsValid) return;
     _obtainingSession = true;
     final forUser = _user?.id;
+    var granted = false;
     try {
-      final grant = await _mintSession(googleToken, attempts: 2);
+      final grant = await _mintSession(googleToken, attempts: attempts);
       if (grant != null && forUser != null && _user?.id == forUser && _consented) {
         _sessionToken = grant.token;
         _sessionExpiresAt = grant.expiresAt;
+        granted = true;
         await _persist();
       }
     } finally {
       _obtainingSession = false;
+    }
+    if (!granted && retriesLeft > 0 && !_sessionUnsupported) {
+      Timer(const Duration(seconds: 30), () {
+        final token = _freshGoogleToken();
+        if (token != null && _user?.id == forUser) {
+          unawaited(_obtainSession(token, retriesLeft: retriesLeft - 1));
+        }
+      });
     }
   }
 
@@ -623,17 +552,15 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
-  /// الرمز الذي يُرسل للخادم، بالترتيب: رمز الجلسة المحفوظ إن كان صالحًا، ثم رمز جوجل
-  /// الحاضر في الذاكرة، ثم رمز جديد من استعادة جوجل الهادئة. لا نفتح واجهة جوجل هنا أبدًا،
-  /// ولا نسمح بأي طلب قبل موافقة المستخدم.
+  /// الرمز الذي يُرسل للخادم: رمز الجلسة المحفوظ إن كان صالحًا، وإلا رمز جوجل إن كان
+  /// ما زال في الذاكرة. لا نفتح واجهة جوجل هنا أبدًا، ولا نسمح بأي طلب قبل موافقة المستخدم.
   Future<String> authToken() async {
     if (!hasConsented) {
       throw const CloudApiException('يلزم الموافقة على شروط الاستخدام وسياسة الخصوصية أولاً.');
     }
     final saved = _sessionToken;
     if (saved != null && _sessionIsValid) return saved;
-    var google = _freshGoogleToken();
-    google ??= await _refreshGoogleSilently();
+    final google = _freshGoogleToken();
     if (google != null) {
       unawaited(_obtainSession(google));
       return google;
@@ -664,7 +591,6 @@ class BynuxSession extends ChangeNotifier {
 
   @override
   void dispose() {
-    _readyFailsafe?.cancel();
     _events?.cancel();
     super.dispose();
   }
