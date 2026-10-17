@@ -72,6 +72,7 @@ const youtubeUrl = 'https://youtube.com/channel/UC4Ox1C-_DWCbIeiWJ_6rV9Q';
 const telegramUrl = 'https://t.me/Bayan_x777';
 const appChannelUrl = 'https://t.me/Bynux_777';
 final _logo = base64Decode(kLogoBase64);
+final _appLogo = base64Decode(kAppLogoBase64);
 
 // ───────── كتالوج المكتبات (التثبيت حقيقي داخل بيئة Python المشتركة) ─────────
 class Lib {
@@ -1973,7 +1974,7 @@ class AppDrawer extends StatelessWidget {
                         children: [
                           Row(children: [
                             ClipOval(
-                              child: Image.memory(_logo,
+                              child: Image.memory(_appLogo,
                                   width: 52,
                                   height: 52,
                                   fit: BoxFit.cover,
