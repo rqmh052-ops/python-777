@@ -13,6 +13,7 @@ import ast
 import hashlib
 import importlib.util
 import json
+import math
 import re
 import sys
 import tempfile
@@ -1046,12 +1047,26 @@ def test_launcher_icon_installed_without_white_background() -> None:
                 assert b > 150 and r < 120, (density, x, (r, g, b, a))
         fg = Image.open(res / "drawable-nodpi" / "ic_launcher_foreground.png").convert("RGBA")
         assert fg.size == (432, 432) and fg.getpixel((0, 0))[3] == 0
-        # the tile sits inside the 66dp safe zone: 72..360 of 432px
-        xs = [x for x in range(432) if fg.getpixel((x, 216))[3] > 0]
-        assert min(xs) >= 70 and max(xs) <= 362, (min(xs), max(xs))
+        # the lettering alone (no badge frame) sits inside the 66dp safe circle (radius 33dp = 132px),
+        # so no launcher mask (circle / squircle / square) can ever clip it
+        opaque = [(x, y) for y in range(0, 432, 2) for x in range(0, 432, 2) if fg.getpixel((x, y))[3] > 8]
+        assert opaque, "foreground is not empty"
+        assert max(math.hypot(x - 216, y - 216) for x, y in opaque) <= 132, "inside the safe circle"
+        solid = [fg.getpixel(p) for p in opaque if fg.getpixel(p)[3] > 200]
+        assert solid and all(min(px[:3]) > 150 for px in solid), "white lettering only: no blue frame"
+        # the background layer is a full-bleed opaque square (the launcher shapes it, we do not)
+        bg = Image.open(res / "drawable-nodpi" / "ic_launcher_bg.png").convert("RGBA")
+        assert bg.size == (432, 432)
+        assert all(bg.getpixel(p)[3] == 255 for p in ((0, 0), (431, 0), (0, 431), (431, 431), (216, 216)))
+        # themed icons (Android 13+) use the monochrome layer
+        mono = Image.open(res / "drawable-nodpi" / "ic_launcher_monochrome.png").convert("RGBA")
+        assert mono.size == (432, 432) and mono.getpixel((0, 0))[3] == 0
+        assert mono.getchannel("A").tobytes() == fg.getchannel("A").tobytes()
         adaptive_xml = (res / "mipmap-anydpi-v26" / "ic_launcher.xml").read_text(encoding="utf-8")
         assert minidom.parseString(adaptive_xml.encode("utf-8")).documentElement.tagName == "adaptive-icon"
         assert "@drawable/ic_launcher_foreground" in adaptive_xml
+        assert "@drawable/ic_launcher_bg" in adaptive_xml
+        assert "<monochrome" in adaptive_xml and "@drawable/ic_launcher_monochrome" in adaptive_xml
         color = minidom.parse(str(res / "values" / "ic_launcher_background.xml"))
         assert re.fullmatch(r"#[0-9A-F]{6}", color.getElementsByTagName("color")[0].firstChild.data)
 

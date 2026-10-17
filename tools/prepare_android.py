@@ -475,6 +475,7 @@ ICON_SOURCE = ROOT / "icon.png"
 LEGACY_ICON_SIZES = (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192))
 ADAPTIVE_CANVAS = 432  # 108dp عند xxxhdpi
 ADAPTIVE_TILE = 288  # 72dp = النافذة المرئية للأيقونة التكيفية
+ADAPTIVE_SAFE_RADIUS = 33 * 4  # دائرة المنطقة الآمنة 66dp: لا يقصّها أي قناع من أي شركة مصنّعة
 
 
 def _remove_backdrop(rgb):
@@ -545,6 +546,120 @@ def _adaptive_background(master) -> str:
     return "#%02X%02X%02X" % (r, g, b)
 
 
+def _glyph_alpha(master):
+    """يستخرج الكتابة البيضاء (بدون الإطار والخلفية) كقناع شفافية 0..1، أو None إن لم يوجد محتوى كافٍ."""
+    import numpy as np
+    from scipy import ndimage as ndi
+
+    arr = np.array(master).astype(np.float32)
+    white = arr[..., :3].min(axis=2)
+    alpha = np.clip((white - 130.0) / 70.0, 0.0, 1.0) * (arr[..., 3] / 255.0)
+    solid = alpha > 0.5
+    lab, n = ndi.label(solid)
+    if n == 0:
+        return None
+    sizes = ndi.sum(solid, lab, range(1, n + 1))
+    keep_ids = [i + 1 for i, size in enumerate(sizes) if size >= 0.0001 * solid.size]
+    if not keep_ids:
+        return None
+    keep = ndi.binary_dilation(np.isin(lab, keep_ids), iterations=3)
+    alpha = alpha * keep
+    if (alpha > 0.5).mean() < 0.01:
+        return None
+    return alpha
+
+
+def _enclosing_circle(alpha):
+    """أصغر دائرة (تقريبًا) تحيط بكل بكسلات الكتابة: (مركز x, مركز y), نصف القطر."""
+    import numpy as np
+
+    ys, xs = np.nonzero(alpha > 0.5)
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    try:
+        from scipy.spatial import ConvexHull
+
+        pts = pts[ConvexHull(pts).vertices]
+    except Exception:
+        pass
+    centre = pts.mean(axis=0)
+    for i in range(1, 2001):
+        far = pts[int(np.linalg.norm(pts - centre, axis=1).argmax())]
+        centre = centre + (far - centre) / (i + 1)
+    return centre, float(np.linalg.norm(pts - centre, axis=1).max())
+
+
+def _adaptive_background_layer(master, glyph):
+    """طبقة خلفية ممتلئة بالكامل (بدون شفافية) بتدرج لوني رأسي مأخوذ من ألوان الأيقونة نفسها."""
+    import numpy as np
+    from PIL import Image
+    from scipy import ndimage as ndi
+
+    arr = np.array(master).astype(np.float32)
+    side = arr.shape[0]
+    solid = arr[..., 3] > 250
+    inter = ndi.binary_erosion(solid, iterations=max(2, int(side * 0.09)))
+    if glyph is not None:
+        inter &= ~ndi.binary_dilation(glyph > 0.05, iterations=max(3, int(side * 0.014)))
+    stops: list[tuple[float, np.ndarray]] = []
+    bands = 10
+    for i in range(bands):
+        y0, y1 = int(i * side / bands), int((i + 1) * side / bands)
+        m = inter[y0:y1]
+        if m.sum() >= 0.01 * side * side / bands * 10:
+            stops.append(((i + 0.5) / bands, arr[y0:y1, :, :3][m].mean(axis=0)))
+    if len(stops) < 3:
+        r, g, b = (int(v) for v in ImageColor_getrgb(_adaptive_background(master)))
+        return Image.new("RGBA", (ADAPTIVE_CANVAS, ADAPTIVE_CANVAS), (r, g, b, 255))
+    ts = np.array([t for t, _ in stops])
+    cols = np.array([c for _, c in stops])
+    # النافذة المرئية للأيقونة هي 72dp من 108dp (من 1/6 إلى 5/6 من اللوحة)
+    rows = (np.arange(ADAPTIVE_CANVAS) / (ADAPTIVE_CANVAS - 1) - 1 / 6) / (4 / 6)
+    ramp = np.stack([np.interp(rows, ts, cols[:, ch]) for ch in range(3)], axis=1)
+    ramp = ndi.gaussian_filter1d(ramp, 6, axis=0, mode="nearest")
+    img = np.repeat(ramp[:, None, :], ADAPTIVE_CANVAS, axis=1)
+    img = np.dstack([img.round().clip(0, 255).astype(np.uint8), np.full((ADAPTIVE_CANVAS, ADAPTIVE_CANVAS), 255, np.uint8)])
+    return Image.fromarray(img, "RGBA")
+
+
+def ImageColor_getrgb(value: str):
+    from PIL import ImageColor
+
+    return ImageColor.getrgb(value)
+
+
+def build_adaptive_layers(master):
+    """يبني طبقات الأيقونة التكيفية (432×432): (أمامية, أحادية اللون, خلفية).
+
+    الأمامية: الكتابة وحدها بدون إطار الأيقونة، داخل دائرة المنطقة الآمنة (66dp)، فلا يقصّها أي قناع.
+    الخلفية: ممتلئة بالكامل بلا شفافية ولا شكل مرسوم، والقناع يضعه الجهاز حسب شركته.
+    الأحادية: نفس الكتابة بقناع شفافيتها فقط، لأيقونات أندرويد 13+ المتناغمة مع الخلفية.
+    إن تعذّر استخراج الكتابة (أيقونة بلا كتابة بيضاء) تُستعمل الصورة كاملة كما في الطريقة القديمة.
+    """
+    import numpy as np
+    from PIL import Image
+
+    canvas = ADAPTIVE_CANVAS
+    glyph = _glyph_alpha(master)
+    fg = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    if glyph is None:
+        tile = master.resize((ADAPTIVE_TILE, ADAPTIVE_TILE), Image.LANCZOS)
+        fg.paste(tile, ((canvas - ADAPTIVE_TILE) // 2, (canvas - ADAPTIVE_TILE) // 2))
+    else:
+        centre, radius = _enclosing_circle(glyph)
+        scale = (ADAPTIVE_SAFE_RADIUS * 0.97) / radius
+        rgb = np.array(master)[..., :3]
+        layer = Image.fromarray(np.dstack([rgb, (glyph * 255).round().astype(np.uint8)]), "RGBA")
+        size = max(1, int(round(layer.width * scale)))
+        layer = layer.resize((size, size), Image.LANCZOS)
+        ox = int(round(canvas / 2 - centre[0] * scale))
+        oy = int(round(canvas / 2 - centre[1] * scale))
+        fg.paste(layer, (ox, oy))
+    mono = Image.new("RGBA", (canvas, canvas), (255, 255, 255, 0))
+    mono.putalpha(fg.getchannel("A"))
+    bg = _adaptive_background_layer(master, glyph)
+    return fg, mono, bg
+
+
 def install_launcher_icons(res_dir: Path | None = None, source: Path | None = None) -> list[str]:
     """يولّد أيقونة التطبيق من icon.png داخل مشروع أندرويد المولَّد (بدون أي ملفات جاهزة).
 
@@ -580,17 +695,17 @@ def install_launcher_icons(res_dir: Path | None = None, source: Path | None = No
 
     for density, px in LEGACY_ICON_SIZES:
         write(f"mipmap-{density}/ic_launcher.png", image=master.resize((px, px), Image.LANCZOS))
-    canvas = Image.new("RGBA", (ADAPTIVE_CANVAS, ADAPTIVE_CANVAS), (0, 0, 0, 0))
-    tile = master.resize((ADAPTIVE_TILE, ADAPTIVE_TILE), Image.LANCZOS)
-    offset = (ADAPTIVE_CANVAS - ADAPTIVE_TILE) // 2
-    canvas.paste(tile, (offset, offset), tile)
-    write("drawable-nodpi/ic_launcher_foreground.png", image=canvas)
+    fg, mono, bg = build_adaptive_layers(master)
+    write("drawable-nodpi/ic_launcher_foreground.png", image=fg)
+    write("drawable-nodpi/ic_launcher_monochrome.png", image=mono)
+    write("drawable-nodpi/ic_launcher_bg.png", image=bg.convert("RGB"))
     write(
         "mipmap-anydpi-v26/ic_launcher.xml",
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
-        '    <background android:drawable="@color/ic_launcher_background"/>\n'
+        '    <background android:drawable="@drawable/ic_launcher_bg"/>\n'
         '    <foreground android:drawable="@drawable/ic_launcher_foreground"/>\n'
+        '    <monochrome android:drawable="@drawable/ic_launcher_monochrome"/>\n'
         "</adaptive-icon>\n",
     )
     write(
