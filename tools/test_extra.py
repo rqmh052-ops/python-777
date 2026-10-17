@@ -1405,7 +1405,9 @@ def test_plan_2_2g_editor_button_and_run_gate() -> None:
     assert "attachRunId: session.runId" in open_output and "claimRunSlot(context, widget.script)" in open_output
     assert "_canEnter ? 'دخول' : 'تشغيل'" in editor
     gate = _dart_block(main_dart, "Future<bool> claimRunSlot(")
-    assert "إيقاف النسخة القديمة وتشغيل الجديدة؟" in gate and "سكربت آخر يعمل" in gate
+    # عدة سكربتات معًا: لا نافذة «سكربت آخر يعمل» ولا إيقاف لسكربتات أخرى؛ فقط النسخة القديمة من نفس السكربت والحد الأقصى
+    assert "إيقاف النسخة القديمة وتشغيل الجديدة؟" in gate and "سكربت آخر يعمل" not in gate
+    assert "runSlot.occupantOf(script.path)" in gate and "runSlot.isFull" in gate
     assert "confirmOwnOldRun" in gate
     restart = _dart_block(main_dart, "Future<void> _restart()")
     assert "confirmOwnOldRun: false" in restart, "the restart button already is the user's decision to stop"
@@ -1655,6 +1657,162 @@ def test_plan_2d_log_screen_and_lifecycle_wiring() -> None:
     assert "SelectionArea(" in main and "arSelectionContextMenu" in main
     assert "appendOutputEventLines(_lines, text, kind)" in main
     assert "_copyLimit = 400000" in main and "maxBytes: 1024 * 1024" in main
+
+
+def test_concurrent_scripts_are_isolated() -> None:
+    """Several scripts at once: own output, own input, own Stop button, own threads."""
+    import sys as _sys
+
+    original_stdout = _sys.stdout
+    with tempfile.TemporaryDirectory(prefix="bayan-conc-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        sources = {
+            "a.py": (
+                "import sys, threading, time\n"
+                "print('A-start', sys.argv[0].endswith('a.py'))\n"
+                "def w():\n    time.sleep(0.2)\n    print('A-thread')\n"
+                "t = threading.Thread(target=w)\nt.start()\n"
+                "name = input('A?')\nprint('A-got', name)\n"
+            ),
+            "b.py": (
+                "import sys, time\n"
+                "print('B-start', sys.argv[0].endswith('b.py'))\n"
+                "while True:\n    print('B-tick')\n    time.sleep(0.05)\n"
+            ),
+            "c.py": "import sys\nprint('C-err', file=sys.stderr)\nraise SystemExit(3)\n",
+            "d.py": "import time\nwhile True:\n    pass\n",
+        }
+        cbs = {k: RunCb(["zed"] if k == "a.py" else None) for k in sources}
+        for k, v in sources.items():
+            (root / k).write_text(v, encoding="utf-8")
+        results: dict = {}
+
+        def go(name: str) -> None:
+            results[name] = mod.run_script(str(root / name), cbs[name])
+
+        threads = {k: threading.Thread(target=go, args=(k,), name=f"Bayan-Python-{k}") for k in sources}
+        for t in threads.values():
+            t.start()
+        time.sleep(0.5)
+        assert mod.active_run_count() >= 2, "b.py and d.py must still be running together"
+        # Stop ONE script: the other keeps running
+        cbs["b.py"].stop = True
+        time.sleep(0.4)
+        assert not threads["b.py"].is_alive() and threads["d.py"].is_alive(), "stopping b must not stop d"
+        cbs["d.py"].stop = True
+        for t in threads.values():
+            t.join(8)
+            assert not t.is_alive(), "script did not finish"
+
+        def text(name: str, kind: str | None = None) -> str:
+            return "".join(t for k, t in cbs[name].out if kind is None or k == kind)
+
+        assert results == {"a.py": 0, "b.py": 130, "c.py": 3, "d.py": 130}, results
+        # nothing leaked into another script's console
+        assert "A-start True" in text("a.py") and "A-thread" in text("a.py") and "A-got zed" in text("a.py")
+        assert "B-" not in text("a.py") and "A-" not in text("b.py") and "A-" not in text("c.py")
+        assert text("b.py").startswith("B-start True") and text("b.py").count("B-tick") >= 3
+        assert text("c.py", "stderr") == "C-err\n" and text("c.py", "stdout") == ""
+        assert ("input", "A?") in cbs["a.py"].events and not any(e[0] == "input" for e in cbs["b.py"].events)
+        # everything is restored once the last script ended
+        assert mod.active_run_count() == 0
+        assert _sys.stdout is original_stdout
+        assert getattr(mod.time.sleep, "__name__", "") != "bayan_sleep"
+        assert mod.threading.Thread.start.__name__ == "start"
+        assert _sys.argv[0] not in {str(root / n) for n in sources}
+
+
+def test_threads_of_one_script_do_not_block_another() -> None:
+    """A script that waits for its own non-daemon thread must not wait for another script's threads."""
+    with tempfile.TemporaryDirectory(prefix="bayan-conc2-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        (root / "slow.py").write_text(
+            "import threading, time\n"
+            "threading.Thread(target=lambda: time.sleep(1.5)).start()\n"
+            "print('slow-main-done')\n",
+            encoding="utf-8",
+        )
+        (root / "fast.py").write_text(
+            "import threading, time\n"
+            "t = threading.Thread(target=lambda: print('fast-thread'))\nt.start()\nt.join()\n",
+            encoding="utf-8",
+        )
+        slow_cb, fast_cb = RunCb(), RunCb()
+        times: dict = {}
+
+        def go(name: str, cb: "RunCb") -> None:
+            started = time.monotonic()
+            mod.run_script(str(root / name), cb)
+            times[name] = time.monotonic() - started
+
+        a = threading.Thread(target=go, args=("slow.py", slow_cb))
+        b = threading.Thread(target=go, args=("fast.py", fast_cb))
+        a.start()
+        time.sleep(0.1)
+        b.start()
+        b.join(6)
+        a.join(6)
+        assert times["fast.py"] < 1.0, times
+        assert times["slow.py"] >= 1.4, times
+        assert "fast-thread" in "".join(t for _, t in fast_cb.out)
+        assert "fast-thread" not in "".join(t for _, t in slow_cb.out)
+
+
+def test_many_scripts_share_cwd_and_path_cleanly() -> None:
+    import os as _os
+
+    with tempfile.TemporaryDirectory(prefix="bayan-conc3-") as td:
+        root = Path(td)
+        mod.configure(str(root / "env"))
+        before_cwd, before_path = _os.getcwd(), list(sys.path)
+        names = [f"s{i}.py" for i in range(6)]
+        for n in names:
+            (root / n).write_text("import time\nfor _ in range(4):\n    print(__file__.split('/')[-1])\n    time.sleep(0.05)\n", encoding="utf-8")
+        cbs = {n: RunCb() for n in names}
+        ts = [threading.Thread(target=mod.run_script, args=(str(root / n), cbs[n])) for n in names]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(8)
+            assert not t.is_alive()
+        for n in names:
+            out = "".join(t for _, t in cbs[n].out)
+            assert out == (n + "\n") * 4, (n, out)
+        assert _os.getcwd() == before_cwd and sys.path == before_path
+
+
+def test_concurrent_runs_kotlin_and_dart_wiring() -> None:
+    kt = KOTLIN.read_text(encoding="utf-8")
+    runner = (ROOT / "script_runner.dart").read_text(encoding="utf-8")
+    main_dart = (ROOT / "main.dart").read_text(encoding="utf-8")
+    # Kotlin: خيط لكل سكربت، والحد الأقصى يطابق Dart، ولا رفض لسكربت لأن غيره يعمل
+    assert "newCachedThreadPool" in kt and "newSingleThreadExecutor { runnable ->\n        Thread(runnable, \"Bayan-Python\")" not in kt
+    kt_max = int(re.search(r"const val MAX_CONCURRENT_RUNS = (\d+)", kt).group(1))
+    dart_max = int(re.search(r"static const int maxConcurrent = (\d+);", runner).group(1))
+    assert kt_max == dart_max == 10
+    run_branch = kt[kt.index('"run" -> {') : kt.index('"sendInput" -> {')]
+    assert "firstOrNull { !it.finished }" not in run_branch, "the old 'any live script blocks a new one' gate is gone"
+    assert "it.scriptPath == scriptPath" in run_branch and "MAX_CONCURRENT_RUNS" in run_branch
+    # مكتبات: لا تثبيت أثناء سكربت ولا سكربت أثناء تثبيت (كان ينتظر الخيط الواحد)
+    assert "packageJobs > 0" in run_branch and kt.count("packageJobs += 1") == 2 and kt.count("packageJobs -= 1") == 2
+    # Dart: بوابة التشغيل لكل سكربت لا تعتمد على «شاغل واحد»
+    slot = runner[runner.index("class RunSlot") :]
+    assert "RunInfo? occupantOf(String scriptPath)" in slot and "Future<bool> release(String scriptPath)" in slot
+    assert "bool get isFull" in slot and not re.search(r"liveRun\b", slot)
+    # النافذة المصغّرة: وضع «الكل» مدموج بالوقت، وبادئة اسم السكربت، وتبديل
+    mini = main_dart[main_dart.index("class _PipLine") : main_dart.index("// ───────── مكونات مشتركة")]
+    for needle in ("'الكل ⇄'", "سكربت يعمل", "_cycleFocus", "timeMs.compareTo", "_pipTagColors", "line.name"):
+        assert needle in mini, needle
+    assert "RunSlot.maxConcurrent" in main_dart
+
+
+def test_fixes_md_documents_concurrent_scripts() -> None:
+    fixes = (ROOT / "FIXES.md").read_text(encoding="utf-8")
+    assert "# تعدد السكربتات" in fixes
+    for needle in ("_RoutedStream", "MAX_CONCURRENT_RUNS", "وضع «الكل»", "قيود معروفة"):
+        assert needle in fixes, needle
 
 
 def test_fixes_md_documents_build_2_5d1() -> None:
