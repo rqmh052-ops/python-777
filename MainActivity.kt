@@ -703,15 +703,30 @@ class BayanPythonBridge private constructor(private val context: Context) :
         /** عدد الجلسات المنتهية المحتفظ بها (الأقدم تُحذف جلستها كاملة). */
         const val MAX_FINISHED_RUNS = 10
 
+        /** أقصى عدد سكربتات تعمل في نفس الوقت (كل سكربت له خيط بايثون خاص به). */
+        const val MAX_CONCURRENT_RUNS = 10
+
         const val BUSY_MESSAGE =
             "هناك سكربت يعمل الآن، وقد يكون في الخلفية. أوقفه من إشعار «مشغّل بايثون» (زر «إيقاف الكل») ثم أعد المحاولة"
+
+        const val SAME_SCRIPT_BUSY_MESSAGE =
+            "هذا السكربت يعمل الآن. أوقفه أولًا ثم شغّله من جديد"
+
+        const val PACKAGE_JOB_BUSY_MESSAGE =
+            "تثبيت أو إزالة مكتبة جارٍ الآن. انتظر حتى ينتهي ثم شغّل السكربت"
+
+        const val TOO_MANY_RUNS_MESSAGE =
+            "وصلت للحد الأقصى: 10 سكربتات تعمل في نفس الوقت. أوقف سكربتًا ثم حاول مجددًا"
     }
 
     data class RunInfo(val runId: String, val name: String, val startedAt: Long)
 
     private val main = Handler(Looper.getMainLooper())
-    private val pythonExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "Bayan-Python").apply { isDaemon = true }
+    // كل سكربت على خيط خاص به (حتى MAX_CONCURRENT_RUNS معًا). الخيط يعود للتجمّع بعد انتهاء السكربت.
+    // تثبيت المكتبات يمر من هنا أيضًا، وهو ممنوع أصلًا أثناء عمل أي سكربت.
+    private val pythonThreadCounter = java.util.concurrent.atomic.AtomicInteger(0)
+    private val pythonExecutor = Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "Bayan-Python-" + pythonThreadCounter.incrementAndGet()).apply { isDaemon = true }
     }
     private val controlExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "Bayan-Python-Control").apply { isDaemon = true }
@@ -719,6 +734,8 @@ class BayanPythonBridge private constructor(private val context: Context) :
     // المفتاح: مسار السكربت. لكل سكربت جلسة واحدة (الأخيرة)، وتشغيل جديد لنفس السكربت يستبدلها.
     private val sessions = mutableMapOf<String, RunSession>()
     private val sessionsLock = Any()
+    // تثبيت/إزالة مكتبة جارٍ (يُعدَّل داخل sessionsLock فقط): لا يبدأ سكربت أثناءه، ولا تبدأ مكتبة أثناء سكربت
+    private var packageJobs = 0
     private var environmentReady = false
 
     // حالة موافقة المستخدم ووضع النافذة المصغّرة (Picture-in-Picture)
@@ -1042,9 +1059,18 @@ class BayanPythonBridge private constructor(private val context: Context) :
                 }
                 val session: RunSession
                 synchronized(sessionsLock) {
-                    val active = sessions.values.firstOrNull { !it.finished }
-                    if (active != null) {
-                        fail(result, "busy", BUSY_MESSAGE)
+                    if (packageJobs > 0) {
+                        fail(result, "busy", PACKAGE_JOB_BUSY_MESSAGE)
+                        return
+                    }
+                    val live = sessions.values.filter { !it.finished }
+                    // نفس السكربت لا يعمل مرتين معًا (الواجهة تسأل عن إيقاف النسخة القديمة قبل ذلك)
+                    if (live.any { it.scriptPath == scriptPath }) {
+                        fail(result, "busy", SAME_SCRIPT_BUSY_MESSAGE)
+                        return
+                    }
+                    if (live.size >= MAX_CONCURRENT_RUNS) {
+                        fail(result, "busy", TOO_MANY_RUNS_MESSAGE)
                         return
                     }
                     session = RunSession(runId, scriptPath, textHash)
@@ -1288,7 +1314,7 @@ class BayanPythonBridge private constructor(private val context: Context) :
             "packages.list" -> {
                 synchronized(sessionsLock) {
                     if (sessions.values.any { !it.finished }) {
-                        fail(result, "busy", "لا يمكن قراءة المكتبات أثناء تشغيل سكربت")
+                        fail(result, "busy", "لا يمكن قراءة المكتبات أثناء تشغيل سكربتات. أوقف السكربتات الشغّالة أولًا")
                         return
                     }
                 }
@@ -1309,7 +1335,7 @@ class BayanPythonBridge private constructor(private val context: Context) :
             "packages.catalog" -> {
                 synchronized(sessionsLock) {
                     if (sessions.values.any { !it.finished }) {
-                        fail(result, "busy", "لا يمكن فحص المكتبات أثناء تشغيل سكربت")
+                        fail(result, "busy", "لا يمكن فحص المكتبات أثناء تشغيل سكربتات. أوقف السكربتات الشغّالة أولًا")
                         return
                     }
                 }
@@ -1356,9 +1382,10 @@ class BayanPythonBridge private constructor(private val context: Context) :
                 }
                 synchronized(sessionsLock) {
                     if (sessions.values.any { !it.finished }) {
-                        fail(result, "busy", "أوقف السكربت الحالي قبل تثبيت مكتبة")
+                        fail(result, "busy", "أوقف السكربتات الشغّالة قبل تثبيت مكتبة")
                         return
                     }
+                    packageJobs += 1
                 }
                 pythonExecutor.execute {
                     try {
@@ -1386,6 +1413,8 @@ class BayanPythonBridge private constructor(private val context: Context) :
                             )
                         )
                         fail(result, "package_install", friendly(t))
+                    } finally {
+                        synchronized(sessionsLock) { packageJobs -= 1 }
                     }
                 }
             }
@@ -1398,9 +1427,10 @@ class BayanPythonBridge private constructor(private val context: Context) :
                 }
                 synchronized(sessionsLock) {
                     if (sessions.values.any { !it.finished }) {
-                        fail(result, "busy", "أوقف السكربت الحالي قبل إزالة مكتبة")
+                        fail(result, "busy", "أوقف السكربتات الشغّالة قبل إزالة مكتبة")
                         return
                     }
+                    packageJobs += 1
                 }
                 pythonExecutor.execute {
                     try {
@@ -1415,6 +1445,8 @@ class BayanPythonBridge private constructor(private val context: Context) :
                         }
                     } catch (t: Throwable) {
                         fail(result, "package_remove", friendly(t))
+                    } finally {
+                        synchronized(sessionsLock) { packageJobs -= 1 }
                     }
                 }
             }

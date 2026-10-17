@@ -563,24 +563,36 @@ class RunHub extends ChangeNotifier {
 
 final runHub = RunHub.instance;
 
-// ───────── مكان التشغيل الوحيد (RunSlot) ─────────
+// ───────── أماكن التشغيل (RunSlot) ─────────
 
-/// كل تشغيل جديد يمر من هنا. سكربت واحد في كل مرة الآن؛ لاحقًا تعدد السكربتات
-/// يتم بتغيير هذا الجزء فقط (الواجهة تسأل: هل يوجد مكان؟).
+/// كل تشغيل جديد يمر من هنا. تعمل عدة سكربتات في نفس الوقت (كل واحد على خيط بايثون خاص به)
+/// حتى [maxConcurrent]. نفس السكربت لا يعمل مرتين معًا.
 class RunSlot {
   RunSlot._();
 
   static final RunSlot instance = RunSlot._();
 
+  /// أقصى عدد سكربتات معًا (يطابق MAX_CONCURRENT_RUNS في MainActivity.kt).
+  static const int maxConcurrent = 10;
+
   /// أقصى انتظار بعد الإيقاف. سكربت عالق في عملية شبكة أو ملف قد لا يتوقف.
   static const Duration stopWait = Duration(seconds: 2);
 
-  /// السكربت الذي يشغل المكان الآن (null = المكان فارغ).
-  RunInfo? get occupant => runHub.liveRun;
+  int get liveCount => runHub.liveRuns.length;
 
-  /// يوقف الشاغل وينتظر حتى ثانيتين تقريبًا. true = صار المكان فارغًا.
-  Future<bool> release() async {
-    final current = runHub.liveRun;
+  bool get isFull => liveCount >= maxConcurrent;
+
+  /// الجلسة الحيّة لهذا السكربت إن وُجدت (null = غير شغّال).
+  RunInfo? occupantOf(String scriptPath) {
+    for (final r in runHub.liveRuns) {
+      if (r.scriptPath == scriptPath) return r;
+    }
+    return null;
+  }
+
+  /// يوقف هذا السكربت وحده وينتظر حتى ثانيتين تقريبًا. true = توقف.
+  Future<bool> release(String scriptPath) async {
+    final current = occupantOf(scriptPath);
     if (current == null) return true;
     try {
       await bayanPython.stop(runId: current.runId);
@@ -588,10 +600,10 @@ class RunSlot {
       debugPrint('RunSlot.release: $e');
     }
     final deadline = DateTime.now().add(stopWait);
-    while (runHub.hasLive && DateTime.now().isBefore(deadline)) {
+    while (occupantOf(scriptPath) != null && DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(const Duration(milliseconds: 80));
     }
-    return !runHub.hasLive;
+    return occupantOf(scriptPath) == null;
   }
 }
 

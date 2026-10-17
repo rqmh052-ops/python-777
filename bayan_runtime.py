@@ -249,16 +249,20 @@ class _CallbackStdin(io.TextIOBase):
         self.callback = callback
         self.hub = hub
 
-    def readline(self, size: int = -1) -> str:
+    def ask(self, prompt: str = "") -> str:
+        """input(prompt): show the prompt, wait for the user's line (stop-aware)."""
         if _should_stop(self.callback):
             raise StopRequested()
         if self.hub is not None:
             self.hub.flush()
-        self.callback.emitInput("")
-        value = self.callback.requestInput("")
+        self.callback.emitInput(str(prompt))
+        value = self.callback.requestInput(str(prompt))
         if value is None or _should_stop(self.callback):
             raise StopRequested()
-        return str(value) + "\n"
+        return str(value)
+
+    def readline(self, size: int = -1) -> str:
+        return self.ask("") + "\n"
 
     def read(self, size: int = -1) -> str:
         return self.readline(size)
@@ -354,42 +358,226 @@ class _Watchdog:
                 pass
 
 
-class _WorkerShims:
-    """Makes common libraries work when the script runs on a worker thread.
+# ---------------------------------------------------------------------------
+# Several scripts at the same time (one interpreter, one thread per script)
+# ---------------------------------------------------------------------------
+#
+# Python has ONE sys.stdout, ONE builtins.input, ONE time.sleep ... per process.
+# Instead of swapping those per run (which breaks as soon as two scripts overlap),
+# they are replaced ONCE by small routers while at least one script runs. A router
+# looks at the calling thread, finds the run that owns it, and forwards to that
+# run's own output hub / input callback / stop flag. Threads started by a script
+# inherit its run (threading.Thread.start is wrapped), so print() from a worker
+# thread of script A never lands in script B's console.
+#
+# Still shared by all scripts (process-wide in CPython, cannot be split):
+# the working directory, os.environ, sys.modules and the GIL.
 
-    * time.sleep() notices the Stop button instead of blocking until it ends;
-    * signal.signal() and loop.add_signal_handler() only work on the main thread
-      (python-telegram-bot's run_polling() calls them), so outside it they become no-ops;
-    * asyncio.get_event_loop() works (Telethon, python-telegram-bot, plain scripts).
-    """
+_RUN_LOCAL = threading.local()
+_RUNTIME_LOCK = threading.RLock()
+_ACTIVE_RUNS: list["_RunContext"] = []
+_RUNTIME_STATE: dict[str, Any] = {"patches": None, "path": None, "cwd": None, "paths": {}}
 
-    def __init__(self, callback: Any):
+
+class _RunContext:
+    """Everything that belongs to ONE running script."""
+
+    def __init__(self, path: Path, callback: Any):
+        self.path = path
+        self.dir = str(path.parent)
         self.callback = callback
+        self.hub = _OutputHub(callback)
+        self.out = _CallbackStream(callback, "stdout", self.hub)
+        self.err = _CallbackStream(callback, "stderr", self.hub)
+        self.stdin = _CallbackStdin(callback, self.hub)
+        self.trace = _trace_factory(callback)
+        self.argv: list[str] = [str(path)]
+        self.threads: list[threading.Thread] = []
+        self.loop: Any = None
+        self.finished = False
+
+    def make_loop(self) -> None:
+        """Like the main thread of CPython: asyncio.get_event_loop() just works."""
+        try:
+            import asyncio
+        except Exception:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+            except Exception:
+                self.loop = None
+
+    def drop_loop(self) -> None:
+        loop, self.loop = self.loop, None
+        if loop is None:
+            return
+        try:
+            import asyncio
+
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
+        try:
+            if not loop.is_closed():
+                loop.close()
+        except Exception:
+            pass
+
+
+def _thread_ctx() -> "_RunContext | None":
+    """The run that owns the calling thread (None for threads Bayan does not know)."""
+    return getattr(_RUN_LOCAL, "ctx", None)
+
+
+def _route_ctx() -> "_RunContext | None":
+    """Owner of the calling thread; unknown threads fall back to the newest running script."""
+    ctx = getattr(_RUN_LOCAL, "ctx", None)
+    if ctx is not None:
+        return ctx
+    with _RUNTIME_LOCK:
+        return _ACTIVE_RUNS[-1] if _ACTIVE_RUNS else None
+
+
+class _RoutedStream(io.TextIOBase):
+    """sys.stdout / sys.stderr while scripts run: forwards to the calling script's console."""
+
+    errors = "replace"
+    line_buffering = False
+
+    def __init__(self, kind: str, original: Any):
+        super().__init__()
+        self.kind = kind
+        self.original = original
+
+    def _target(self) -> "_CallbackStream | None":
+        ctx = _route_ctx()
+        if ctx is None or ctx.finished:
+            return None  # a script that already ended: drop late output
+        return ctx.out if self.kind == "stdout" else ctx.err
+
+    def write(self, s: str) -> int:
+        target = self._target()
+        if target is not None and s:
+            target.write(s)
+        return len(s)
+
+    def flush(self) -> None:
+        target = self._target()
+        if target is not None:
+            target.flush()
+
+    def reconfigure(self, **_kwargs: Any) -> None:
+        return None
+
+    @property
+    def buffer(self) -> _BufferShim:
+        return _BufferShim(self)
+
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+
+class _RoutedStdin(io.TextIOBase):
+    def readline(self, size: int = -1) -> str:
+        ctx = _route_ctx()
+        if ctx is None or ctx.finished:
+            return ""
+        return ctx.stdin.readline(size)
+
+    def read(self, size: int = -1) -> str:
+        return self.readline(size)
+
+    def isatty(self) -> bool:
+        return False
+
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+
+def _argv_delegate(name: str):
+    def method(self, *args: Any, **kwargs: Any) -> Any:
+        return getattr(self._current(), name)(*args, **kwargs)
+
+    method.__name__ = name
+    return method
+
+
+class _ArgvProxy(list):
+    """sys.argv that answers with the calling script's own argv."""
+
+    _base: list
+
+    def _current(self) -> list:
+        ctx = _route_ctx()
+        return ctx.argv if ctx is not None else self._base
+
+
+for _name in (
+    "__getitem__", "__setitem__", "__delitem__", "__iter__", "__len__", "__contains__",
+    "__reversed__", "__eq__", "__ne__", "__repr__", "__str__", "append", "extend",
+    "insert", "pop", "remove", "index", "count", "copy", "sort", "reverse", "clear",
+):
+    setattr(_ArgvProxy, _name, _argv_delegate(_name))
+del _name
+
+
+def _make_argv_proxy(base: list) -> _ArgvProxy:
+    proxy = _ArgvProxy()
+    proxy._base = list(base)
+    list.extend(proxy, base)  # C code that reads the raw storage still sees something sensible
+    return proxy
+
+
+class _GlobalPatches:
+    """The process-wide hooks. Installed with the first running script, removed after the last."""
+
+    def __init__(self) -> None:
         self._undo: list[tuple[Any, str, Any]] = []
-        self._loop: Any = None
+        self._saved_argv: Any = None
 
     def _patch(self, owner: Any, name: str, value: Any) -> None:
         self._undo.append((owner, name, getattr(owner, name)))
         setattr(owner, name, value)
 
-    @staticmethod
-    def _on_main_thread() -> bool:
-        return threading.current_thread() is threading.main_thread()
-
     def install(self) -> None:
-        callback = self.callback
+        self._saved_argv = getattr(sys, "argv", [""])
+        self._patch(sys, "stdout", _RoutedStream("stdout", sys.stdout))
+        self._patch(sys, "stderr", _RoutedStream("stderr", sys.stderr))
+        self._patch(sys, "stdin", _RoutedStdin())
+        self._patch(sys, "argv", _make_argv_proxy(self._saved_argv))
+
+        orig_input = builtins.input
+
+        def bayan_input(prompt: Any = "") -> str:
+            ctx = _route_ctx()
+            if ctx is None or ctx.finished:
+                return orig_input(prompt)
+            return ctx.stdin.ask(str(prompt))
+
+        self._patch(builtins, "input", bayan_input)
+
         real_sleep = time.sleep
-        on_main = self._on_main_thread
 
         def bayan_sleep(seconds: Any) -> None:
+            ctx = _thread_ctx()
             try:
                 remaining = float(seconds)
             except (TypeError, ValueError):
                 return real_sleep(seconds)  # let Python raise its usual error
-            if remaining == 0:
-                return real_sleep(0)
+            if remaining == 0 or ctx is None:
+                return real_sleep(seconds)
             if remaining < 0:
                 raise ValueError("sleep length must be non-negative")
+            callback = ctx.callback
             deadline = time.monotonic() + remaining
             while True:
                 left = deadline - time.monotonic()
@@ -401,21 +589,22 @@ class _WorkerShims:
 
         self._patch(time, "sleep", bayan_sleep)
 
+        # signal.signal() only works on the main thread; scripts run on worker threads
+        # (python-telegram-bot's run_polling() calls it), so outside it becomes a no-op.
         orig_signal = signal.signal
 
         def bayan_signal(signalnum: Any, handler: Any) -> Any:
             try:
                 return orig_signal(signalnum, handler)
             except ValueError:
-                if on_main():
+                if threading.current_thread() is threading.main_thread():
                     raise
                 return signal.SIG_DFL
 
         self._patch(signal, "signal", bayan_signal)
 
-        # A thread that the script started and that dies because Stop was pressed
-        # (or because the script ended) must not print a "StopRequested" traceback.
-        # Installed once and kept: such threads can die a moment after the run ends.
+        # A thread that dies because Stop was pressed (or because its script ended)
+        # must not print a "StopRequested" traceback. Installed once and kept.
         if not getattr(threading.excepthook, "_bayan", False):
             orig_excepthook = threading.excepthook
 
@@ -426,6 +615,29 @@ class _WorkerShims:
 
             bayan_excepthook._bayan = True  # type: ignore[attr-defined]
             threading.excepthook = bayan_excepthook
+
+        # Threads a script starts belong to that script: same console, same Stop button.
+        orig_start = threading.Thread.start
+
+        def bayan_start(thread: Any, *args: Any, **kwargs: Any) -> Any:
+            ctx = _thread_ctx()
+            if ctx is not None and not ctx.finished and not hasattr(thread, "_bayan_ctx"):
+                thread._bayan_ctx = ctx
+                ctx.threads.append(thread)
+                inner = thread.run
+
+                def run() -> Any:
+                    _RUN_LOCAL.ctx = ctx
+                    try:
+                        sys.settrace(ctx.trace)
+                    except Exception:
+                        pass
+                    return inner()
+
+                thread.run = run
+            return orig_start(thread, *args, **kwargs)
+
+        self._patch(threading.Thread, "start", bayan_start)
 
         try:
             import asyncio
@@ -454,7 +666,7 @@ class _WorkerShims:
                 try:
                     return orig_add(loop, sig, cb, *args)
                 except (RuntimeError, ValueError, OSError):
-                    if on_main():
+                    if threading.current_thread() is threading.main_thread():
                         raise
                     return None
 
@@ -462,21 +674,12 @@ class _WorkerShims:
                 try:
                     return orig_remove(loop, sig)
                 except (RuntimeError, ValueError, OSError):
-                    if on_main():
+                    if threading.current_thread() is threading.main_thread():
                         raise
                     return False
 
             self._patch(unix_cls, "add_signal_handler", add_signal_handler)
             self._patch(unix_cls, "remove_signal_handler", remove_signal_handler)
-
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            try:
-                self._loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self._loop)
-            except Exception:
-                self._loop = None
 
     def restore(self) -> None:
         while self._undo:
@@ -485,30 +688,75 @@ class _WorkerShims:
                 setattr(owner, name, value)
             except Exception:
                 pass
-        loop, self._loop = self._loop, None
-        if loop is not None:
-            try:
-                import asyncio
 
-                asyncio.set_event_loop(None)
+
+def _acquire_runtime(ctx: _RunContext, site: str) -> None:
+    """Register a starting script. The first one installs the hooks and remembers cwd/sys.path."""
+    with _RUNTIME_LOCK:
+        state = _RUNTIME_STATE
+        if not _ACTIVE_RUNS:
+            patches = _GlobalPatches()
+            patches.install()
+            state["patches"] = patches
+            state["path"] = list(sys.path)
+            state["cwd"] = Path.cwd()
+            state["paths"] = {}
+        _ACTIVE_RUNS.append(ctx)
+        counts: dict[str, int] = state["paths"]
+        for entry in (ctx.dir, site):
+            counts[entry] = counts.get(entry, 0) + 1
+        sys.path[:] = [ctx.dir, site] + [p for p in sys.path if p not in {ctx.dir, site}]
+        os.chdir(ctx.dir)
+        # raw storage of the argv proxy follows the newest script (the proxy itself routes per thread)
+        try:
+            list.__setitem__(sys.argv, slice(None), ctx.argv)
+        except Exception:
+            pass
+
+
+def _release_runtime(ctx: _RunContext, site: str) -> None:
+    with _RUNTIME_LOCK:
+        state = _RUNTIME_STATE
+        if ctx in _ACTIVE_RUNS:
+            _ACTIVE_RUNS.remove(ctx)
+        counts: dict[str, int] = state["paths"]
+        saved_path: list[str] = state["path"] or []
+        for entry in (ctx.dir, site):
+            counts[entry] = counts.get(entry, 1) - 1
+            if counts[entry] <= 0:
+                counts.pop(entry, None)
+                if entry not in saved_path and entry in sys.path:
+                    sys.path.remove(entry)
+        if _ACTIVE_RUNS:
+            try:
+                os.chdir(_ACTIVE_RUNS[-1].dir)
             except Exception:
                 pass
-            try:
-                if not loop.is_closed():
-                    loop.close()
-            except Exception:
-                pass
+            return
+        patches = state["patches"]
+        state["patches"] = None
+        if patches is not None:
+            patches.restore()
+        sys.path[:] = saved_path
+        try:
+            os.chdir(state["cwd"] or Path.cwd())
+        except Exception:
+            pass
+        state["path"] = None
+        state["cwd"] = None
+        state["paths"] = {}
 
 
-def _join_user_threads(before: set, callback: Any) -> None:
-    """Like CPython at exit: wait for non-daemon threads the script started."""
+def active_run_count() -> int:
+    with _RUNTIME_LOCK:
+        return len(_ACTIVE_RUNS)
+
+
+def _join_user_threads(ctx: _RunContext, callback: Any) -> None:
+    """Like CPython at exit: wait for non-daemon threads THIS script started."""
     me = threading.current_thread()
     while True:
-        alive = [
-            t
-            for t in threading.enumerate()
-            if t is not me and t not in before and not t.daemon and t.is_alive()
-        ]
+        alive = [t for t in list(ctx.threads) if t is not me and not t.daemon and t.is_alive()]
         # Ask about Stop AFTER listing the threads and BEFORE returning. A thread that
         # dies because Stop was pressed (StopRequested) can vanish between two polls;
         # with the old order the list came back empty and the run ended with 0
@@ -521,12 +769,12 @@ def _join_user_threads(before: set, callback: Any) -> None:
         alive[0].join(0.1)
 
 
-def _reap_user_threads(before: set, timeout: float) -> None:
-    """After the run: give threads the script left behind a moment to notice they must stop."""
+def _reap_user_threads(ctx: _RunContext, timeout: float) -> None:
+    """After the run: give THIS script's leftover threads a moment to notice they must stop."""
     me = threading.current_thread()
     deadline = time.monotonic() + timeout
-    for t in list(threading.enumerate()):
-        if t is me or t in before:
+    for t in list(ctx.threads):
+        if t is me:
             continue
         left = deadline - time.monotonic()
         if left <= 0:
@@ -535,6 +783,7 @@ def _reap_user_threads(before: set, timeout: float) -> None:
             t.join(left)
         except Exception:
             pass
+    ctx.threads.clear()
 
 
 def _run_exit_code(value: Any) -> int:
@@ -712,7 +961,7 @@ def _missing_libraries(path: Path, source: str, exc: BaseException) -> list[dict
 
 
 def run_script(script_path: str, callback: Any) -> int:
-    """Execute one user script in the shared Bayan Python interpreter."""
+    """Execute one user script. Several can run at the same time, each on its own thread."""
     _, _, site, _ = _require_config()
     _require_callback_api(callback, _RUN_CALLBACK_REQUIRED)
     path = Path(script_path).resolve()
@@ -721,58 +970,24 @@ def run_script(script_path: str, callback: Any) -> int:
         callback.emitExit(1)
         return 1
 
-    old_cwd = Path.cwd()
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    old_stdin = sys.stdin
-    old_input = builtins.input
-    old_path = list(sys.path)
-    old_argv = list(getattr(sys, "argv", [""]))
+    ctx = _RunContext(path, callback)
+    hub, err = ctx.hub, ctx.err
+    site_str = str(site)
     old_trace = sys.gettrace()
-    old_thread_trace = threading.gettrace() if hasattr(threading, "gettrace") else None
-
-    hub = _OutputHub(callback)
-    out = _CallbackStream(callback, "stdout", hub)
-    err = _CallbackStream(callback, "stderr", hub)
-    stdin = _CallbackStdin(callback, hub)
-    trace = _trace_factory(callback)
-    shims = _WorkerShims(callback)
     watchdog = _Watchdog(callback, hub)
-    threads_before = set(threading.enumerate())
     exit_code = 0
     source = ""
     missing_payload = ""
+    acquired = False
     watchdog.start()
     callback.emitState("running")
 
     try:
-        site_str = str(site)
-        script_dir = str(path.parent)
-        sys.path[:] = [script_dir, site_str] + [p for p in old_path if p not in {script_dir, site_str}]
-        os.chdir(script_dir)
-        sys.argv = [str(path)]
-        sys.stdout = out
-        sys.stderr = err
-        sys.stdin = stdin
-
-        def bayan_input(prompt: str = "") -> str:
-            if _should_stop(callback):
-                raise StopRequested()
-            hub.flush()
-            callback.emitInput(str(prompt))
-            value = callback.requestInput(str(prompt))
-            if value is None or _should_stop(callback):
-                raise StopRequested()
-            return str(value)
-
-        builtins.input = bayan_input
-        try:
-            shims.install()
-        except Exception:
-            pass  # the script still runs, just without the worker-thread helpers
-        sys.settrace(trace)
-        if hasattr(threading, "settrace"):
-            threading.settrace(trace)
+        _RUN_LOCAL.ctx = ctx
+        _acquire_runtime(ctx, site_str)
+        acquired = True
+        ctx.make_loop()
+        sys.settrace(ctx.trace)
 
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
@@ -786,7 +1001,7 @@ def run_script(script_path: str, callback: Any) -> int:
             "__cached__": None,
         }
         exec(code, namespace, namespace)
-        _join_user_threads(threads_before, callback)
+        _join_user_threads(ctx, callback)
         exit_code = 0
     except StopRequested:
         exit_code = 130
@@ -811,35 +1026,24 @@ def run_script(script_path: str, callback: Any) -> int:
             sys.settrace(old_trace)
         except Exception:
             pass
-        if hasattr(threading, "settrace"):
-            try:
-                threading.settrace(old_thread_trace)
-            except Exception:
-                pass
         try:
-            trace.kill()
-            _reap_user_threads(threads_before, 1.0)
+            ctx.trace.kill()
+            _reap_user_threads(ctx, 1.0)
         except Exception:
             pass
-        try:
-            shims.restore()
-        except Exception:
-            pass
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        sys.stdin = old_stdin
-        builtins.input = old_input
-        sys.path[:] = old_path
-        sys.argv = old_argv
-        try:
-            os.chdir(old_cwd)
-        except Exception:
-            pass
-        importlib.invalidate_caches()
+        ctx.drop_loop()
         try:
             hub.flush()
         except Exception:
             pass
+        ctx.finished = True
+        _RUN_LOCAL.ctx = None
+        if acquired:
+            try:
+                _release_runtime(ctx, site_str)
+            except Exception:
+                pass
+        importlib.invalidate_caches()
         if missing_payload:
             try:
                 callback.emitMissing(missing_payload)

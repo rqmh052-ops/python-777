@@ -643,6 +643,35 @@ class _PipMiniWindowHostState extends State<PipMiniWindowHost>
   }
 }
 
+/// سطر واحد في النافذة المصغّرة، مع الوقت (لدمج عدة سكربتات بترتيب زمني) ورقم لون السكربت.
+class _PipLine {
+  const _PipLine(this.timeMs, this.tag, this.name, this.text, this.kind);
+  final int timeMs;
+  final int tag; // رقم لون السكربت
+  final String name; // اسم السكربت المختصر (بادئة السطر)
+  final String text;
+  final int kind; // 0 عادي، 3 خطأ
+}
+
+/// ألوان بادئات السكربتات في وضع «الكل» (حتى 10 سكربتات).
+const List<Color> _pipTagColors = <Color>[
+  Color(0xFF6FD3E8),
+  Color(0xFFFFB86B),
+  Color(0xFF5BD68A),
+  Color(0xFFC792EA),
+  Color(0xFFFF8FB1),
+  Color(0xFF4DB6AC),
+  Color(0xFFFFD866),
+  Color(0xFF9FA8FF),
+  Color(0xFFD7A98C),
+  Color(0xFF9DB4C8),
+];
+
+/// النافذة المصغّرة (Picture-in-Picture):
+/// - سكربت واحد يعمل: إخراجه فقط.
+/// - عدة سكربتات: وضع «الكل» (الافتراضي) يعرض آخر الأسطر من جميعها مدموجة بترتيب الوقت،
+///   وقبل كل سطر اسم السكربت بلون خاص به. زر ⇄ (أو زر التبديل في النافذة) يتنقّل:
+///   الكل ← سكربت 1 ← سكربت 2 … ← الكل.
 class MiniScriptConsole extends StatefulWidget {
   const MiniScriptConsole({super.key});
 
@@ -651,18 +680,24 @@ class MiniScriptConsole extends StatefulWidget {
 }
 
 class _MiniScriptConsoleState extends State<MiniScriptConsole> {
-  // تجميع التحديثات كل 250ms (ضمن النطاق 200–300ms) مع سقف صارم للذاكرة
+  // تجميع التحديثات كل 250ms مع سقف صارم للذاكرة
   static const int _batchIntervalMs = 250;
   static const int _maxLogTailBytes = 16 * 1024;
   static const int _maxDisplayLines = 36;
+  static const int _maxBuiltLines = 400;
   static const int _maxLineChars = 220;
+  static const int _maxTagChars = 9;
 
   final ScrollController _scroll = ScrollController();
-  List<Line> _lines = const <Line>[];
-  String _activeScriptPath = '';
-  String _activeRunId = '';
-  int _lastSize = -1;
-  int _lastEpoch = -1;
+  List<_PipLine> _lines = const <_PipLine>[];
+  // '' = وضع «الكل»؛ غير ذلك = مسار سكربت واحد مختار
+  String _focusPath = '';
+  // أسطر كل سكربت كما قُرئت من سجله (لا يُعاد قراءة سكربت لم يتغير)
+  final Map<String, List<_PipLine>> _cache = <String, List<_PipLine>>{};
+  final Map<String, String> _cacheRun = <String, String>{}; // مسار ← runId الذي بُني منه
+  final Map<String, (int, int)> _cacheStamp = <String, (int, int)>{}; // مسار ← (حجم السجل، epoch)
+  final Set<String> _dirty = <String>{};
+  final Map<String, int> _tagOf = <String, int>{}; // لون ثابت لكل سكربت طوال الجلسة
   Timer? _batchTimer;
   bool _fetching = false;
   bool _pendingFetch = false;
@@ -678,8 +713,9 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
         .listen(_onRunEvent, onError: (Object _) {});
     _pipSub = bayanPython.events
         .where((e) => e.channel == 'pip' && e.type == 'next')
-        .listen((_) => _cycleScript(), onError: (Object _) {});
-    _syncTargetScript(immediate: true);
+        .listen((_) => _cycleFocus(), onError: (Object _) {});
+    _dirty.addAll(runHub.liveRuns.map((r) => r.scriptPath));
+    unawaited(_pull());
   }
 
   @override
@@ -692,59 +728,56 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
     super.dispose();
   }
 
+  int _tagFor(String path) => _tagOf.putIfAbsent(path, () => _tagOf.length % _pipTagColors.length);
+
+  static String _shortName(String path) {
+    var name = path.substring(path.lastIndexOf('/') + 1);
+    if (name.toLowerCase().endsWith('.py')) name = name.substring(0, name.length - 3);
+    return name.length > _maxTagChars ? name.substring(0, _maxTagChars) : name;
+  }
+
   void _onHubChanged() {
     if (!mounted) return;
-    _syncTargetScript(immediate: false);
+    final live = runHub.liveRuns;
+    // السكربت المختار انتهى: نرجع إلى «الكل»
+    if (_focusPath.isNotEmpty && !live.any((r) => r.scriptPath == _focusPath)) {
+      _focusPath = '';
+    }
+    // تشغيل جديد لسكربت معروف (runId تغيّر): نعيد بناء أسطره من الصفر
+    for (final r in live) {
+      if (_cacheRun[r.scriptPath] != r.runId) _dirty.add(r.scriptPath);
+    }
+    _cache.removeWhere((path, _) => !live.any((r) => r.scriptPath == path));
+    _scheduleBatchPull();
     setState(() {});
   }
 
-  void _syncTargetScript({required bool immediate}) {
-    final live = runHub.liveRuns;
-    if (live.isEmpty) return;
-    final current = live.where((r) => r.scriptPath == _activeScriptPath).firstOrNull ?? live.first;
-    final changed = current.scriptPath != _activeScriptPath || current.runId != _activeRunId;
-    _activeScriptPath = current.scriptPath;
-    _activeRunId = current.runId;
-    if (changed) {
-      _lastSize = -1;
-      _lastEpoch = -1;
-      if (immediate) {
-        unawaited(_pullFromLogStore());
-      } else {
-        _scheduleBatchPull();
-      }
-    } else if (immediate) {
-      unawaited(_pullFromLogStore());
-    }
-  }
-
-  void _cycleScript() {
+  void _cycleFocus() {
     final live = runHub.liveRuns;
     if (live.length <= 1) return;
-    final idx = live.indexWhere((r) => r.scriptPath == _activeScriptPath);
-    final next = live[(idx + 1) % live.length];
-    setState(() {
-      _activeScriptPath = next.scriptPath;
-      _activeRunId = next.runId;
-      _lastSize = -1;
-      _lastEpoch = -1;
-      _lines = const <Line>[];
-    });
-    unawaited(_pullFromLogStore());
+    final order = <String>['', ...live.map((r) => r.scriptPath)];
+    final idx = order.indexOf(_focusPath);
+    final next = order[(idx + 1) % order.length];
+    setState(() => _focusPath = next);
+    _recompose();
   }
 
   void _onRunEvent(BayanEvent e) {
-    if (!mounted) return;
-    if (e.runId.isNotEmpty && _activeRunId.isNotEmpty && e.runId != _activeRunId) {
+    if (!mounted || e.runId.isEmpty) return;
+    if (e.type != 'stdout' &&
+        e.type != 'stderr' &&
+        e.type != 'error' &&
+        e.type != 'started' &&
+        e.type != 'exit') {
       return;
     }
-    if (e.type == 'stdout' ||
-        e.type == 'stderr' ||
-        e.type == 'error' ||
-        e.type == 'started' ||
-        e.type == 'exit') {
-      _scheduleBatchPull();
+    for (final r in runHub.liveRuns) {
+      if (r.runId == e.runId) {
+        _dirty.add(r.scriptPath);
+        break;
+      }
     }
+    _scheduleBatchPull();
   }
 
   void _scheduleBatchPull() {
@@ -754,64 +787,32 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
       _batchTimer = null;
       if (_pendingFetch && mounted) {
         _pendingFetch = false;
-        unawaited(_pullFromLogStore());
+        unawaited(_pull());
       }
     });
   }
 
-  Future<void> _pullFromLogStore() async {
-    final path = _activeScriptPath;
-    final runId = _activeRunId;
-    if (path.isEmpty || !mounted) return;
+  /// يقرأ سجل كل سكربت تغيّر منذ آخر مرة (حتى 10 قراءات صغيرة) ثم يركّب الأسطر.
+  Future<void> _pull() async {
+    if (!mounted) return;
     if (_fetching) {
       _pendingFetch = true;
       return;
     }
     _fetching = true;
     try {
-      final page = await bayanPython.logsPage(path, maxBytes: _maxLogTailBytes);
-      if (!mounted || path != _activeScriptPath) return;
-      if (page.size == _lastSize && page.epoch == _lastEpoch && _lines.isNotEmpty) {
-        return;
+      final live = runHub.liveRuns;
+      final todo = live
+          .where((r) =>
+              (_focusPath.isEmpty || r.scriptPath == _focusPath) &&
+              (_dirty.contains(r.scriptPath) || !_cache.containsKey(r.scriptPath)))
+          .toList(growable: false);
+      for (final r in todo) {
+        _dirty.remove(r.scriptPath);
+        await _pullOne(r);
+        if (!mounted) return;
       }
-      _lastSize = page.size;
-      _lastEpoch = page.epoch;
-
-      final records = _StoredLogRecord.parsePage(page.text);
-      var startIdx = 0;
-      for (var i = records.length - 1; i >= 0; i--) {
-        final r = records[i];
-        if (r.type == 'start' && (runId.isEmpty || r.runId == runId)) {
-          startIdx = i + 1;
-          break;
-        }
-      }
-
-      final built = <Line>[];
-      for (var i = startIdx; i < records.length; i++) {
-        final r = records[i];
-        if (r.type != 'event') continue;
-        if (r.kind == 'o' || r.kind == 'e') {
-          appendOutputEventLines(
-            built,
-            r.text,
-            r.kind == 'e' ? 3 : 0,
-            maxLines: _maxDisplayLines,
-          );
-        }
-      }
-      for (var i = 0; i < built.length; i++) {
-        final t = built[i].text;
-        if (t.length > _maxLineChars) {
-          built[i] = Line('${t.substring(0, _maxLineChars)}…', built[i].kind);
-        }
-      }
-      setState(() => _lines = built);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _scroll.hasClients) {
-          _scroll.jumpTo(_scroll.position.maxScrollExtent);
-        }
-      });
+      _recompose();
     } catch (_) {
     } finally {
       _fetching = false;
@@ -821,16 +822,116 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
     }
   }
 
+  Future<void> _pullOne(RunInfo run) async {
+    final path = run.scriptPath;
+    try {
+      final page = await bayanPython.logsPage(path, maxBytes: _maxLogTailBytes);
+      if (!mounted) return;
+      final stamp = (page.size, page.epoch);
+      if (_cacheStamp[path] == stamp && _cacheRun[path] == run.runId && _cache.containsKey(path)) {
+        return;
+      }
+      _cacheStamp[path] = stamp;
+      _cacheRun[path] = run.runId;
+      final tag = _tagFor(path);
+      final records = _StoredLogRecord.parsePage(page.text);
+      var startIdx = 0;
+      for (var i = records.length - 1; i >= 0; i--) {
+        final r = records[i];
+        if (r.type == 'start' && (run.runId.isEmpty || r.runId == run.runId)) {
+          startIdx = i + 1;
+          break;
+        }
+      }
+      final built = <Line>[];
+      final times = <int>[];
+      for (var i = startIdx; i < records.length; i++) {
+        final r = records[i];
+        if (r.type != 'event') continue;
+        if (r.kind == 'o' || r.kind == 'e') {
+          appendOutputEventLines(built, r.text, r.kind == 'e' ? 3 : 0, maxLines: _maxBuiltLines);
+          while (times.length < built.length) {
+            times.add(r.timeMs);
+          }
+          if (times.length > built.length) {
+            times.removeRange(0, times.length - built.length);
+          }
+        }
+      }
+      // السطر الأخير الفارغ مجرد أثر نهاية السطر الأخير
+      if (built.isNotEmpty && built.last.text.isEmpty) {
+        built.removeLast();
+        times.removeLast();
+      }
+      final lines = <_PipLine>[];
+      for (var i = 0; i < built.length; i++) {
+        var t = built[i].text;
+        if (t.length > _maxLineChars) t = '${t.substring(0, _maxLineChars)}…';
+        lines.add(_PipLine(times[i], tag, _shortName(path), t, built[i].kind));
+      }
+      _cache[path] = lines;
+    } catch (_) {
+      // قراءة فاشلة لسكربت واحد لا توقف بقية السكربتات
+    }
+  }
+
+  /// يدمج أسطر السكربتات الظاهرة بترتيب الوقت ويأخذ آخر _maxDisplayLines.
+  void _recompose() {
+    if (!mounted) return;
+    final live = runHub.liveRuns;
+    final shown = _focusPath.isEmpty
+        ? live
+        : live.where((r) => r.scriptPath == _focusPath).toList(growable: false);
+    final merged = <_PipLine>[];
+    for (final r in shown) {
+      final part = _cache[r.scriptPath];
+      if (part == null) continue;
+      // ختم الترتيب: داخل السكربت الواحد يبقى ترتيب الأسطر كما هو
+      merged.addAll(part.length > _maxDisplayLines ? part.sublist(part.length - _maxDisplayLines) : part);
+    }
+    if (shown.length > 1) {
+      final indexed = <MapEntry<int, _PipLine>>[
+        for (var i = 0; i < merged.length; i++) MapEntry<int, _PipLine>(i, merged[i]),
+      ];
+      indexed.sort((a, b) {
+        final c = a.value.timeMs.compareTo(b.value.timeMs);
+        return c != 0 ? c : a.key.compareTo(b.key);
+      });
+      merged
+        ..clear()
+        ..addAll(indexed.map((e) => e.value));
+    }
+    final tail = merged.length > _maxDisplayLines
+        ? merged.sublist(merged.length - _maxDisplayLines)
+        : merged;
+    setState(() => _lines = tail);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _scroll.hasClients) {
+        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final live = runHub.liveRuns;
-    final current = live.where((r) => r.scriptPath == _activeScriptPath).firstOrNull ??
-        (live.isNotEmpty ? live.first : null);
-    final name = current == null
-        ? kAppName
-        : current.scriptPath.substring(current.scriptPath.lastIndexOf('/') + 1);
-    final status = current?.status ?? RunStatus.running;
-    final activeIdx = current == null ? 0 : live.indexOf(current);
+    final focused = _focusPath.isEmpty
+        ? null
+        : live.where((r) => r.scriptPath == _focusPath).firstOrNull;
+    // سكربت واحد فقط يعمل: كأن المستخدم اختاره (بلا بادئات)
+    final single = live.length == 1 ? live.first : focused;
+    final showAll = single == null;
+    final focusIdx = focused == null ? 0 : live.indexOf(focused) + 1;
+
+    final String title;
+    final RunStatus status;
+    if (single != null) {
+      title = single.scriptPath.substring(single.scriptPath.lastIndexOf('/') + 1);
+      status = single.status;
+    } else {
+      title = '${live.length} سكربت يعمل';
+      status = live.any((r) => r.status == RunStatus.waiting) ? RunStatus.waiting : RunStatus.running;
+    }
 
     return Material(
       color: C.console,
@@ -845,7 +946,7 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // سطر علوي صغير فقط: اسم السكربت وحالته، ومبدّل السكربتات عند تعددها
+              // سطر علوي صغير: اسم السكربت (أو عدد السكربتات) وحالته، ومبدّل العرض عند التعدد
               Container(
                 height: 24,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -859,8 +960,8 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
-                        name,
-                        textDirection: TextDirection.ltr,
+                        title,
+                        textDirection: showAll ? null : TextDirection.ltr,
                         textAlign: TextAlign.right,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -871,21 +972,11 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      RunDot.labelOf(status),
-                      maxLines: 1,
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        color: RunDot.colorOf(status),
-                      ),
-                    ),
                     if (live.length > 1) ...[
                       const SizedBox(width: 6),
                       GestureDetector(
                         behavior: HitTestBehavior.opaque,
-                        onTap: _cycleScript,
+                        onTap: _cycleFocus,
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
                           decoration: BoxDecoration(
@@ -894,8 +985,7 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
                             border: Border.all(color: C.accent.withValues(alpha: .45)),
                           ),
                           child: Text(
-                            '${activeIdx + 1}/${live.length} ⇄',
-                            textDirection: TextDirection.ltr,
+                            showAll ? 'الكل ⇄' : '$focusIdx/${live.length} ⇄',
                             style: const TextStyle(
                               fontSize: 9.5,
                               fontWeight: FontWeight.w700,
@@ -926,15 +1016,33 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
                           itemCount: _lines.length,
                           itemBuilder: (context, index) {
                             final line = _lines[index];
-                            return Text(
-                              line.text.isEmpty ? ' ' : line.text,
+                            final body = line.text.isEmpty ? ' ' : line.text;
+                            final textStyle = mono.copyWith(
+                              fontSize: 10.5,
+                              height: 1.32,
+                              color: line.kind == 3 ? C.error : C.text,
+                            );
+                            if (!showAll) {
+                              return Text(body,
+                                  maxLines: 2, overflow: TextOverflow.ellipsis, style: textStyle);
+                            }
+                            // وضع «الكل»: اسم السكربت بلونه قبل كل سطر
+                            return Text.rich(
+                              TextSpan(
+                                children: [
+                                  TextSpan(
+                                    text: '${line.name} ',
+                                    style: textStyle.copyWith(
+                                      color: _pipTagColors[line.tag % _pipTagColors.length],
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                  TextSpan(text: body),
+                                ],
+                              ),
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
-                              style: mono.copyWith(
-                                fontSize: 10.5,
-                                height: 1.32,
-                                color: line.kind == 3 ? C.error : C.text,
-                              ),
+                              style: textStyle,
                             );
                           },
                         ),
@@ -946,6 +1054,7 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
       ),
     );
   }
+
 }
 
 // ───────── مكونات مشتركة ─────────
@@ -1607,47 +1716,51 @@ class RunDot extends StatelessWidget {
       );
 }
 
-/// كل تشغيل جديد يمر من هنا (سكربت واحد في كل مرة الآن).
-/// true = المكان فارغ ويمكن بدء التشغيل.
-/// - يعمل سكربت آخر: نافذة «سكربت آخر يعمل» (إيقافه وتشغيل هذا؟).
+/// كل تشغيل جديد يمر من هنا. عدة سكربتات تعمل معًا (حتى RunSlot.maxConcurrent)، وتشغيل سكربت
+/// لا يوقف غيره. true = يمكن بدء التشغيل.
 /// - تعمل نسخة قديمة من هذا السكربت نفسه (نصه تغيّر): نافذة «إيقاف النسخة القديمة وتشغيل الجديدة؟».
+/// - وصلنا للحد الأقصى: رسالة، ولا يبدأ التشغيل.
 /// confirmOwnOldRun = false لزر «إعادة تشغيل» في شاشة الإخراج: المستخدم طلب الإيقاف بنفسه.
 Future<bool> claimRunSlot(BuildContext context, Script script,
     {bool confirmOwnOldRun = true}) async {
-  final other = runSlot.occupant;
-  if (other == null) return true;
-  final sameScript = other.scriptPath == script.path;
-  if (!sameScript || confirmOwnOldRun) {
-    final otherName =
-        other.scriptPath.substring(other.scriptPath.lastIndexOf('/') + 1);
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: C.surface,
-        title: Text(sameScript
-            ? 'إيقاف النسخة القديمة وتشغيل الجديدة؟'
-            : 'سكربت آخر يعمل'),
-        content: Text(sameScript
-            ? 'النسخة السابقة من هذا السكربت ما زالت تعمل بالنص القديم.'
-            : 'يعمل الآن $otherName. إيقافه وتشغيل هذا؟'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('إلغاء')),
-          TextButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('إيقاف وتشغيل')),
-        ],
-      ),
-    );
-    if (ok != true) return false;
+  final own = runSlot.occupantOf(script.path);
+  if (own != null) {
+    if (confirmOwnOldRun) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: C.surface,
+          title: const Text('إيقاف النسخة القديمة وتشغيل الجديدة؟'),
+          content: const Text('النسخة السابقة من هذا السكربت ما زالت تعمل بالنص القديم.'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('إلغاء')),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('إيقاف وتشغيل')),
+          ],
+        ),
+      );
+      if (ok != true) return false;
+    }
+    final freed = await runSlot.release(script.path);
+    if (!freed) {
+      if (context.mounted) {
+        _toast(context,
+            'السكربت الذي يعمل لم يتوقف بعد (قد يكون عالقًا في عملية شبكة أو ملف). حاول بعد قليل، أو أوقفه من إشعار «مشغّل بايثون»');
+      }
+      return false;
+    }
   }
-  final freed = await runSlot.release();
-  if (!freed && context.mounted) {
-    _toast(context,
-        'السكربت الذي يعمل لم يتوقف بعد (قد يكون عالقًا في عملية شبكة أو ملف). حاول بعد قليل، أو أوقفه من إشعار «مشغّل بايثون»');
+  if (runSlot.isFull) {
+    if (context.mounted) {
+      _toast(context,
+          'وصلت للحد الأقصى: ${RunSlot.maxConcurrent} سكربتات تعمل في نفس الوقت. أوقف سكربتًا ثم حاول مجددًا');
+    }
+    return false;
   }
-  return freed;
+  return true;
 }
 
 // ───────── إدارة السكربتات: تثبيت / إعادة تسمية / نسخ / حذف ─────────

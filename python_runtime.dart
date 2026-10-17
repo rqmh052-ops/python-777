@@ -791,7 +791,7 @@ String shortInstallReason(String raw) {
   if (t.contains('checksum')) return 'فشل التحقق من الملف المنزّل';
   if (t.contains('تم إيقاف التثبيت')) return 'تم إيقاف التثبيت';
   if (t.contains('هناك سكربت') || t.contains('أوقف السكربت')) {
-    return 'أوقف السكربت الحالي أولاً';
+    return 'أوقف السكربتات الشغّالة أولاً';
   }
   final first = t.split('\n').first.trim();
   return first.length > 60 ? '${first.substring(0, 60)}…' : first;
