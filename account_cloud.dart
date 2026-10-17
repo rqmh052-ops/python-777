@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// إعدادات الخدمة. معرّف تطبيق الويب ليس سرّاً، ولا نضع أي سرّ داخل التطبيق.
@@ -22,8 +23,7 @@ const int bynuxServerMaxBytes = 1024 * 1024;
 /// تغيير هذا الثابت مستقبلاً يعيد طلب الموافقة تلقائياً لكل الحسابات على الجهاز.
 const String bynuxLegalTermsVersion = '7.1_2026-10-15';
 
-/// هوية المستخدم المحفوظة على الجهاز. بعد أول دخول لا يعتمد التطبيق على جوجل
-/// ليعرف أنك مسجّل، فيفتح الرئيسية مباشرة حتى لو كان الإنترنت بطيئًا أو مقطوعًا.
+/// هوية المستخدم المحفوظة على الجهاز.
 class BynuxUser {
   const BynuxUser({required this.id, required this.email, this.displayName});
 
@@ -60,25 +60,217 @@ class CloudSessionGrant {
   final DateTime expiresAt;
 }
 
+/// لقطة الحالة المحفوظة على الجهاز: المستخدم، رمز الجلسة، والموافقات.
+/// تُحفظ دائمًا في مكانين مستقلين (SharedPreferences + ملف داخل مجلد التطبيق)
+/// فإذا فشل أحدهما أو ضاع، يكفي الآخر.
+class _SessionSnapshot {
+  _SessionSnapshot({
+    this.user,
+    this.session,
+    this.sessionExp,
+    Set<String>? consents,
+    this.signedOut = false,
+    this.savedAt = 0,
+  }) : consents = consents ?? <String>{};
+
+  final BynuxUser? user;
+  final String? session;
+  final DateTime? sessionExp;
+  final Set<String> consents;
+
+  /// true بعد ضغطة «تسجيل الخروج» الصريحة: نمنع الاستعادة الهادئة من جوجل
+  /// حتى لا يعود الحساب وحده إذا تعذّر على جوجل نفسه تسجيل الخروج.
+  final bool signedOut;
+  final int savedAt;
+
+  String encode() => jsonEncode(<String, Object?>{
+        'v': 2,
+        'savedAt': DateTime.now().millisecondsSinceEpoch,
+        'user': user?.toJson(),
+        'session': session,
+        'sessionExp': sessionExp?.millisecondsSinceEpoch,
+        'consents': consents.toList(),
+        'signedOut': signedOut,
+      });
+
+  static _SessionSnapshot? tryDecode(String? raw) {
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final data = jsonDecode(raw);
+      if (data is! Map) return null;
+      final token = data['session']?.toString();
+      final expMs = data['sessionExp'];
+      final consentsRaw = data['consents'];
+      return _SessionSnapshot(
+        user: BynuxUser.tryParse(data['user']),
+        session: (token == null || token.isEmpty) ? null : token,
+        sessionExp: expMs is num
+            ? DateTime.fromMillisecondsSinceEpoch(expMs.toInt())
+            : null,
+        consents: consentsRaw is List
+            ? consentsRaw.map((e) => e.toString()).toSet()
+            : <String>{},
+        signedOut: data['signedOut'] == true,
+        savedAt: (data['savedAt'] as num?)?.toInt() ?? 0,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// صيغة النسخة السابقة (bynux_session_v1) للترحيل بدون أن يخسر أحد جلسته.
+  static _SessionSnapshot? tryDecodeLegacy(String? raw) {
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final data = jsonDecode(raw);
+      if (data is! Map) return null;
+      final user = BynuxUser.tryParse(data['user']);
+      if (user == null) return null;
+      final token = data['session']?.toString();
+      final expMs = data['sessionExp'];
+      return _SessionSnapshot(
+        user: user,
+        session: (token == null || token.isEmpty) ? null : token,
+        sessionExp: expMs is num
+            ? DateTime.fromMillisecondsSinceEpoch(expMs.toInt())
+            : null,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// تخزين مزدوج: SharedPreferences + ملف JSON ذرّي داخل مجلد التطبيق الخاص.
+/// القراءة تأخذ الأحدث من الاثنين وتدمج الموافقات، والكتابة تتم على الاثنين دائمًا.
+class _SessionStore {
+  static const String _prefsKey = 'bynux_session_v2';
+  static const String _legacyPrefsKey = 'bynux_session_v1';
+  static const String _legacyConsentPrefix =
+      'bynux_consent_${bynuxLegalTermsVersion}_';
+  static const String _fileName = 'bynux_session_v2.json';
+
+  Future<void> _chain = Future<void>.value();
+
+  Future<File?> _file() async {
+    try {
+      final dir = await getApplicationSupportDirectory();
+      if (!await dir.exists()) await dir.create(recursive: true);
+      return File('${dir.path}/$_fileName');
+    } catch (error) {
+      debugPrint('session store: no support dir: $error');
+      return null;
+    }
+  }
+
+  Future<_SessionSnapshot> load() async {
+    final candidates = <_SessionSnapshot>[];
+    final consents = <String>{};
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      try {
+        await prefs.reload();
+      } catch (_) {}
+      final current = _SessionSnapshot.tryDecode(prefs.getString(_prefsKey));
+      if (current != null) candidates.add(current);
+      final legacy =
+          _SessionSnapshot.tryDecodeLegacy(prefs.getString(_legacyPrefsKey));
+      if (legacy != null) candidates.add(legacy);
+      for (final key in prefs.getKeys()) {
+        if (key.startsWith(_legacyConsentPrefix) &&
+            prefs.getBool(key) == true) {
+          final id = key.substring(_legacyConsentPrefix.length);
+          if (id.isNotEmpty) consents.add(BynuxSession.consentKeyForId(id));
+        }
+      }
+    } catch (error) {
+      debugPrint('session store: prefs read failed: $error');
+    }
+
+    try {
+      final file = await _file();
+      if (file != null && await file.exists()) {
+        final fromFile = _SessionSnapshot.tryDecode(await file.readAsString());
+        if (fromFile != null) candidates.add(fromFile);
+      }
+    } catch (error) {
+      debugPrint('session store: file read failed: $error');
+    }
+
+    _SessionSnapshot? best;
+    for (final candidate in candidates) {
+      consents.addAll(candidate.consents);
+      if (best == null || candidate.savedAt >= best.savedAt) best = candidate;
+    }
+    return _SessionSnapshot(
+      user: best?.user,
+      session: best?.session,
+      sessionExp: best?.sessionExp,
+      consents: consents,
+      signedOut: best?.signedOut ?? false,
+      savedAt: best?.savedAt ?? 0,
+    );
+  }
+
+  /// الكتابات تتسلسل حتى لا تتداخل، ويُكتب الاثنان دائمًا.
+  Future<void> save(_SessionSnapshot snapshot) {
+    final encoded = snapshot.encode();
+    final run = _chain.then((_) => _saveNow(encoded));
+    _chain = run.then<void>((_) {}, onError: (Object _) {});
+    return run;
+  }
+
+  Future<void> _saveNow(String encoded) async {
+    var okPrefs = false;
+    var okFile = false;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      okPrefs = await prefs.setString(_prefsKey, encoded);
+    } catch (error) {
+      debugPrint('session store: prefs write failed: $error');
+    }
+    try {
+      final file = await _file();
+      if (file != null) {
+        final tmp = File('${file.path}.tmp');
+        await tmp.writeAsString(encoded, flush: true);
+        await tmp.rename(file.path);
+        okFile = true;
+      }
+    } catch (error) {
+      debugPrint('session store: file write failed: $error');
+    }
+    if (!okPrefs && !okFile) {
+      debugPrint('session store: BOTH layers failed to save the session');
+    }
+  }
+}
+
 class BynuxSession extends ChangeNotifier {
   BynuxSession._();
   static final BynuxSession instance = BynuxSession._();
 
-  static const String _prefsKey = 'bynux_session_v1';
-  static const String _consentPrefix =
-      'bynux_consent_${bynuxLegalTermsVersion}_';
+  /// مفتاح موافقة الحساب (مرتبط بإصدار نصوص الشروط). يُطابَق بالمعرّف أو بالبريد.
+  static String consentKeyForId(String id) =>
+      '$bynuxLegalTermsVersion|id:$id';
+  static String consentKeyForEmail(String email) =>
+      '$bynuxLegalTermsVersion|mail:${email.trim().toLowerCase()}';
 
-  /// مفتاح حفظ الموافقة محلياً مرتبط بمعرّف حساب جوجل وإصدار نصوص الشروط.
-  static String consentPrefsKey(String userId) => '$_consentPrefix$userId';
-
+  final _SessionStore _store = _SessionStore();
   final GoogleSignIn _google = GoogleSignIn.instance;
+  final Set<String> _consents = <String>{};
   StreamSubscription<GoogleSignInAuthenticationEvent>? _events;
   GoogleSignInAccount? _account;
   BynuxUser? _user;
   String? _sessionToken;
   DateTime? _sessionExpiresAt;
   String? _pendingGoogleToken;
+  Timer? _readyFailsafe;
+  Future<void>? _restoreFuture;
+  Future<String?>? _refreshFuture;
   bool _consented = false;
+  bool _signedOut = false;
   bool _googleReady = false;
   bool _ready = false;
   bool _signingIn = false;
@@ -99,82 +291,77 @@ class BynuxSession extends ChangeNotifier {
     return expiresAt.isAfter(DateTime.now().add(const Duration(minutes: 1)));
   }
 
-  /// يقرأ الجلسة المحفوظة وحالة موافقة الحساب من ملف محلي (بدون شبكة).
-  /// يُستدعى قبل runApp ليظهر أول إطار صحيحًا: الرئيسية إن كان الحساب موافقًا،
-  /// أو شاشة الموافقة إن لم يوافق بعد، أو شاشة الدخول إن لم يكن هناك حساب.
+  bool _isConsentedFor(String id, String email) {
+    if (id.isNotEmpty && _consents.contains(consentKeyForId(id))) return true;
+    if (email.trim().isNotEmpty &&
+        _consents.contains(consentKeyForEmail(email))) {
+      return true;
+    }
+    return false;
+  }
+
+  Future<void> _persist() => _store.save(_SessionSnapshot(
+        user: _user,
+        session: _sessionToken,
+        sessionExp: _sessionExpiresAt,
+        consents: Set<String>.of(_consents),
+        signedOut: _signedOut,
+      ));
+
+  void _finishReady() {
+    _readyFailsafe?.cancel();
+    _readyFailsafe = null;
+    if (_ready) return;
+    _ready = true;
+    notifyListeners();
+  }
+
+  /// يقرأ الحالة المحفوظة (بدون شبكة) من المكانين ويدمجهما. يُستدعى قبل runApp.
+  /// - حساب محفوظ: الرئيسية (أو الموافقة) من أول إطار.
+  /// - خروج صريح سابق: شاشة الدخول مباشرة.
+  /// - لا شيء محفوظ: تبقى شاشة انتظار قصيرة حتى تنتهي الاستعادة الهادئة من جوجل
+  ///   (نفس سلوك النسخة القديمة التي كانت تعمل على هاتفك)، بسقف 10 ثوانٍ.
   Future<void> loadSaved() async {
     if (_ready) return;
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_prefsKey);
-      if (raw != null && raw.isNotEmpty) {
-        final data = jsonDecode(raw);
-        if (data is Map) {
-          _user = BynuxUser.tryParse(data['user']);
-          if (_user != null) {
-            _consented = prefs.getBool(consentPrefsKey(_user!.id)) == true;
-            final token = data['session']?.toString();
-            final expMs = data['sessionExp'];
-            if (token != null && token.isNotEmpty && expMs is num) {
-              _sessionToken = token;
-              _sessionExpiresAt =
-                  DateTime.fromMillisecondsSinceEpoch(expMs.toInt());
-            }
-          }
-        }
+      final snap = await _store.load();
+      _consents
+        ..clear()
+        ..addAll(snap.consents);
+      _signedOut = snap.signedOut;
+      _user = snap.user;
+      _sessionToken = snap.session;
+      _sessionExpiresAt = snap.sessionExp;
+      final current = _user;
+      if (current != null) {
+        _consented = _isConsentedFor(current.id, current.email);
       }
-    } catch (_) {
-      // ملف تالف أو تخزين غير متاح: نبدأ بدون جلسة (شاشة الدخول) ولا نوقف التطبيق.
+    } catch (error) {
+      debugPrint('loadSaved failed: $error');
       _user = null;
       _sessionToken = null;
       _sessionExpiresAt = null;
       _consented = false;
     }
-    _ready = true;
-    notifyListeners();
-  }
-
-  Future<bool> _readConsent(String userId) async {
-    if (userId.isEmpty) return false;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      return prefs.getBool(consentPrefsKey(userId)) == true;
-    } catch (_) {
-      return false;
+    if (_user != null || _signedOut) {
+      _ready = true;
+      notifyListeners();
+    } else {
+      _readyFailsafe = Timer(const Duration(seconds: 10), _finishReady);
     }
   }
 
-  Future<void> _persist() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final current = _user;
-      if (current == null) {
-        await prefs.remove(_prefsKey);
-        return;
-      }
-      await prefs.setString(
-        _prefsKey,
-        jsonEncode(<String, Object?>{
-          'user': current.toJson(),
-          'session': _sessionToken,
-          'sessionExp': _sessionExpiresAt?.millisecondsSinceEpoch,
-        }),
-      );
-    } catch (_) {
-      // الحفظ أفضل جهد: الجلسة الحالية تبقى صالحة حتى إغلاق التطبيق.
-    }
-  }
-
-  /// يحفظ موافقة الحساب الحالي محلياً ويستكمل إنشاء جلسة الخادم المؤجّلة.
+  /// يحفظ موافقة الحساب الحالي على المكانين ويستكمل إنشاء جلسة الخادم المؤجّلة.
   Future<void> acceptConsent() async {
     final current = _user;
     if (current == null) return;
+    _consents.add(consentKeyForId(current.id));
+    if (current.email.trim().isNotEmpty) {
+      _consents.add(consentKeyForEmail(current.email));
+    }
     _consented = true;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(consentPrefsKey(current.id), true);
-    } catch (_) {}
     notifyListeners();
+    await _persist();
     final pendingToken = _pendingGoogleToken ?? _freshGoogleToken();
     _pendingGoogleToken = null;
     if (!_sessionIsValid && pendingToken != null) {
@@ -192,8 +379,10 @@ class BynuxSession extends ChangeNotifier {
         (event) {
           // نتجاهل حدث الخروج القادم من المكتبة عمدًا: الخروج الوحيد المعتمد هو
           // ضغطة «تسجيل الخروج» من المستخدم، حتى لا تضيع الجلسة بسبب حدث عابر.
-          if (event is GoogleSignInAuthenticationEventSignIn && !_signingIn) {
-            unawaited(_adoptAccountAsync(event.user));
+          if (event is GoogleSignInAuthenticationEventSignIn &&
+              !_signingIn &&
+              !_signedOut) {
+            unawaited(_adoptAccount(event.user));
           }
         },
         onError: (Object error) {
@@ -210,29 +399,105 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
-  /// لا يستدعي جوجل إطلاقًا. الجلسة المحفوظة (رمز الخادم الطويل) هي المرجع الوحيد؛
-  /// واجهة جوجل لا تظهر إلا من زر «تسجيل الدخول» اليدوي. بقيت الدالة لأن الشاشة تستدعيها.
-  Future<void> restoreInBackground() async {}
+  /// الاستعادة الهادئة من جوجل عند فتح التطبيق (هذا ما كان يحفظ الدخول في النسخة القديمة).
+  /// تعمل في الخلفية مع إعادة محاولة وصبر أطول، وإذا نجحت بعد ظهور شاشة الدخول
+  /// تنتقل الشاشة تلقائيًا للرئيسية (أو الموافقة). تُنفَّذ مرة واحدة لكل تشغيل.
+  Future<void> restoreInBackground() => _restoreFuture ??= _restoreOnce();
 
-  Future<void> _adoptAccountAsync(GoogleSignInAccount account) async {
-    final consented = await _readConsent(account.id);
-    _adoptAccount(account, consented: consented);
+  Future<void> _restoreOnce() async {
+    try {
+      if (_signedOut) return;
+      await initialize();
+      if (!_googleReady) return;
+      final account = await _silentRestore(attempts: 3);
+      if (account != null && !_signedOut && !_signingIn) {
+        await _adoptAccount(account);
+      }
+    } catch (error) {
+      debugPrint('restoreInBackground failed: $error');
+    } finally {
+      _finishReady();
+    }
   }
 
-  void _adoptAccount(GoogleSignInAccount account, {required bool consented}) {
+  /// محاولة استعادة هادئة من جوجل. null = لا حساب سابق أو فشلت كل المحاولات.
+  /// المهلة لكل محاولة طويلة نسبيًا: الاستعادة قد تتأخر على بعض الأجهزة، وهذا كان
+  /// سبب فشلها سابقًا حين كانت مهلتها 8 ثوانٍ.
+  Future<GoogleSignInAccount?> _silentRestore({required int attempts}) async {
+    var emptyAnswers = 0;
+    for (var i = 0; i < attempts; i++) {
+      try {
+        final attempt = _google.attemptLightweightAuthentication();
+        if (attempt == null) return null; // المنصة لا تدعمها.
+        final account = await attempt.timeout(const Duration(seconds: 25));
+        if (account != null) return account;
+        // جواب فارغ مرتين = لا يوجد حساب سابق فعلًا (أول تثبيت): لا داعي لإبطاء شاشة الدخول.
+        if (++emptyAnswers >= 2) return null;
+      } on TimeoutException {
+        // سنعيد المحاولة؛ وإن اكتملت المحاولة المتأخرة يلتقطها مستمع الأحداث.
+      } catch (error) {
+        debugPrint('silent restore attempt ${i + 1} failed: $error');
+      }
+      if (i + 1 < attempts) {
+        await Future<void>.delayed(Duration(milliseconds: 1500 * (i + 1)));
+      }
+    }
+    return null;
+  }
+
+  /// رمز جوجل جديد بدون أي واجهة: يُستعمل عندما ينتهي رمز جوجل في الذاكرة ولا توجد جلسة صالحة.
+  Future<String?> _refreshGoogleSilently() {
+    final running = _refreshFuture;
+    if (running != null) return running;
+    final next = _doRefreshGoogle().whenComplete(() => _refreshFuture = null);
+    _refreshFuture = next;
+    return next;
+  }
+
+  Future<String?> _doRefreshGoogle() async {
+    if (_signedOut) return null;
+    try {
+      await initialize();
+      if (!_googleReady) return null;
+      final account = await _silentRestore(attempts: 2);
+      if (account == null) return null;
+      _account = account;
+      final token = account.authentication.idToken;
+      return _idTokenIsFresh(token) ? token : null;
+    } catch (error) {
+      debugPrint('silent refresh failed: $error');
+      return null;
+    }
+  }
+
+  /// يعتمد حسابًا جاء من جوجل (استعادة هادئة أو حدث) ويحفظه على المكانين.
+  Future<void> _adoptAccount(GoogleSignInAccount account) async {
     _account = account;
     final next = BynuxUser.fromGoogle(account);
     final current = _user;
-    if (current == null || current.id != next.id) {
+    final sameAccount = current != null &&
+        (current.id == next.id ||
+            (current.email.trim().isNotEmpty &&
+                current.email.trim().toLowerCase() ==
+                    next.email.trim().toLowerCase()));
+    if (!sameAccount) {
       // رمز الجلسة المحفوظ يخص حسابًا آخر.
       _sessionToken = null;
       _sessionExpiresAt = null;
     }
     _user = next;
-    _consented = consented;
+    _signedOut = false;
+    _consented = _isConsentedFor(next.id, next.email);
     _initializationError = null;
-    unawaited(_persist());
+    _ready = true;
+    _readyFailsafe?.cancel();
+    _readyFailsafe = null;
     notifyListeners();
+    await _persist();
+    if (_consented && !_sessionIsValid) {
+      final google = _freshGoogleToken();
+      if (google != null) unawaited(_obtainSession(google));
+    }
   }
 
   Future<void> signIn() async {
@@ -247,12 +512,13 @@ class BynuxSession extends ChangeNotifier {
       if (token == null || token.isEmpty) {
         throw StateError('لم يصل رمز التحقق من جوجل. تحقّق من إعدادات معرّف التطبيق وبصمة التوقيع.');
       }
-      final alreadyConsented = await _readConsent(account.id);
+      _signedOut = false;
+      final alreadyConsented = _isConsentedFor(account.id, account.email);
       if (alreadyConsented) {
         // الحساب وافق مسبقًا على هذا الجهاز: ننشئ جلسة الخادم مباشرة.
         final grant = await _mintSession(token, attempts: 2);
         _pendingGoogleToken = null;
-        _adoptAccount(account, consented: true);
+        await _adoptAccount(account);
         if (grant != null) {
           _sessionToken = grant.token;
           _sessionExpiresAt = grant.expiresAt;
@@ -261,7 +527,7 @@ class BynuxSession extends ChangeNotifier {
       } else {
         // الحساب لم يوافق بعد: نؤجّل إنشاء جلسة الخادم وأي اتصال بالسحابة إلى ما بعد الموافقة.
         _pendingGoogleToken = token;
-        _adoptAccount(account, consented: false);
+        await _adoptAccount(account);
       }
     } catch (error) {
       _initializationError = _friendlyError(error);
@@ -280,6 +546,7 @@ class BynuxSession extends ChangeNotifier {
     _sessionExpiresAt = null;
     _pendingGoogleToken = null;
     _consented = false;
+    _signedOut = true;
     _initializationError = null;
     await _persist();
     notifyListeners();
@@ -356,15 +623,17 @@ class BynuxSession extends ChangeNotifier {
     }
   }
 
-  /// الرمز الذي يُرسل للخادم: رمز الجلسة المحفوظ إن كان صالحًا، وإلا رمز جوجل إن كان
-  /// ما زال في الذاكرة. لا نفتح واجهة جوجل هنا أبدًا، ولا نسمح بأي طلب قبل موافقة المستخدم.
+  /// الرمز الذي يُرسل للخادم، بالترتيب: رمز الجلسة المحفوظ إن كان صالحًا، ثم رمز جوجل
+  /// الحاضر في الذاكرة، ثم رمز جديد من استعادة جوجل الهادئة. لا نفتح واجهة جوجل هنا أبدًا،
+  /// ولا نسمح بأي طلب قبل موافقة المستخدم.
   Future<String> authToken() async {
     if (!hasConsented) {
       throw const CloudApiException('يلزم الموافقة على شروط الاستخدام وسياسة الخصوصية أولاً.');
     }
     final saved = _sessionToken;
     if (saved != null && _sessionIsValid) return saved;
-    final google = _freshGoogleToken();
+    var google = _freshGoogleToken();
+    google ??= await _refreshGoogleSilently();
     if (google != null) {
       unawaited(_obtainSession(google));
       return google;
@@ -395,6 +664,7 @@ class BynuxSession extends ChangeNotifier {
 
   @override
   void dispose() {
+    _readyFailsafe?.cancel();
     _events?.cancel();
     super.dispose();
   }
