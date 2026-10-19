@@ -11,11 +11,24 @@ import zipfile
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "bayan_runtime.py"
-spec = importlib.util.spec_from_file_location("bayan_runtime_test_target", MODULE_PATH)
-if spec is None or spec.loader is None:
-    raise RuntimeError("تعذر تحميل bayan_runtime.py")
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+import os as _os_override
+from importlib.machinery import ExtensionFileLoader as _ExtLoader
+
+_override_path = _os_override.environ.get("BAYAN_RUNTIME_PATH", "")
+if _override_path.endswith(".so"):
+    # اختبار نسخة Cython المجمّعة: يجب أن تكون الوحدة المحمّلة امتدادًا .so بلا نسخة .py بجوارها.
+    _loader = _ExtLoader("bayan_runtime", _override_path)
+    spec = importlib.util.spec_from_loader("bayan_runtime", _loader)
+    mod = importlib.util.module_from_spec(spec)
+    _loader.exec_module(mod)
+    assert str(mod.__file__).endswith(".so"), mod.__file__
+    assert not Path(_override_path).with_name("bayan_runtime.py").exists(), "py copy beside the .so"
+else:
+    spec = importlib.util.spec_from_file_location("bayan_runtime_test_target", MODULE_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("تعذر تحميل bayan_runtime.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
 
 
 class Callback:

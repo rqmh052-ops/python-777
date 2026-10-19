@@ -26,10 +26,23 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "bayan_runtime.py"
 KOTLIN = ROOT / "MainActivity.kt"
 
-spec = importlib.util.spec_from_file_location("bayan_runtime_extra_target", RUNTIME)
-assert spec and spec.loader
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+import os as _os_override
+from importlib.machinery import ExtensionFileLoader as _ExtLoader
+
+_override_path = _os_override.environ.get("BAYAN_RUNTIME_PATH", "")
+if _override_path.endswith(".so"):
+    # اختبار نسخة Cython المجمّعة: يجب أن تكون الوحدة المحمّلة امتدادًا .so بلا نسخة .py بجوارها.
+    _loader = _ExtLoader("bayan_runtime", _override_path)
+    spec = importlib.util.spec_from_loader("bayan_runtime", _loader)
+    mod = importlib.util.module_from_spec(spec)
+    _loader.exec_module(mod)
+    assert str(mod.__file__).endswith(".so"), mod.__file__
+    assert not Path(_override_path).with_name("bayan_runtime.py").exists(), "py copy beside the .so"
+else:
+    spec = importlib.util.spec_from_file_location("bayan_runtime_extra_target", RUNTIME)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +103,12 @@ def test_kotlin_contract() -> None:
 
 def test_build_disables_shrink() -> None:
     wf = (ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
-    line = next(l for l in wf.splitlines() if "flutter build apk" in l and "run:" in l)
-    assert "--no-shrink" in line, "R8 would rename RunCallback/PackageCallback again"
+    builds = [l.strip() for l in wf.splitlines() if "flutter build apk" in l]
+    assert len(builds) == 2, builds
+    default, rollback = builds
+    assert "--no-shrink" not in default and "--obfuscate" in default, default
+    assert "--no-shrink" in rollback, "shrink=false must restore the old --no-shrink build"
+    assert "shrink:" in wf and "workflow_dispatch" in wf, "rollback input is missing"
     assert "tools/verify_apk.py" in wf, "CI must fail when the APK lost the Kotlin callbacks"
 
 
