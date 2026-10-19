@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      shrink:
+        description: "تفعيل R8 (تصغير/تعمية الكود). اتركه true إلا للتراجع السريع عند عطل غير متوقع."
+        type: boolean
+        default: true
+      cython:
+        description: "المرحلة 4 (تجريبية): تجميع bayan_runtime.py بـ Cython إلى .so. false = السلوك القديم (pyc)."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,7 +60,8 @@ jobs:
 
       - name: Validate Python runtime
         run: |
-          python -m py_compile bayan_runtime.py tools/test_runtime.py tools/test_extra.py tools/verify_apk.py tools/prepare_android.py
+          python -m py_compile bayan_runtime.py tools/test_runtime.py tools/test_extra.py tools/verify_apk.py tools/prepare_android.py tools/build_cython.py tools/test_pinning_roots.py
+          python tools/test_pinning_roots.py
           python tools/test_runtime.py
           python tools/test_extra.py
           flutter --version
@@ -61,7 +71,7 @@ jobs:
           cp pubspec.yaml /tmp/bayan_pubspec.yaml
           rm -rf lib
           mkdir -p lib
-          cp main.dart store.dart logo.dart python_runtime.dart script_runner.dart account_cloud.dart lib/
+          cp main.dart store.dart logo.dart python_runtime.dart script_runner.dart account_cloud.dart secure_http.dart lib/
           cp -r lib /tmp/bayan_lib
           flutter create . --platforms=android --project-name app --org com.bynux
           rm -rf lib
@@ -77,9 +87,6 @@ jobs:
               - test/**
           EOF
 
-      - name: Configure Chaquopy and Android
-        run: python tools/prepare_android.py
-
       - name: Prepare stable Android signing key
         env:
           BYNUX_KEYSTORE_BASE64: ${{ secrets.BYNUX_KEYSTORE_BASE64 }}
@@ -90,22 +97,74 @@ jobs:
             echo "BYNUX_KEYSTORE_PATH=$RUNNER_TEMP/bynux-release.jks" >> "$GITHUB_ENV"
             echo "BYNUX_KEYSTORE_PASSWORD=$BYNUX_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
             echo "Stable Bynux signing key configured."
+            # المرحلة 3: بصمة SHA-256 لشهادة التوقيع (alias = bynux كما في prepare_android.py).
+            CERT_SHA256=$(keytool -exportcert -alias bynux -keystore "$RUNNER_TEMP/bynux-release.jks" -storepass "$BYNUX_KEYSTORE_PASSWORD" | sha256sum | cut -d' ' -f1)
+            if [ "${#CERT_SHA256}" -ne 64 ]; then
+              echo "Failed to compute the signing certificate SHA-256 (alias 'bynux')."
+              exit 1
+            fi
+            echo "BYNUX_CERT_SHA256=$CERT_SHA256" >> "$GITHUB_ENV"
+            echo "Signature integrity check will be ENABLED (certificate SHA-256 injected)."
           else
             echo "Signing secrets are not configured; this build will use Flutter's temporary debug signing key. Google Sign-In will not be stable until both secrets are added."
+            echo "Signature integrity check will be DISABLED for this build (debug signing)."
           fi
+
+      # المرحلة 4 (تجريبية، فقط عند cython=true): اختبار نسخة Cython على المضيف ثم محاولة التجميع المتقاطع.
+      # أي فشل في التجميع المتقاطع/الدمج يرجع تلقائيًا لنسخة .py القديمة دون كسر البناء.
+      - name: Cython host build and tests
+        if: ${{ inputs.cython == true }}
+        run: |
+          python -m pip install cython setuptools wheel
+          python tools/build_cython.py host build/cython_host
+          BAYAN_RUNTIME_PATH=$(ls build/cython_host/bayan_runtime*.so) python tools/test_runtime.py
+          BAYAN_RUNTIME_PATH=$(ls build/cython_host/bayan_runtime*.so) python tools/test_extra.py
+
+      - name: Cython Android cross-compile (falls back to .py on failure)
+        if: ${{ inputs.cython == true }}
+        continue-on-error: true
+        run: |
+          python tools/build_cython.py android build/cython_android
+          echo "BYNUX_CYTHON_SO=$(ls $PWD/build/cython_android/bayan_runtime*.so)" >> "$GITHUB_ENV"
+          echo "BYNUX_EXPECT_CYTHON=1" >> "$GITHUB_ENV"
+
+      - name: Configure Chaquopy and Android
+        run: python tools/prepare_android.py
 
       - name: Install Flutter dependencies
         run: flutter pub get
 
+      # المرحلة 2: بوابة التثبيت قبل البناء (اتصال حقيقي + اختبار سلبي ضد example.com).
+      - name: TLS pinning gate
+        run: dart run tools/check_pinning.dart
+
       - name: Analyze Dart
         run: flutter analyze
 
-      # --no-shrink ضروري: R8 يعيد تسمية كلاسات Kotlin (مثل RunCallback -> y0) ويحذف
-      # دوال emitState/emitPackage لأن بايثون وحده يستدعيها، فتفشل كل السكربتات والمكتبات.
+      # R8 مفعّل افتراضيًا الآن (بلا --no-shrink). قواعد proguard-rules.pro المولَّدة في
+      # tools/prepare_android.py تُبقي BayanPythonBridge وكلاسات emitState/emitPackage التي
+      # يستدعيها بايثون بالاسم، وخطوة "Verify Kotlin callbacks survived R8" تفشل البناء فورًا
+      # إن حُذفت رغم ذلك. مدخل workflow_dispatch باسم shrink=false يعيد --no-shrink القديم
+      # للتراجع السريع عند أي عطل غير متوقع لم تغطه قواعد الـ keep.
+      - name: Resolve shrink flag
+        id: shrink
+        run: |
+          value="${{ inputs.shrink }}"
+          if [ -z "$value" ]; then
+            value="true"
+          fi
+          echo "enabled=$value" >> "$GITHUB_OUTPUT"
+          echo "Shrink (R8) enabled: $value"
+
       - name: Build release APK
         env:
           JAVA_TOOL_OPTIONS: -Xmx4g
-        run: flutter build apk --release --no-shrink --target-platform android-arm64 --obfuscate --split-debug-info=build/symbols
+        run: |
+          if [ "${{ steps.shrink.outputs.enabled }}" = "true" ]; then
+            flutter build apk --release --target-platform android-arm64 --obfuscate --split-debug-info=build/symbols
+          else
+            flutter build apk --release --no-shrink --target-platform android-arm64 --obfuscate --split-debug-info=build/symbols
+          fi
 
       - name: Verify APK
         run: |
@@ -139,5 +198,5 @@ jobs:
       - name: Fail the build if the Kotlin callbacks were removed
         if: steps.verify.outcome == 'failure'
         run: |
-          echo "R8 removed the Kotlin callbacks - do NOT install this APK (it shows 'y0 object has no attribute')."
+          echo "APK verification failed (R8 removed Kotlin callbacks, or the signing certificate / Cython checks failed) - do NOT install this APK."
           exit 1
