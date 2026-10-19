@@ -134,7 +134,7 @@ jobs:
       - name: Install Flutter dependencies
         run: flutter pub get
 
-      # المرحلة 2: بوابة التثبيت قبل البناء (اتصال حقيقي + اختبار سلبي ضد example.com).
+      # المرحلة 2: بوابة التثبيت قبل البناء (اتصال حقيقي + اختبار سلبي بسياق ثقة فارغ + رفض المضيفين الأخرى).
       - name: TLS pinning gate
         run: dart run tools/check_pinning.dart
 
