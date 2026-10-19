@@ -1,6 +1,14 @@
 // بوابة CI: يتحقق أن التثبيت يعمل فعلًا قبل البناء.
-//  1) اتصال حقيقي بالخادم: أي رد HTTP (حتى 401/404) = نجاح المصافحة؛ HandshakeException = فشل البناء.
-//  2) اختبار سلبي: العميل المثبَّت يجب أن يفشل مع https://example.com (دليل أنه لا يستعمل جذور النظام).
+//  1) اتصال حقيقي بالخادم عبر العميل المثبَّت الفعلي: أي رد HTTP (حتى 401/404) = نجاح المصافحة؛
+//     HandshakeException = فشل البناء (الجذور المضمّنة لا تغطي سلسلة الخادم).
+//  2) اختبار سلبي حتمي: نفس الخادم الحقيقي، لكن بسياق ثقة فارغ (withTrustedRoots: false وبلا أي جذر).
+//     يجب أن تفشل المصافحة؛ وهذا دليل أن جذور النظام لا تُستعمل أصلًا (جذور runner تثق بهذا الخادم حتمًا).
+//
+// لماذا لا نختبر ضد موقع خارجي (مثل example.com)؟ لأن القائمة تضم عمدًا جذور مُصدري Cloudflare
+// (ISRG وGTS وSSL.com وSectigo)، وكثير من المواقع تستعمل الجذور نفسها، فقد ينجح الاتصال بها
+// وهذا سلوك صحيح للتثبيت على مستوى الجذور، لا عيب فيه. أما منع بقية المضيفين فتتولاه
+// requirePinnedUri في طبقة التطبيق، ونختبره هنا أيضًا (3).
+//  3) requirePinnedUri يرفض مضيفًا آخر وhttp العادي.
 // التشغيل: dart run tools/check_pinning.dart
 import 'dart:io';
 
@@ -9,6 +17,7 @@ import '../secure_http.dart';
 Future<void> main() async {
   var failed = false;
 
+  // 1) إيجابي: العميل المثبَّت الفعلي مع الخادم الحقيقي.
   final client = createPinnedHttpClient();
   try {
     final request = await openPinned(
@@ -30,26 +39,43 @@ Future<void> main() async {
     client.close(force: true);
   }
 
-  // اختبار سلبي: نتجاوز requirePinnedUri عمدًا باستعمال HttpClient المثبَّت مباشرة.
-  final negative = createPinnedHttpClient();
+  // 2) سلبي: الخادم نفسه بسياق بلا أي جذر. لو نجح فجذور النظام تُستعمل = التثبيت غير مطبّق.
+  final empty = createPinnedHttpClient(
+    contextOverride: SecurityContext(withTrustedRoots: false),
+  );
   try {
-    final request = await negative
-        .getUrl(Uri.parse('https://example.com/'))
+    final request = await empty
+        .getUrl(Uri.parse('https://$pinnedHost/'))
         .timeout(const Duration(seconds: 30));
     final response = await request.close().timeout(const Duration(seconds: 30));
     await response.drain<void>();
-    stderr.writeln('FAIL: pinned client connected to example.com - pinning is NOT enforced.');
+    stderr.writeln('FAIL: client with an EMPTY trust store still connected - system roots are being used.');
     failed = true;
   } on HandshakeException {
-    stdout.writeln('OK: example.com was rejected (pinning is enforced).');
+    stdout.writeln('OK: empty trust store was rejected (system roots are not used).');
   } on TlsException {
-    stdout.writeln('OK: example.com was rejected (pinning is enforced).');
+    stdout.writeln('OK: empty trust store was rejected (system roots are not used).');
   } catch (e) {
-    // خطأ شبكة غير TLS (مثل انقطاع DNS) لا يثبت التثبيت ولا ينفيه.
+    // خطأ شبكة غير TLS لا يثبت التثبيت ولا ينفيه.
     stderr.writeln('FAIL: negative test inconclusive (non-TLS error): $e');
     failed = true;
   } finally {
-    negative.close(force: true);
+    empty.close(force: true);
+  }
+
+  // 3) طبقة المضيف: أي مضيف آخر أو http العادي يُرفض قبل أي اتصال.
+  for (final bad in <String>[
+    'https://example.com/',
+    'https://evil.$pinnedHost.example.org/',
+    'http://$pinnedHost/',
+  ]) {
+    try {
+      requirePinnedUri(Uri.parse(bad));
+      stderr.writeln('FAIL: requirePinnedUri accepted $bad');
+      failed = true;
+    } on ArgumentError {
+      stdout.writeln('OK: requirePinnedUri rejected $bad');
+    }
   }
 
   exit(failed ? 1 : 0);
