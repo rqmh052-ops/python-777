@@ -2165,7 +2165,8 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
             val bridge = BayanPythonBridge.get(context)
             bridge.appLang = value
             bridge.refreshPipParams()
-            BayanScriptService.sync(context)
+            // يعيد بناء إشعار الخدمة (نصّه يتبع اللغة) إن كانت تعمل، ولا يبدأ خدمة جديدة
+            BayanScriptService.onRunsChanged()
         }
         return ok
     }
