@@ -163,6 +163,11 @@ androidComponents {
                 println("BAYAN-ABI after $typeName: $abiFilters")
             }
         }
+        dsl.packaging.jniLibs.excludes.add("**/libdatastore_shared_counter.so")
+        dsl.packaging.jniLibs.excludes.add("**/libdartjni.so")
+        dsl.packaging.jniLibs.excludes.add("**/libsqlite3_chaquopy.so")
+        dsl.packaging.jniLibs.excludes.add("**/libcrypto_chaquopy.so")
+        dsl.packaging.jniLibs.excludes.add("**/libssl_chaquopy.so")
     }
 }
 """
@@ -180,6 +185,11 @@ androidComponents {
                 abiFilters.add('arm64-v8a')
             }
         }
+        dsl.packaging.jniLibs.excludes.add('**/libdatastore_shared_counter.so')
+        dsl.packaging.jniLibs.excludes.add('**/libdartjni.so')
+        dsl.packaging.jniLibs.excludes.add('**/libsqlite3_chaquopy.so')
+        dsl.packaging.jniLibs.excludes.add('**/libcrypto_chaquopy.so')
+        dsl.packaging.jniLibs.excludes.add('**/libssl_chaquopy.so')
     }
 }
 """
