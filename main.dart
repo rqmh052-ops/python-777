@@ -1333,7 +1333,7 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final _key = GlobalKey<ScaffoldState>();
   Timer? _tick;
-  bool _asked = false, _dialogOpen = false, _prevFallback = false;
+  bool _dialogOpen = false, _prevFallback = false;
 
   @override
   void initState() {
@@ -1364,7 +1364,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       } catch (_) {}
       if (!mounted) return;
       // الترحيب يشمل إذن الملفات، فلا نعرض نافذته المنفصلة في هذه المرة
-      _asked = true;
       await _showWelcome();
       return;
     }
@@ -4310,38 +4309,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     }
   }
 
-  Future<void> _openAutoStart() async {
-    final how = await bayanSystem.openAutoStart();
-    if (how == 'app') {
-      if (mounted) _snack(tr('فتحنا إعدادات التطبيق بدل صفحة الشركة.', 'Opened app settings instead of OEM page.'));
-    } else if (how == 'failed') {
-      if (mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
-    }
-  }
-
-  Future<void> _openBrandBattery() async {
-    final how = await bayanSystem.openBrandBattery();
-    if (how == 'app') {
-      if (mounted) _snack(tr('فتحنا إعدادات التطبيق بدل صفحة الشركة.', 'Opened app settings instead of OEM page.'));
-    } else if (how == 'failed') {
-      if (mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
-    }
-  }
-
-  Future<void> _openAppSettings() async {
-    final ok = await bayanSystem.openAppSettings();
-    if (!ok && mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
-  }
-
-  Future<void> _openDeveloper() async {
-    final how = await bayanSystem.openDeveloperOptions();
-    if (how == 'about') {
-      if (mounted) _snack(tr('فعّل خيارات المطور: اضغط 7 مرات على «رقم الإصدار».', 'Enable Developer Options: tap "Build number" 7 times.'));
-    } else if (how == 'failed') {
-      if (mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
-    }
-  }
-
   Widget _card({
     required int index,
     required String id,
@@ -4428,148 +4395,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     );
   }
 
-  // بطاقة اختصار: الضغط عليها يفتح صفحة الإعداد مباشرة (عنوان + سطر قصير)
-  Widget _shortcut({
-    required int index,
-    required IconData icon,
-    required String title,
-    required String hint,
-    required Future<void> Function() onTap,
-  }) =>
-      Appear(
-        index: index,
-        child: PressFx(
-          scale: .985,
-          child: Container(
-            decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(14), boxShadow: _shadow),
-            child: Material(
-              color: C.surface,
-              clipBehavior: Clip.antiAlias,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  side: const BorderSide(color: C.borderHi)),
-              child: InkWell(
-                onTap: _busy ? null : () => _run(onTap),
-                child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                  child: Row(children: [
-                    Container(
-                      width: 40,
-                      height: 40,
-                      decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: C.accent.withValues(alpha: .12),
-                          border: Border.all(
-                              color: C.accent.withValues(alpha: .35))),
-                      child: Icon(icon, color: C.accent, size: 22),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(title,
-                                style: const TextStyle(
-                                    fontSize: 16, fontWeight: FontWeight.w600)),
-                            if (hint.isNotEmpty) ...[
-                              const SizedBox(height: 2),
-                              Text(hint,
-                                  style: const TextStyle(
-                                      fontSize: 12.5, color: C.muted)),
-                            ],
-                          ]),
-                    ),
-                    const Icon(Icons.chevron_left,
-                        color: C.muted,
-                        size: 22,
-                        textDirection: TextDirection.ltr),
-                  ]),
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-
-  // سطر قصير بلا زر (لما لا يمكن فتحه من التطبيق)
-  Widget _tip(int index, IconData icon, String text) => Appear(
-        index: index,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6),
-          child: Row(children: [
-            Icon(icon, color: C.dim, size: 18),
-            const SizedBox(width: 8),
-            Expanded(
-                child: Text(text,
-                    style: const TextStyle(fontSize: 12.5, color: C.dim))),
-          ]),
-        ),
-      );
-
-  // اختصارات الشركة + خيارات المطور. صفحات الشركات لا يمكن فحص وجودها مسبقًا،
-  // فإن لم تُفتح الصفحة تُفتح إعدادات التطبيق ويظهر تنبيه قصير.
-  List<Widget> _shortcuts(int start) {
-    final items = <Widget>[];
-    var k = start;
-    void add(IconData icon, String title, String hint,
-        Future<void> Function() onTap) {
-      items.add(const SizedBox(height: 12));
-      items.add(_shortcut(
-          index: k++, icon: icon, title: title, hint: hint, onTap: onTap));
-    }
-
-    switch (_sys.oem) {
-      case 'xiaomi':
-        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
-            _openAutoStart);
-        add(Icons.tune, 'توفير البطارية', 'اختر «بلا قيود»',
-            _openBrandBattery);
-        break;
-      case 'samsung':
-        add(Icons.tune, 'حدود الخلفية', 'أضفه إلى Never sleeping apps',
-            _openAutoStart);
-        break;
-      case 'huawei':
-        add(Icons.play_circle_outline, 'تشغيل التطبيقات',
-            'إدارة يدوية ← فعّل الكل', _openAutoStart);
-        break;
-      case 'oppo':
-      case 'oneplus':
-        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
-            _openAutoStart);
-        add(Icons.tune, 'نشاط الخلفية', 'اسمح بالتشغيل في الخلفية',
-            _openAppSettings);
-        break;
-      case 'vivo':
-        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
-            _openAutoStart);
-        add(Icons.tune, 'استهلاك الخلفية', 'اسمح بالاستهلاك العالي',
-            _openAppSettings);
-        break;
-      case 'transsion':
-        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
-            _openAutoStart);
-        add(Icons.tune, 'نشاط الخلفية', 'Allow background activity',
-            _openAppSettings);
-        break;
-      case 'asus':
-        add(Icons.play_circle_outline, 'التشغيل التلقائي', 'فعّل التطبيق',
-            _openAutoStart);
-        break;
-      default:
-        break;
-    }
-    add(Icons.developer_mode, 'خيارات المطور',
-        'أوقف «Suspend execution for cached apps»', _openDeveloper);
-    if (_sys.oem.isNotEmpty) {
-      items.add(const SizedBox(height: 14));
-      items.add(_tip(k++, Icons.lock_outline, 'اقفل التطبيق في قائمة الأخيرة'));
-    }
-    return items;
-  }
-
   Future<void> _finishWelcome() async {
     final nav = Navigator.of(context);
     await store.setFlag(_welcomeFlag, true);
@@ -4594,9 +4419,12 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                       (_sys.notifications ? 0 : 1) +
                       (_sys.battery ? 0 : 1);
                   var i = 0;
-                  // شاشة ثابتة غير قابلة للتمرير تعرض الصلاحيات الثلاث الأساسية فقط، وزر المتابعة مرفوع تحتها مباشرة
-                  return SingleChildScrollView(
-                    physics: const NeverScrollableScrollPhysics(),
+                  // الصلاحيات الثلاث فقط وزر المتابعة تحتها مباشرة؛ تبدو الشاشة ثابتة وتتمرر فقط إن ضاقت الشاشة (حتى لا يختفي الزر)
+                  return ScrollConfiguration(
+                    behavior: ScrollConfiguration.of(context)
+                        .copyWith(overscroll: false),
+                    child: SingleChildScrollView(
+                    physics: const ClampingScrollPhysics(),
                     padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -4658,7 +4486,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                         ],
                       ],
                     ),
-                  );
+                  ));
                 },
               ),
             ),
