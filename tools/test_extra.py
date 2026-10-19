@@ -1254,11 +1254,19 @@ def test_dart_permissions_screen_wiring() -> None:
     assert "getFlag(_welcomeFlag)" in main and "setFlag(_welcomeFlag, true)" in main
     assert "bool getFlag(String key)" in store and "Future<void> setFlag(" in store
     assert "package:permission_handler/permission_handler.dart" in rt
-    for member in ("status()", "requestBattery()", "openAutoStart()", "requestNotifications()"):
+    # The screen shows exactly three cards (files, notifications, battery); the auto-start card was
+    # removed on purpose. So main.dart must call these three, while openAutoStart()/openBrandBattery()
+    # stay available in the runtime (and handled by Kotlin, see test_dart_kotlin_method_channels_agree)
+    # for the planned per-brand settings shortcuts, without being required in main.dart.
+    for member in ("status()", "requestBattery()", "requestNotifications()"):
         assert member in rt, member
         assert f"bayanSystem.{member.split('(')[0]}" in main, member
-    # every icon used must be one Flutter ships (spot check of the new ones)
-    for icon in ("Icons.verified_user_outlined", "Icons.notifications_none", "Icons.battery_charging_full", "Icons.play_circle_outline"):
+    for member in ("openAutoStart()", "openBrandBattery()"):
+        assert member in rt, member
+    for card_id in ("'files'", "'notifications'", "'battery'"):
+        assert f"id: {card_id}" in main, card_id
+    # every icon used must be one Flutter ships (spot check of the icons the screen really uses)
+    for icon in ("Icons.folder_open_outlined", "Icons.notifications_none", "Icons.battery_charging_full"):
         assert icon in main, icon
 
 
