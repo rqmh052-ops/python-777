@@ -4,8 +4,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+
+import 'python_runtime.dart';
 
 /// إعدادات الخدمة. معرّف تطبيق الويب ليس سرّاً، ولا نضع أي سرّ داخل التطبيق.
 const String bynuxGoogleWebClientId =
@@ -61,7 +61,7 @@ class CloudSessionGrant {
 }
 
 /// لقطة الحالة المحفوظة على الجهاز: المستخدم، رمز الجلسة، والموافقات.
-/// تُحفظ دائمًا في مكانين مستقلين (SharedPreferences + ملف داخل مجلد التطبيق)
+/// تُحفظ دائمًا في مكانين مستقلين (SharedPreferences الأصلية + ملف داخل مجلد التطبيق)
 /// فإذا فشل أحدهما أو ضاع، يكفي الآخر.
 class _SessionSnapshot {
   _SessionSnapshot({
@@ -141,7 +141,7 @@ class _SessionSnapshot {
   }
 }
 
-/// تخزين مزدوج: SharedPreferences + ملف JSON ذرّي داخل مجلد التطبيق الخاص.
+/// تخزين مزدوج: SharedPreferences الأصلية + ملف JSON ذرّي داخل مجلد التطبيق الخاص.
 /// القراءة تأخذ الأحدث من الاثنين وتدمج الموافقات، والكتابة تتم على الاثنين دائمًا.
 class _SessionStore {
   static const String _prefsKey = 'bynux_session_v2';
@@ -152,10 +152,9 @@ class _SessionStore {
 
   Future<void> _chain = Future<void>.value();
 
-  Future<File?> _file() async {
+  File? _fileSync() {
     try {
-      final dir = await getApplicationSupportDirectory();
-      if (!await dir.exists()) await dir.create(recursive: true);
+      final dir = bynuxAppSupportDirSync();
       return File('${dir.path}/$_fileName');
     } catch (error) {
       debugPrint('session store: no support dir: $error');
@@ -168,34 +167,32 @@ class _SessionStore {
     final consents = <String>{};
 
     try {
-      final prefs = await SharedPreferences.getInstance();
-      try {
-        await prefs.reload();
-      } catch (_) {}
-      final current = _SessionSnapshot.tryDecode(prefs.getString(_prefsKey));
-      if (current != null) candidates.add(current);
-      final legacy =
-          _SessionSnapshot.tryDecodeLegacy(prefs.getString(_legacyPrefsKey));
-      if (legacy != null) candidates.add(legacy);
-      for (final key in prefs.getKeys()) {
-        if (key.startsWith(_legacyConsentPrefix) &&
-            prefs.getBool(key) == true) {
-          final id = key.substring(_legacyConsentPrefix.length);
-          if (id.isNotEmpty) consents.add(BynuxSession.consentKeyForId(id));
-        }
-      }
-    } catch (error) {
-      debugPrint('session store: prefs read failed: $error');
-    }
-
-    try {
-      final file = await _file();
-      if (file != null && await file.exists()) {
-        final fromFile = _SessionSnapshot.tryDecode(await file.readAsString());
+      final file = _fileSync();
+      if (file != null && file.existsSync()) {
+        final fromFile = _SessionSnapshot.tryDecode(file.readAsStringSync());
         if (fromFile != null) candidates.add(fromFile);
       }
     } catch (error) {
       debugPrint('session store: file read failed: $error');
+    }
+
+    try {
+      final prefs = await bayanSystem.getPrefs();
+      final current =
+          _SessionSnapshot.tryDecode(prefs[_prefsKey]?.toString());
+      if (current != null) candidates.add(current);
+      final legacy = _SessionSnapshot.tryDecodeLegacy(
+          prefs[_legacyPrefsKey]?.toString());
+      if (legacy != null) candidates.add(legacy);
+      prefs.forEach((key, val) {
+        if (key.startsWith(_legacyConsentPrefix) &&
+            (val == true || val == 'true')) {
+          final id = key.substring(_legacyConsentPrefix.length);
+          if (id.isNotEmpty) consents.add(BynuxSession.consentKeyForId(id));
+        }
+      });
+    } catch (error) {
+      debugPrint('session store: prefs read failed: $error');
     }
 
     _SessionSnapshot? best;
@@ -225,13 +222,7 @@ class _SessionStore {
     var okPrefs = false;
     var okFile = false;
     try {
-      final prefs = await SharedPreferences.getInstance();
-      okPrefs = await prefs.setString(_prefsKey, encoded);
-    } catch (error) {
-      debugPrint('session store: prefs write failed: $error');
-    }
-    try {
-      final file = await _file();
+      final file = _fileSync();
       if (file != null) {
         final tmp = File('${file.path}.tmp');
         await tmp.writeAsString(encoded, flush: true);
@@ -240,6 +231,11 @@ class _SessionStore {
       }
     } catch (error) {
       debugPrint('session store: file write failed: $error');
+    }
+    try {
+      okPrefs = await bayanSystem.setPref(_prefsKey, encoded);
+    } catch (error) {
+      debugPrint('session store: prefs write failed: $error');
     }
     if (!okPrefs && !okFile) {
       debugPrint('session store: BOTH layers failed to save the session');
@@ -420,14 +416,18 @@ class BynuxSession extends ChangeNotifier {
   Future<void> signIn() async {
     await initialize();
     if (!_googleReady) {
-      throw StateError(_initializationError ?? 'تعذّر تجهيز تسجيل الدخول بجوجل.');
+      throw StateError(_initializationError ??
+          tr('تعذّر تجهيز تسجيل الدخول بجوجل.',
+              'Failed to initialize Google Sign-In.'));
     }
     _signingIn = true;
     try {
       final account = await _google.authenticate();
       final token = account.authentication.idToken;
       if (token == null || token.isEmpty) {
-        throw StateError('لم يصل رمز التحقق من جوجل. تحقّق من إعدادات معرّف التطبيق وبصمة التوقيع.');
+        throw StateError(tr(
+            'لم يصل رمز التحقق من جوجل. تحقّق من إعدادات معرّف التطبيق وبصمة التوقيع.',
+            'Did not receive Google verification token. Check app client ID and signing fingerprint.'));
       }
       _signedOut = false;
       final alreadyConsented = _isConsentedFor(account.id, account.email);
@@ -556,7 +556,9 @@ class BynuxSession extends ChangeNotifier {
   /// ما زال في الذاكرة. لا نفتح واجهة جوجل هنا أبدًا، ولا نسمح بأي طلب قبل موافقة المستخدم.
   Future<String> authToken() async {
     if (!hasConsented) {
-      throw const CloudApiException('يلزم الموافقة على شروط الاستخدام وسياسة الخصوصية أولاً.');
+      throw CloudApiException(tr(
+          'يلزم الموافقة على شروط الاستخدام وسياسة الخصوصية أولاً.',
+          'You must accept the Terms of Use and Privacy Policy first.'));
     }
     final saved = _sessionToken;
     if (saved != null && _sessionIsValid) return saved;
@@ -566,8 +568,12 @@ class BynuxSession extends ChangeNotifier {
       return google;
     }
     throw CloudApiException(_sessionUnsupported
-        ? 'خادم السحابة قديم ولا يدعم حفظ الجلسة. أعد نشر ملف worker.js ثم سجّل الخروج وادخل من جديد.'
-        : 'انتهت جلسة السحابة. سجّل الخروج ثم ادخل بحساب جوجل مرة واحدة.');
+        ? tr(
+            'خادم السحابة قديم ولا يدعم حفظ الجلسة. أعد نشر ملف worker.js ثم سجّل الخروج وادخل من جديد.',
+            'Cloud server is outdated and does not support saved sessions. Redeploy worker.js, then sign out and sign in again.')
+        : tr(
+            'انتهت جلسة السحابة. سجّل الخروج ثم ادخل بحساب جوجل مرة واحدة.',
+            'Cloud session expired. Sign out and sign in with Google once.'));
   }
 
   String? _freshGoogleToken() {
@@ -578,15 +584,20 @@ class BynuxSession extends ChangeNotifier {
   static String _friendlyError(Object error) {
     final message = error.toString().toLowerCase();
     if (message.contains('network') || message.contains('socket')) {
-      return 'تحقّق من اتصال الإنترنت ثم حاول مرة أخرى.';
+      return tr('تحقّق من اتصال الإنترنت ثم حاول مرة أخرى.',
+          'Check your internet connection and try again.');
     }
     if (message.contains('canceled') || message.contains('cancelled')) {
-      return 'تم إلغاء تسجيل الدخول.';
+      return tr('تم إلغاء تسجيل الدخول.', 'Sign-in was canceled.');
     }
     if (message.contains('clientconfiguration') || message.contains('developer_error')) {
-      return 'إعدادات تسجيل جوجل غير مكتملة. يلزم التأكد من اسم الحزمة وبصمة مفتاح التوقيع في منصة جوجل.';
+      return tr(
+          'إعدادات تسجيل جوجل غير مكتملة. يلزم التأكد من اسم الحزمة وبصمة مفتاح التوقيع في منصة جوجل.',
+          'Google Sign-In configuration is incomplete. Verify the package name and signing key fingerprint in Google Cloud Console.');
     }
-    return 'تعذّر تسجيل الدخول بجوجل. تحقّق من الاتصال وإعدادات التطبيق ثم أعد المحاولة.';
+    return tr(
+        'تعذّر تسجيل الدخول بجوجل. تحقّق من الاتصال وإعدادات التطبيق ثم أعد المحاولة.',
+        'Google Sign-In failed. Check your connection and app settings, then try again.');
   }
 
   @override
@@ -702,7 +713,9 @@ class BynuxCloudApi {
     final token = decoded['sessionToken']?.toString() ?? '';
     final expiresAt = DateTime.tryParse(decoded['expiresAt']?.toString() ?? '');
     if (token.isEmpty || expiresAt == null) {
-      throw const CloudApiException('استجابة الجلسة غير مكتملة.', statusCode: 404);
+      throw CloudApiException(
+          tr('استجابة الجلسة غير مكتملة.', 'Incomplete session response.'),
+          statusCode: 404);
     }
     return CloudSessionGrant(token: token, expiresAt: expiresAt);
   }
@@ -779,7 +792,9 @@ class BynuxCloudApi {
     final json = await _jsonRequest('GET', '/v1/files');
     final rawFiles = json['files'] ?? json['items'];
     if (rawFiles is! List) {
-      throw const CloudApiException('استجابة السحابة غير مكتملة. أعد نشر ملف الخادم المرفق ثم حاول مرة أخرى.');
+      throw CloudApiException(tr(
+          'استجابة السحابة غير مكتملة. أعد نشر ملف الخادم المرفق ثم حاول مرة أخرى.',
+          'Incomplete cloud response. Redeploy the attached server file and try again.'));
     }
     return rawFiles
         .whereType<Map>()
@@ -799,14 +814,19 @@ class BynuxCloudApi {
         name.contains('..') ||
         name.contains('/') ||
         name.contains('\\')) {
-      throw const CloudApiException('اسم السكربت غير صالح للنسخ السحابي.');
+      throw CloudApiException(tr('اسم السكربت غير صالح للنسخ السحابي.',
+          'Invalid script name for cloud backup.'));
     }
     if (await file.length() > bynuxMaxScriptBytes) {
-      throw const CloudApiException('حجم السكربت أكبر من الحد المسموح وهو 1 ميجابايت.');
+      throw CloudApiException(tr(
+          'حجم السكربت أكبر من الحد المسموح وهو 1 ميجابايت.',
+          'Script size exceeds the maximum allowed limit of 1 MB.'));
     }
     final bytes = await file.readAsBytes();
     if (bytes.length > bynuxMaxScriptBytes) {
-      throw const CloudApiException('حجم السكربت أكبر من الحد المسموح وهو 1 ميجابايت.');
+      throw CloudApiException(tr(
+          'حجم السكربت أكبر من الحد المسموح وهو 1 ميجابايت.',
+          'Script size exceeds the maximum allowed limit of 1 MB.'));
     }
     final request = await _open(
         'PUT', '/v1/files/${Uri.encodeComponent(name)}');
@@ -855,7 +875,8 @@ class BynuxCloudApi {
     await for (final chunk in response) {
       bytes.addAll(chunk);
       if (bytes.length > bynuxServerMaxBytes) {
-        throw const CloudApiException('حجم الملف المستلم تجاوز الحد الآمن.');
+        throw CloudApiException(tr('حجم الملف المستلم تجاوز الحد الآمن.',
+            'Received file size exceeded the safe limit.'));
       }
     }
     return bytes;
@@ -864,41 +885,56 @@ class BynuxCloudApi {
   String _statusMessage(int status, String? serverMessage) {
     switch (status) {
       case 400:
-        return 'تعذّر تنفيذ الطلب؛ بيانات الملف غير صالحة.';
+        return tr('تعذّر تنفيذ الطلب؛ بيانات الملف غير صالحة.',
+            'Could not process request; invalid file data.');
       case 401:
-        return 'تعذّر التحقق من حساب جوجل. سجّل الخروج ثم ادخل من جديد.';
+        return tr('تعذّر التحقق من حساب جوجل. سجّل الخروج ثم ادخل من جديد.',
+            'Could not verify Google account. Sign out and sign in again.');
       case 403:
-        return 'ليس لديك صلاحية للوصول إلى هذا الملف.';
+        return tr('ليس لديك صلاحية للوصول إلى هذا الملف.',
+            'You do not have permission to access this file.');
       case 404:
-        return 'الملف غير موجود في السحابة.';
+        return tr('الملف غير موجود في السحابة.', 'File not found in the cloud.');
       case 413:
-        return 'حجم الملف أكبر من الحد المسموح وهو 1 ميجابايت.';
+        return tr('حجم الملف أكبر من الحد المسموح وهو 1 ميجابايت.',
+            'File size exceeds the maximum allowed limit of 1 MB.');
       case 429:
-        return 'وصلت إلى حد الطلبات المسموح مؤقتاً. حاول بعد قليل.';
+        return tr('وصلت إلى حد الطلبات المسموح مؤقتاً. حاول بعد قليل.',
+            'Rate limit reached temporarily. Try again shortly.');
       case 500:
       case 502:
       case 503:
-        return 'خدمة السحابة تواجه مشكلة مؤقتة. حاول بعد قليل.';
+        return tr('خدمة السحابة تواجه مشكلة مؤقتة. حاول بعد قليل.',
+            'Cloud service is experiencing a temporary issue. Try again shortly.');
       default:
         if (serverMessage != null && serverMessage.isNotEmpty) {
-          return 'تعذّر إكمال العملية على السحابة.';
+          return tr('تعذّر إكمال العملية على السحابة.',
+              'Could not complete the operation on the cloud.');
         }
-        return 'تعذّر الاتصال بالسحابة. تحقّق من الإنترنت وحاول مرة أخرى.';
+        return tr('تعذّر الاتصال بالسحابة. تحقّق من الإنترنت وحاول مرة أخرى.',
+            'Could not connect to the cloud. Check your internet and try again.');
     }
   }
 }
 
 String bynuxFormatBytes(int bytes) {
+  if (isEn) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+  }
   if (bytes < 1024) return '$bytes بايت';
   if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} كيلوبايت';
   return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} ميجابايت';
 }
 
 String bynuxFormatDate(DateTime? date) {
-  if (date == null) return 'غير متوفر';
+  if (date == null) return tr('غير متوفر', 'Not available');
   String two(int n) => n.toString().padLeft(2, '0');
   return '${two(date.day)}/${two(date.month)}/${date.year}  ${two(date.hour)}:${two(date.minute)}';
 }
 
-String bynuxFriendlyCloudError(Object error) =>
-    error is CloudApiException ? error.message : 'تعذّر الاتصال بالسحابة. تحقّق من الإنترنت ثم حاول مرة أخرى.';
+String bynuxFriendlyCloudError(Object error) => error is CloudApiException
+    ? error.message
+    : tr('تعذّر الاتصال بالسحابة. تحقّق من الإنترنت ثم حاول مرة أخرى.',
+        'Could not connect to the cloud. Check your internet and try again.');

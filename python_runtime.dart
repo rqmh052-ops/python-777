@@ -1,12 +1,101 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+// ───────── اللغة (العربية افتراضيًا دائمًا حتى لو كان هاتف المستخدم بالإنجليزية) ─────────
+final ValueNotifier<String> appLang = ValueNotifier<String>('ar');
+
+bool get isEn => appLang.value == 'en';
+
+String tr(String ar, String en) => appLang.value == 'en' ? en : ar;
+
+Directory bynuxAppSupportDirSync() {
+  final candidates = <String>[
+    '${Directory.systemTemp.parent.path}/files',
+    '/data/user/0/com.bynux.app/files',
+    '/data/data/com.bynux.app/files',
+    '${Directory.systemTemp.path}/bynux_files',
+  ];
+  for (final path in candidates) {
+    try {
+      final dir = Directory(path);
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      return dir;
+    } catch (_) {}
+  }
+  return Directory.systemTemp;
+}
+
+Directory bynuxAppDocsDirSync() {
+  final candidates = <String>[
+    '${Directory.systemTemp.parent.path}/app_flutter',
+    '/data/user/0/com.bynux.app/app_flutter',
+    '/data/data/com.bynux.app/app_flutter',
+    '${Directory.systemTemp.path}/bynux_docs',
+  ];
+  for (final path in candidates) {
+    try {
+      final dir = Directory(path);
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      return dir;
+    } catch (_) {}
+  }
+  return Directory.systemTemp;
+}
+
+String translateRuntimeText(String s) {
+  if (!isEn || s.isEmpty) return s;
+  const exact = <String, String>{
+    'المكتبة غير موجودة في PyPI': 'Library not found on PyPI',
+    'لا توجد نسخة منها تعمل على أندرويد': 'No Android-compatible version available',
+    'لا توجد نسخة تعمل على أندرويد': 'No Android-compatible version available',
+    'اسم المكتبة فارغ': 'Library name is empty',
+    'اكتب اسم مكتبة من PyPI فقط': 'Enter a PyPI library name only',
+    'اسم المكتبة غير صالح': 'Invalid library name',
+    'صيغة الإصدار غير مدعومة': 'Unsupported version format',
+    'لم يتم العثور على مكتبة بهذا الاسم': 'No library found with this name',
+    'لا توجد wheel متوافقة مع Python/Android/ABI الحاليين لهذا الإصدار':
+        'No compatible wheel for current Python/Android/ABI',
+    'فشل التحقق من checksum للملف': 'File checksum verification failed',
+    'تم إيقاف التثبيت': 'Installation stopped',
+    'المكتبة غير مثبتة': 'Library is not installed',
+    'فشل تثبيت المكتبة': 'Failed to install library',
+    'تعذر إزالة المكتبة': 'Failed to remove library',
+    'لا يمكن قراءة المكتبات أثناء تشغيل سكربتات. أوقف السكربتات الشغّالة أولًا':
+        'Cannot read libraries while scripts are running. Stop running scripts first.',
+    'لا يمكن فحص المكتبات أثناء تشغيل سكربتات. أوقف السكربتات الشغّالة أولًا':
+        'Cannot check libraries while scripts are running. Stop running scripts first.',
+    'أوقف السكربتات الشغّالة قبل تثبيت مكتبة':
+        'Stop running scripts before installing a library',
+    'أوقف السكربتات الشغّالة قبل إزالة مكتبة':
+        'Stop running scripts before removing a library',
+    'هذا السكربت يعمل الآن. أوقفه أولًا ثم شغّله من جديد':
+        'This script is currently running. Stop it first, then run it again.',
+    'تثبيت أو إزالة مكتبة جارٍ الآن. انتظر حتى ينتهي ثم شغّل السكربت':
+        'A library installation or removal is in progress. Wait for it to finish.',
+    'وصلت للحد الأقصى: 10 سكربتات تعمل في نفس الوقت. أوقف سكربتًا ثم حاول مجددًا':
+        'Maximum limit reached: 10 scripts running simultaneously. Stop a script and try again.',
+  };
+  if (exact.containsKey(s)) return exact[s]!;
+  if (s.startsWith('الملف غير موجود: ')) {
+    return 'File not found: ${s.substring('الملف غير موجود: '.length)}';
+  }
+  if (s.startsWith('تعذر الاتصال بـPyPI: ')) {
+    return 'Could not connect to PyPI: ${s.substring('تعذر الاتصال بـPyPI: '.length)}';
+  }
+  if (s.startsWith('تعذر الاتصال بمستودع Chaquopy: ')) {
+    return 'Could not connect to Chaquopy repo: ${s.substring('تعذر الاتصال بمستودع Chaquopy: '.length)}';
+  }
+  return s;
+}
+
 // يعرض رسالة الخطأ الحقيقية بدل PlatformException(code, message, null, null)
-String errText(Object e) =>
-    e is PlatformException ? (e.message ?? e.code) : '$e';
+String errText(Object e) => translateRuntimeText(
+    e is PlatformException ? (e.message ?? e.code) : '$e');
 
 // اسم المكتبة موحّدًا (حروف صغيرة، والفواصل _ . - تصبح -)
 String pkgKey(String name) =>
@@ -105,7 +194,7 @@ class PackageAvailability {
       name: json['name']?.toString() ?? '',
       available: a is bool ? a : null,
       version: json['version']?.toString(),
-      reason: json['reason']?.toString() ?? '',
+      reason: translateRuntimeText(json['reason']?.toString() ?? ''),
     );
   }
 }
@@ -288,6 +377,28 @@ class BayanSystem {
     if (now.notifications) return;
     if (result.isPermanentlyDenied || now.sdk < 33) {
       await openNotificationSettings();
+    }
+  }
+
+  /// قراءة الإعدادات المحفوظة من طبقة أندرويد الأصلية.
+  Future<Map<String, dynamic>> getPrefs() async {
+    try {
+      final dynamic raw = await _channel.invokeMethod<dynamic>('getPrefs');
+      if (raw is Map) return Map<String, dynamic>.from(raw);
+    } catch (_) {}
+    return const <String, dynamic>{};
+  }
+
+  /// حفظ إعداد في طبقة أندرويد الأصلية بشكل متزامن وفوري.
+  Future<bool> setPref(String key, String value) async {
+    try {
+      final dynamic raw = await _channel.invokeMethod<dynamic>(
+        'setPref',
+        <String, dynamic>{'key': key, 'value': value},
+      );
+      return raw == true;
+    } catch (_) {
+      return false;
     }
   }
 }
@@ -784,16 +895,26 @@ class LibJob {
 /// سبب فشل مختصر بالعربية (النص الكامل يبقى في details).
 String shortInstallReason(String raw) {
   final t = raw.trim();
-  if (t.isEmpty) return 'فشل التثبيت';
-  if (t.contains('لا توجد wheel متوافقة')) return 'لا توجد نسخة تعمل على أندرويد';
-  if (t.contains('لم يتم العثور على مكتبة')) return 'المكتبة غير موجودة في PyPI';
-  if (t.contains('تعذر الاتصال')) return 'تعذر الاتصال بالإنترنت';
-  if (t.contains('checksum')) return 'فشل التحقق من الملف المنزّل';
-  if (t.contains('تم إيقاف التثبيت')) return 'تم إيقاف التثبيت';
-  if (t.contains('هناك سكربت') || t.contains('أوقف السكربت')) {
-    return 'أوقف السكربتات الشغّالة أولاً';
+  if (t.isEmpty) return tr('فشل التثبيت', 'Installation failed');
+  if (t.contains('لا توجد wheel متوافقة') || t.contains('No compatible wheel')) {
+    return tr('لا توجد نسخة تعمل على أندرويد', 'No Android-compatible version available');
   }
-  final first = t.split('\n').first.trim();
+  if (t.contains('لم يتم العثور على مكتبة') || t.contains('not found on PyPI') || t.contains('No library found')) {
+    return tr('المكتبة غير موجودة في PyPI', 'Library not found on PyPI');
+  }
+  if (t.contains('تعذر الاتصال') || t.contains('Could not connect')) {
+    return tr('تعذر الاتصال بالإنترنت', 'Could not connect to the internet');
+  }
+  if (t.contains('checksum')) {
+    return tr('فشل التحقق من الملف المنزّل', 'Downloaded file verification failed');
+  }
+  if (t.contains('تم إيقاف التثبيت') || t.contains('Installation stopped')) {
+    return tr('تم إيقاف التثبيت', 'Installation stopped');
+  }
+  if (t.contains('هناك سكربت') || t.contains('أوقف السكربت') || t.contains('Stop running scripts')) {
+    return tr('أوقف السكربتات الشغّالة أولاً', 'Stop running scripts first');
+  }
+  final first = translateRuntimeText(t.split('\n').first.trim());
   return first.length > 60 ? '${first.substring(0, 60)}…' : first;
 }
 

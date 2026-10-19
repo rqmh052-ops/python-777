@@ -738,8 +738,13 @@ class BayanPythonBridge private constructor(private val context: Context) :
     private var packageJobs = 0
     private var environmentReady = false
 
-    // حالة موافقة المستخدم ووضع النافذة المصغّرة (Picture-in-Picture)
+    // حالة موافقة المستخدم، اللغة الحالية، ووضع النافذة المصغّرة (Picture-in-Picture)
     @Volatile var consentGranted = false
+    @Volatile var appLang: String = try {
+        context.getSharedPreferences("bynux_prefs", Context.MODE_PRIVATE).getString("lang", "ar") ?: "ar"
+    } catch (_: Throwable) {
+        "ar"
+    }
     @Volatile var inPipMode = false
     @Volatile private var hostActivity: MainActivity? = null
 
@@ -805,7 +810,9 @@ class BayanPythonBridge private constructor(private val context: Context) :
                 .setAction(BayanScriptService.ACTION_PIP_NEXT)
             val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             val pending = PendingIntent.getService(activity, 2, nextIntent, flags)
-            val action = RemoteAction(icon, "تبديل السكربت", "تبديل السكربت المعروض", pending)
+            val pipTitle = if (appLang == "en") "Switch Script" else "تبديل السكربت"
+            val pipDesc = if (appLang == "en") "Switch displayed script" else "تبديل السكربت المعروض"
+            val action = RemoteAction(icon, pipTitle, pipDesc, pending)
             builder.setActions(listOf(action))
         } else {
             builder.setActions(emptyList())
@@ -1811,11 +1818,12 @@ class BayanScriptService : Service() {
         } else {
             Notification.Builder(this)
         }
-        val title = if (runs.isEmpty()) "Bynux" else "${runs.size} سكربت يعمل"
+        val en = BayanPythonBridge.peek()?.appLang == "en"
+        val title = if (runs.isEmpty()) "Bynux" else if (en) "${runs.size} script(s) running" else "${runs.size} سكربت يعمل"
         val text = when {
-            stopping -> "جارٍ إيقاف السكربتات…"
+            stopping -> if (en) "Stopping scripts…" else "جارٍ إيقاف السكربتات…"
             runs.isEmpty() -> ""
-            else -> runs.joinToString("، ") { it.name }
+            else -> runs.joinToString(if (en) ", " else "، ") { it.name }
         }
         val iconRes = smallIcon()
         builder.setSmallIcon(iconRes)
@@ -1841,15 +1849,17 @@ class BayanScriptService : Service() {
             launch.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
             val open = PendingIntent.getActivity(this, 0, launch, flags)
             builder.setContentIntent(open)
+            val openLabel = if (en) "Open App" else "فتح التطبيق"
             builder.addAction(
-                Notification.Action.Builder(Icon.createWithResource(this, iconRes), "فتح التطبيق", open).build()
+                Notification.Action.Builder(Icon.createWithResource(this, iconRes), openLabel, open).build()
             )
         }
         // يبقى الزر ظاهرًا أثناء «جارٍ الإيقاف» ليمكن إعادة إرسال الإيقاف
         val stopIntent = Intent(this, BayanScriptService::class.java).setAction(ACTION_STOP_ALL)
         val stop = PendingIntent.getService(this, 1, stopIntent, flags)
+        val stopLabel = if (en) "Stop All" else "إيقاف الكل"
         builder.addAction(
-            Notification.Action.Builder(Icon.createWithResource(this, iconRes), "إيقاف الكل", stop).build()
+            Notification.Action.Builder(Icon.createWithResource(this, iconRes), stopLabel, stop).build()
         )
         return builder.build()
     }
@@ -1937,6 +1947,12 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
                 }
                 "pipStatus" -> result.success(BayanPythonBridge.peek()?.inPipMode == true)
                 "expandFromPip" -> result.success(BayanPythonBridge.get(context).expandFromPip())
+                "getPrefs" -> result.success(getPrefs())
+                "setPref" -> {
+                    val key = call.argument<String>("key").orEmpty()
+                    val value = call.argument<String>("value").orEmpty()
+                    result.success(setPref(key, value))
+                }
                 else -> result.notImplemented()
             }
         } catch (t: Throwable) {
@@ -2103,5 +2119,54 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
         }
         if (enabled && launch(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) return "dev"
         return if (launch(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS))) return "about" else "failed"
+    }
+
+    private fun getPrefs(): Map<String, Any?> {
+        val out = mutableMapOf<String, Any?>(
+            "sdk" to Build.VERSION.SDK_INT,
+            "filesDir" to context.filesDir.absolutePath,
+        )
+        try {
+            val legacy = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            for ((k, v) in legacy.all) {
+                val clean = if (k.startsWith("flutter.")) k.removePrefix("flutter.") else k
+                if (v is Boolean || v is String || v is Number) {
+                    out[clean] = v.toString()
+                }
+            }
+        } catch (_: Throwable) {}
+        try {
+            val prefs = context.getSharedPreferences("bynux_prefs", Context.MODE_PRIVATE)
+            for ((k, v) in prefs.all) {
+                if (v is Boolean || v is String || v is Number) {
+                    out[k] = v.toString()
+                }
+            }
+        } catch (_: Throwable) {}
+        return out
+    }
+
+    private fun setPref(key: String, value: String): Boolean {
+        if (key.isEmpty()) return false
+        var ok = false
+        try {
+            val prefs = context.getSharedPreferences("bynux_prefs", Context.MODE_PRIVATE)
+            ok = prefs.edit().putString(key, value).commit()
+        } catch (_: Throwable) {}
+        try {
+            val legacy = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            if (value == "true" || value == "false") {
+                legacy.edit().putBoolean("flutter.$key", value == "true").apply()
+            } else {
+                legacy.edit().putString("flutter.$key", value).apply()
+            }
+        } catch (_: Throwable) {}
+        if (key == "lang" && (value == "ar" || value == "en")) {
+            val bridge = BayanPythonBridge.get(context)
+            bridge.appLang = value
+            bridge.refreshPipParams()
+            BayanScriptService.sync(context)
+        }
+        return ok
     }
 }

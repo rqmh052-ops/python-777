@@ -1,13 +1,13 @@
 // طبقة الملفات: السكربتات ملفات .py حقيقية داخل مجلد "Bayan 777"
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:device_info_plus/device_info_plus.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+
+import 'python_runtime.dart';
 
 const kFolderName = 'Bayan 777';
 const kExternalRoot = '/storage/emulated/0/Bayan 777';
@@ -45,7 +45,9 @@ class DeletedScript {
 /// الحد الأقصى لحجم ملف السكربت (بايت): أقل بقليل من حد السيرفر (1 MiB) لتفادي أي احتكاك.
 /// يطابق bynuxMaxScriptBytes في account_cloud.dart.
 const int kMaxScriptBytes = 1000000;
-const String kTooLargeMessage = 'حجم الملف أكبر من الحد المسموح (1 ميجابايت)';
+String get kTooLargeMessage => tr(
+    'حجم الملف أكبر من الحد المسموح (1 ميجابايت)',
+    'File size exceeds the maximum allowed limit (1 MB)');
 
 class PickedPy {
   PickedPy(this.name, this.bytes);
@@ -92,6 +94,22 @@ String _ar(int n, String one, String two, String few, String many) {
 String relativeTime(DateTime t, [DateTime? ref]) {
   final now = ref ?? DateTime.now();
   final diff = now.difference(t);
+  if (isEn) {
+    if (diff.inSeconds < 60) return 'Just now';
+    final m = diff.inMinutes;
+    if (m < 60) return '${m}m ago';
+    final h = diff.inHours;
+    if (h < 24) return '${h}h ago';
+    final d = DateTime.utc(now.year, now.month, now.day)
+        .difference(DateTime.utc(t.year, t.month, t.day))
+        .inDays;
+    if (d <= 1) return 'Yesterday';
+    if (d < 30) return '${d}d ago';
+    final mo = d ~/ 30;
+    if (mo < 12) return '${mo}mo ago';
+    final y = d ~/ 365;
+    return '${y < 1 ? 1 : y}y ago';
+  }
   if (diff.inSeconds < 60) return 'الآن';
   final m = diff.inMinutes;
   if (m < 60) return 'قبل ${_ar(m, 'دقيقة', 'دقيقتين', 'دقائق', 'دقيقة')}';
@@ -109,29 +127,37 @@ String relativeTime(DateTime t, [DateTime? ref]) {
 }
 
 // ───────── اختيار ملف بايثون ─────────
-// يرجع null عند الإلغاء، ويرمي FormatException برسالة عربية إذا لم يكن الملف .py
+// يرجع null عند الإلغاء، ويرمي FormatException برسالة مناسبة إذا لم يكن الملف .py
 Future<PickedPy?> pickPythonFile() async {
   final PlatformFile? f = await FilePicker.pickFile(
       type: FileType.custom, allowedExtensions: ['py']);
   if (f == null) return null;
   if (!isPyName(f.name)) {
-    throw const FormatException('الملف المختار ليس ملف بايثون (.py)');
+    throw FormatException(tr(
+        'الملف المختار ليس ملف بايثون (.py)',
+        'Selected file is not a Python file (.py)'));
   }
   final bytes = await f.readAsBytes();
   if (bytes.length > kMaxScriptBytes) {
-    throw const FormatException(kTooLargeMessage);
+    throw FormatException(kTooLargeMessage);
   }
   return PickedPy(f.name, bytes);
 }
 
 // ───────── المخزن ─────────
 class ScriptStore {
-  SharedPreferences? _prefs;
+  static const String _stateFileName = 'bynux_store_v2.json';
+
+  final Map<String, bool> _flags = <String, bool>{};
+  final Map<String, Set<String>> _pinsByNs = <String, Set<String>>{};
+  final Map<String, Map<String, int>> _runsByNs = <String, Map<String, int>>{};
   Directory? _dir;
-  int _sdk = 0;
+  int _sdk = 33;
+  bool _prefsLoaded = false;
   bool _inited = false;
   bool _ready = false;
   Future<void> _ops = Future<void>.value();
+  Future<void> _saveChain = Future<void>.value();
 
   // يجعل كل عمليات الملفات تعمل بالتتابع حتى لا تتداخل
   Future<T> _serial<T>(Future<T> Function() job) {
@@ -145,16 +171,117 @@ class ScriptStore {
 
   String get _ns => fallbackMode.value ? 'int' : 'ext';
 
+  File _stateFile() => File('${bynuxAppSupportDirSync().path}/$_stateFileName');
+
+  void _decodeStateMap(Map<dynamic, dynamic> data) {
+    final rawFlags = data['flags'];
+    if (rawFlags is Map) {
+      rawFlags.forEach((k, v) {
+        if (v == true || v == 'true') _flags[k.toString()] = true;
+      });
+    }
+    final rawLang = data['lang']?.toString();
+    if (rawLang == 'ar' || rawLang == 'en') {
+      appLang.value = rawLang!;
+    }
+    final rawPins = data['pins'];
+    if (rawPins is Map) {
+      rawPins.forEach((ns, list) {
+        if (list is List) {
+          _pinsByNs
+              .putIfAbsent(ns.toString(), () => <String>{})
+              .addAll(list.map((e) => e.toString()));
+        }
+      });
+    }
+    final rawRuns = data['runs'];
+    if (rawRuns is Map) {
+      rawRuns.forEach((ns, map) {
+        if (map is Map) {
+          final target =
+              _runsByNs.putIfAbsent(ns.toString(), () => <String, int>{});
+          map.forEach((k, v) {
+            if (v is num) target[k.toString()] = v.toInt();
+          });
+        }
+      });
+    }
+  }
+
+  /// قراءة سريعة للحالة المحفوظة (الأعلام واللغة والمثبّتات) قبل runApp.
+  /// اللغة الافتراضية دائمًا هي العربية ('ar') حتى لو كان هاتف المستخدم بالإنجليزية،
+  /// ولا تتغير إلا إذا اختار المستخدم نفسه لغة من القائمة الجانبية.
+  Future<void> loadSaved() async {
+    if (_prefsLoaded) return;
+    _prefsLoaded = true;
+    try {
+      final file = _stateFile();
+      if (file.existsSync()) {
+        final decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is Map) _decodeStateMap(decoded);
+      }
+    } catch (e) {
+      debugPrint('store state file read: $e');
+    }
+    try {
+      final nativePrefs = await bayanSystem.getPrefs();
+      final sdkVal = nativePrefs['sdk'];
+      if (sdkVal is num && sdkVal.toInt() > 0) _sdk = sdkVal.toInt();
+      nativePrefs.forEach((k, v) {
+        if (k.startsWith('flag_') && (v == 'true' || v == true)) {
+          _flags[k.substring(5)] = true;
+        }
+      });
+      final savedLang = nativePrefs['lang']?.toString();
+      if (savedLang == 'ar' || savedLang == 'en') {
+        appLang.value = savedLang!;
+      }
+      for (final ns in const <String>['ext', 'int']) {
+        final rawRuns = nativePrefs['runs.$ns']?.toString();
+        if (rawRuns != null && rawRuns.isNotEmpty) {
+          try {
+            final m = jsonDecode(rawRuns);
+            if (m is Map) {
+              final target = _runsByNs.putIfAbsent(ns, () => <String, int>{});
+              m.forEach((k, v) {
+                if (v is num) target.putIfAbsent(k.toString(), () => v.toInt());
+              });
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      debugPrint('store native prefs read: $e');
+    }
+  }
+
+  Future<void> _persistState() {
+    final payload = jsonEncode(<String, Object?>{
+      'v': 2,
+      'lang': appLang.value,
+      'flags': _flags,
+      'pins': _pinsByNs.map((k, v) => MapEntry(k, v.toList())),
+      'runs': _runsByNs,
+    });
+    final job = _saveChain.then((_) async {
+      try {
+        final file = _stateFile();
+        final tmp = File('${file.path}.tmp');
+        await tmp.writeAsString(payload, flush: true);
+        await tmp.rename(file.path);
+      } catch (e) {
+        debugPrint('store state write: $e');
+      }
+    });
+    _saveChain = job.then<void>((_) {}, onError: (_) {});
+    return job;
+  }
+
   // ───── البدء ─────
   Future<void> init() async {
+    await loadSaved();
     if (_inited) return;
     _inited = true;
-    try {
-      _prefs = await SharedPreferences.getInstance();
-    } catch (e) {
-      debugPrint('prefs: $e');
-    }
-    _sdk = await _androidSdk();
     await _serial<void>(() async {
       try {
         await _resolveRoot();
@@ -165,17 +292,6 @@ class ScriptStore {
     });
     _ready = true;
     scriptsReady.value = true;
-  }
-
-  Future<int> _androidSdk() async {
-    if (!Platform.isAndroid) return 0;
-    try {
-      final info = await DeviceInfoPlugin().androidInfo;
-      final int? v = info.version.sdkInt;
-      return v ?? 0;
-    } catch (_) {
-      return 0;
-    }
   }
 
   // الفحص الحقيقي: هل نستطيع إنشاء المجلد والكتابة فيه فعلاً؟
@@ -193,7 +309,7 @@ class ScriptStore {
   }
 
   Future<Directory> _internalDir() async {
-    final base = await getApplicationDocumentsDirectory();
+    final base = bynuxAppDocsDirSync();
     final d = Directory('${base.path}/$kFolderName');
     if (!await d.exists()) await d.create(recursive: true);
     return d;
@@ -222,14 +338,20 @@ class ScriptStore {
   }
 
   // ───── أعلام صغيرة لا تخص السكربتات (مثل: هل ظهرت شاشة الترحيب؟) ─────
-  bool getFlag(String key) => _prefs?.getBool('flag_$key') ?? false;
+  bool getFlag(String key) => _flags[key] ?? false;
 
   Future<void> setFlag(String key, bool value) async {
-    try {
-      await _prefs?.setBool('flag_$key', value);
-    } catch (e) {
-      debugPrint('setFlag: $e');
-    }
+    _flags[key] = value;
+    await _persistState();
+    await bayanSystem.setPref('flag_$key', value ? 'true' : 'false');
+  }
+
+  // ───── حفظ اللغة المختارة (مع بقاء العربية افتراضية عند أول تشغيل) ─────
+  Future<void> setLang(String code) async {
+    final normalized = code == 'en' ? 'en' : 'ar';
+    appLang.value = normalized;
+    await _persistState();
+    await bayanSystem.setPref('lang', normalized);
   }
 
   // ───── الصلاحيات ─────
@@ -268,7 +390,7 @@ class ScriptStore {
   // ───── نقل السكربتات المؤقتة إلى Bayan 777 (بدون الكتابة فوق أي ملف) ─────
   Future<void> _migrateInternal() async {
     try {
-      final base = await getApplicationDocumentsDirectory();
+      final base = bynuxAppDocsDirSync();
       final src = Directory('${base.path}/$kFolderName');
       if (!await src.exists()) return;
       final files = await _pyFiles(src);
@@ -313,25 +435,21 @@ class ScriptStore {
 
   // ───── البيانات الوصفية: التثبيت وآخر تشغيل (محفوظة محلياً) ─────
   Set<String> _pinSet([String? ns]) =>
-      (_prefs?.getStringList('pins.${ns ?? _ns}') ?? const <String>[]).toSet();
+      Set<String>.of(_pinsByNs[ns ?? _ns] ?? const <String>{});
 
   Future<void> _savePins(Set<String> s, [String? ns]) async {
-    await _prefs?.setStringList('pins.${ns ?? _ns}', s.toList());
+    _pinsByNs[ns ?? _ns] = Set<String>.of(s);
+    await _persistState();
   }
 
-  Map<String, int> _runMap([String? ns]) {
-    final raw = _prefs?.getString('runs.${ns ?? _ns}');
-    if (raw == null) return <String, int>{};
-    try {
-      final m = jsonDecode(raw) as Map;
-      return m.map((k, v) => MapEntry(k.toString(), (v as num).toInt()));
-    } catch (_) {
-      return <String, int>{};
-    }
-  }
+  Map<String, int> _runMap([String? ns]) =>
+      Map<String, int>.of(_runsByNs[ns ?? _ns] ?? const <String, int>{});
 
   Future<void> _saveRuns(Map<String, int> m, [String? ns]) async {
-    await _prefs?.setString('runs.${ns ?? _ns}', jsonEncode(m));
+    final key = ns ?? _ns;
+    _runsByNs[key] = Map<String, int>.of(m);
+    await _persistState();
+    unawaited(bayanSystem.setPref('runs.$key', jsonEncode(m)));
   }
 
   Future<void> _moveMeta(String from, String to) async {
@@ -460,7 +578,7 @@ class ScriptStore {
         final file = File(s.path);
         // ملف أكبر من الحد لا يُفتح في المحرر (يبقى قابلاً للتشغيل)
         if (await file.length() > kMaxScriptBytes) {
-          throw const FormatException(kTooLargeMessage);
+          throw FormatException(kTooLargeMessage);
         }
         final bytes = await file.readAsBytes();
         var t = utf8.decode(bytes, allowMalformed: true);
@@ -550,7 +668,7 @@ class ScriptStore {
   Future<Script> createFromBytes(String rawName, List<int> bytes) =>
       _serial<Script>(() async {
         if (bytes.length > kMaxScriptBytes) {
-          throw const FormatException(kTooLargeMessage);
+          throw FormatException(kTooLargeMessage);
         }
         final f = await _createUnique(rawName, bytes);
         await _doRefresh();

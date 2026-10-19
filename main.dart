@@ -73,21 +73,36 @@ const telegramUrl = 'https://t.me/Bayan_x777';
 const appChannelUrl = 'https://t.me/Bynux_777';
 final _logo = base64Decode(kLogoBase64);
 final _appLogo = base64Decode(kAppLogoBase64);
+final _flagAr = base64Decode(kFlagArBase64);
+final _flagEn = base64Decode(kFlagEnBase64);
+
+void _markAllElementsDirty(Element el) {
+  el.markNeedsBuild();
+  el.visitChildren(_markAllElementsDirty);
+}
+
+Future<void> setAppLanguage(String code) async {
+  final next = code == 'en' ? 'en' : 'ar';
+  if (appLang.value == next) return;
+  await store.setLang(next);
+  WidgetsBinding.instance.rootElement?.visitChildren(_markAllElementsDirty);
+}
 
 // ───────── كتالوج المكتبات (التثبيت حقيقي داخل بيئة Python المشتركة) ─────────
 class Lib {
-  const Lib(this.name, this.desc, this.module);
-  final String name, desc, module;
+  const Lib(this.name, this._descAr, this.module, [this._descEn = '']);
+  final String name, _descAr, module, _descEn;
+  String get desc => isEn && _descEn.isNotEmpty ? _descEn : _descAr;
 }
 
 const catalog = <Lib>[
-  Lib('requests', 'طلبات HTTP للإنترنت', 'requests'),
-  Lib('beautifulsoup4', 'تحليل صفحات HTML', 'bs4'),
-  Lib('python-dotenv', 'قراءة متغيرات البيئة من .env', 'dotenv'),
-  Lib('PyYAML', 'قراءة وكتابة YAML', 'yaml'),
-  Lib('python-telegram-bot', 'تطوير بوتات Telegram', 'telegram'),
-  Lib('pyTelegramBotAPI', 'إنشاء بوتات Telegram بواجهة بسيطة', 'telebot'),
-  Lib('Telethon', 'عميل Telegram عبر MTProto', 'telethon'),
+  Lib('requests', 'طلبات HTTP للإنترنت', 'requests', 'HTTP requests for the web'),
+  Lib('beautifulsoup4', 'تحليل صفحات HTML', 'bs4', 'Parse and scrape HTML pages'),
+  Lib('python-dotenv', 'قراءة متغيرات البيئة من .env', 'dotenv', 'Read environment variables from .env'),
+  Lib('PyYAML', 'قراءة وكتابة YAML', 'yaml', 'Read and write YAML files'),
+  Lib('python-telegram-bot', 'تطوير بوتات Telegram', 'telegram', 'Build Telegram bots'),
+  Lib('pyTelegramBotAPI', 'إنشاء بوتات Telegram بواجهة بسيطة', 'telebot', 'Create Telegram bots with a simple API'),
+  Lib('Telethon', 'عميل Telegram عبر MTProto', 'telethon', 'Telegram MTProto client'),
 ];
 
 // ───────── انتقالات وحركات ─────────
@@ -169,19 +184,19 @@ Widget arContextMenu(BuildContext context, EditableTextState editable) {
     String? label;
     switch (item.type) {
       case ContextMenuButtonType.copy:
-        label = 'نسخ';
+        label = tr('نسخ', 'Copy');
         break;
       case ContextMenuButtonType.cut:
-        label = 'قص';
+        label = tr('قص', 'Cut');
         break;
       case ContextMenuButtonType.paste:
-        label = 'لصق';
+        label = tr('لصق', 'Paste');
         break;
       case ContextMenuButtonType.selectAll:
-        label = 'تحديد الكل';
+        label = tr('تحديد الكل', 'Select All');
         break;
       case ContextMenuButtonType.delete:
-        label = 'حذف';
+        label = tr('حذف', 'Delete');
         break;
       default:
         label = null;
@@ -200,9 +215,9 @@ Widget arSelectionContextMenu(
   final items = <ContextMenuButtonItem>[];
   for (final item in selectableRegionState.contextMenuButtonItems) {
     if (item.type == ContextMenuButtonType.copy) {
-      items.add(item.copyWith(label: 'نسخ'));
+      items.add(item.copyWith(label: tr('نسخ', 'Copy')));
     } else if (item.type == ContextMenuButtonType.selectAll) {
-      items.add(item.copyWith(label: 'تحديد الكل'));
+      items.add(item.copyWith(label: tr('تحديد الكل', 'Select All')));
     }
   }
   return AdaptiveTextSelectionToolbar.buttonItems(
@@ -262,19 +277,19 @@ class LibJobZone extends StatelessWidget {
   final VoidCallback? onDismiss;
 
   static String _stageLabel(String stage) {
-    if (stage == 'download') return 'التنزيل';
-    if (stage == 'install') return 'التثبيت';
-    return 'التحضير';
+    if (stage == 'download') return tr('التنزيل', 'Downloading');
+    if (stage == 'install') return tr('التثبيت', 'Installing');
+    return tr('التحضير', 'Preparing');
   }
 
   @override
   Widget build(BuildContext context) {
     switch (job.state) {
       case JobState.queued:
-        return const Row(children: [
-          Icon(Icons.schedule_rounded, color: C.warn, size: 16),
-          SizedBox(width: 6),
-          Text('في الانتظار', style: TextStyle(fontSize: 12, color: C.warn)),
+        return Row(children: [
+          const Icon(Icons.schedule_rounded, color: C.warn, size: 16),
+          const SizedBox(width: 6),
+          Text(tr('في الانتظار', 'Queued'), style: const TextStyle(fontSize: 12, color: C.warn)),
         ]);
       case JobState.running:
         final raw = (job.progress * 100).floor();
@@ -312,18 +327,18 @@ class LibJobZone extends StatelessWidget {
           ),
         ]);
       case JobState.done:
-        return const Row(children: [
-          Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
-          SizedBox(width: 6),
-          Text('تم تثبيت المكتبة بنجاح',
-              style: TextStyle(fontSize: 12, color: C.ok)),
+        return Row(children: [
+          const Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
+          const SizedBox(width: 6),
+          Text(tr('تم تثبيت المكتبة بنجاح', 'Library installed successfully'),
+              style: const TextStyle(fontSize: 12, color: C.ok)),
         ]);
       case JobState.failed:
         return Row(children: [
           const Icon(Icons.error_outline_rounded, color: C.error, size: 16),
           const SizedBox(width: 6),
           Expanded(
-            child: Text(job.reason,
+            child: Text(shortInstallReason(job.details.isEmpty ? job.reason : job.details),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(fontSize: 12, color: C.error)),
@@ -332,10 +347,10 @@ class LibJobZone extends StatelessWidget {
             InkWell(
               onTap: onDetails,
               borderRadius: BorderRadius.circular(6),
-              child: const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                child: Text('التفاصيل',
-                    style: TextStyle(fontSize: 12, color: C.accent)),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                child: Text(tr('التفاصيل', 'Details'),
+                    style: const TextStyle(fontSize: 12, color: C.accent)),
               ),
             ),
           if (onDismiss != null)
@@ -375,9 +390,9 @@ void showInstallDetails(BuildContext context, LibJob job) {
             Clipboard.setData(ClipboardData(text: text));
             Navigator.pop(ctx);
           },
-          child: const Text('نسخ'),
+          child: Text(tr('نسخ', 'Copy')),
         ),
-        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
+        TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tr('إغلاق', 'Close'))),
       ],
     ),
   );
@@ -407,12 +422,12 @@ class MissingLibCard extends StatelessWidget {
           return Row(children: [
             const Icon(Icons.schedule_rounded, color: C.warn, size: 16),
             const SizedBox(width: 6),
-            const Expanded(
-              child: Text('في الانتظار',
-                  style: TextStyle(fontSize: 13, color: C.warn)),
+            Expanded(
+              child: Text(tr('في الانتظار', 'Queued'),
+                  style: const TextStyle(fontSize: 13, color: C.warn)),
             ),
             OButton(
-              label: 'إلغاء',
+              label: tr('إلغاء', 'Cancel'),
               accent: false,
               height: 36,
               radius: 10,
@@ -425,7 +440,7 @@ class MissingLibCard extends StatelessWidget {
           return Center(child: LibJobZone(job: job));
         case JobState.failed:
           return OButton(
-            label: 'إعادة المحاولة',
+            label: tr('إعادة المحاولة', 'Retry'),
             icon: Icons.refresh_rounded,
             height: 44,
             radius: 10,
@@ -439,14 +454,16 @@ class MissingLibCard extends StatelessWidget {
         const SizedBox(width: 8),
         Expanded(
           child: Text(
-            item.reason.isEmpty ? 'لا توجد نسخة تعمل على أندرويد' : item.reason,
+            item.reason.isEmpty
+                ? tr('لا توجد نسخة تعمل على أندرويد', 'No Android-compatible version available')
+                : translateRuntimeText(item.reason),
             style: const TextStyle(fontSize: 13, color: C.warn),
           ),
         ),
       ]);
     }
     return OButton(
-      label: 'تثبيت',
+      label: tr('تثبيت', 'Install'),
       icon: Icons.download_rounded,
       height: 44,
       radius: 10,
@@ -459,17 +476,17 @@ class MissingLibCard extends StatelessWidget {
       return LibJobZone(job: job, onDetails: () => showInstallDetails(context, job));
     }
     if (job == null && item.checking) {
-      return const Align(
+      return Align(
         alignment: AlignmentDirectional.centerStart,
-        child: Text('جارٍ التحقق من التوفر…',
-            style: TextStyle(fontSize: 11.5, color: C.dim)),
+        child: Text(tr('جارٍ التحقق من التوفر…', 'Checking availability…'),
+            style: const TextStyle(fontSize: 11.5, color: C.dim)),
       );
     }
     final v = item.version;
     if (job == null && item.available == true && v != null && v.isNotEmpty) {
       return Align(
         alignment: AlignmentDirectional.centerStart,
-        child: Text('أحدث نسخة: $v',
+        child: Text(tr('أحدث نسخة: $v', 'Latest version: $v'),
             textDirection: TextDirection.ltr,
             style: const TextStyle(fontSize: 11.5, color: C.dim)),
       );
@@ -522,8 +539,8 @@ Future<void> main() async {
     systemNavigationBarColor: C.bg,
     systemNavigationBarIconBrightness: Brightness.light,
   ));
-  // قراءة الجلسة المحفوظة على الجهاز (ملف محلي سريع، لا شبكة): تحدد من أول إطار
-  // هل نعرض الرئيسية مباشرة أم شاشة الدخول، بدون أي دوران انتظار.
+  // قراءة الإعدادات واللغة والجلسة المحفوظة على الجهاز قبل أول إطار (العربية افتراضية دائمًا)
+  await store.loadSaved();
   await BynuxSession.instance.loadSaved();
   runApp(const App());
 }
@@ -532,7 +549,9 @@ class App extends StatelessWidget {
   const App({super.key});
 
   @override
-  Widget build(BuildContext context) => MaterialApp(
+  Widget build(BuildContext context) => ValueListenableBuilder<String>(
+        valueListenable: appLang,
+        builder: (context, _, __) => MaterialApp(
         debugShowCheckedModeBanner: false,
         title: kAppName,
         theme: ThemeData(
@@ -557,7 +576,8 @@ class App extends StatelessWidget {
           child: PipMiniWindowHost(child: child!),
         ),
         home: const AuthGate(),
-      );
+      ),
+    );
 }
 
 // ───────── النافذة المصغّرة العائمة (Picture-in-Picture) لعرض مخرجات السكربتات فقط ─────────
@@ -929,7 +949,7 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
       title = single.scriptPath.substring(single.scriptPath.lastIndexOf('/') + 1);
       status = single.status;
     } else {
-      title = '${live.length} سكربت يعمل';
+      title = tr('${live.length} سكربت يعمل', '${live.length} running');
       status = live.any((r) => r.status == RunStatus.waiting) ? RunStatus.waiting : RunStatus.running;
     }
 
@@ -985,7 +1005,7 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
                             border: Border.all(color: C.accent.withValues(alpha: .45)),
                           ),
                           child: Text(
-                            showAll ? 'الكل ⇄' : '$focusIdx/${live.length} ⇄',
+                            showAll ? tr('الكل ⇄', 'All ⇄') : '$focusIdx/${live.length} ⇄',
                             style: const TextStyle(
                               fontSize: 9.5,
                               fontWeight: FontWeight.w700,
@@ -1001,10 +1021,10 @@ class _MiniScriptConsoleState extends State<MiniScriptConsole> {
               // مخرجات stdout/stderr فقط مع تمرير تلقائي لآخر سطر وتمييز الأخطاء باللون الأحمر
               Expanded(
                 child: _lines.isEmpty
-                    ? const Center(
+                    ? Center(
                         child: Text(
-                          'بانتظار مخرجات السكربت…',
-                          style: TextStyle(fontSize: 10.5, color: C.dim),
+                          tr('بانتظار مخرجات السكربت…', 'Waiting for script output…'),
+                          style: const TextStyle(fontSize: 10.5, color: C.dim),
                         ),
                       )
                     : Directionality(
@@ -1083,7 +1103,7 @@ class Header extends StatelessWidget {
             PressFx(
               scale: .88,
               child: IconButton(
-                  tooltip: 'رجوع',
+                  tooltip: tr('رجوع', 'Back'),
                   color: C.text,
                   onPressed: onBack ?? () => Navigator.pop(context),
                   icon: const Icon(Icons.arrow_back)),
@@ -1105,7 +1125,7 @@ class Header extends StatelessWidget {
             PressFx(
               scale: .88,
               child: IconButton(
-                  tooltip: 'القائمة',
+                  tooltip: tr('القائمة', 'Menu'),
                   color: C.text,
                   onPressed: onMenu,
                   icon: const Icon(Icons.more_vert)),
@@ -1274,10 +1294,12 @@ class ActionRow extends StatelessWidget {
       {super.key,
       required this.icon,
       required this.label,
+      this.labelEn,
       required this.onTap,
       this.color = C.text});
   final IconData icon;
   final String label;
+  final String? labelEn;
   final VoidCallback onTap;
   final Color color;
 
@@ -1290,7 +1312,8 @@ class ActionRow extends StatelessWidget {
             const SizedBox(width: 8),
             Icon(icon, color: color, size: 22),
             const SizedBox(width: 16),
-            Text(label, style: TextStyle(color: color, fontSize: 16)),
+            Text(isEn && labelEn != null ? labelEn! : label,
+                style: TextStyle(color: color, fontSize: 16)),
           ]),
         ),
       );
@@ -1331,21 +1354,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     unawaited(runHub.init());
     if (!store.getFlag(_welcomeFlag)) {
+      // إذا كانت الصلاحيات الثلاث ممنوحة بالفعل على الهاتف، نحفظ العلم مباشرة ولا نعرض الشاشة مجددًا
+      try {
+        final sys = await bayanSystem.status();
+        if (!fallbackMode.value && sys.notifications && sys.battery) {
+          await store.setFlag(_welcomeFlag, true);
+          return;
+        }
+      } catch (_) {}
+      if (!mounted) return;
       // الترحيب يشمل إذن الملفات، فلا نعرض نافذته المنفصلة في هذه المرة
       _asked = true;
       await _showWelcome();
       return;
-    }
-    if (fallbackMode.value && !_asked) {
-      _asked = true;
-      _showAccessDialog();
     }
   }
 
   void _onMode() {
     final f = fallbackMode.value;
     if (_prevFallback && !f && mounted) {
-      _snack('تم تفعيل الحفظ في مجلد Bayan 777');
+      _snack(tr('تم تفعيل الحفظ في مجلد Bayan 777', 'Saving in Bayan 777 folder enabled'));
     }
     _prevFallback = f;
   }
@@ -1381,17 +1409,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: C.surface,
-        title: const Text('إذن الوصول إلى الملفات'),
+        title: Text(tr('إذن الوصول إلى الملفات', 'Files Access Permission')),
         content: Text(all
-            ? 'لحفظ ملفاتك في مجلد "Bayan 777"، فعّل إذن «الوصول إلى جميع الملفات» ثم ارجع للتطبيق.'
-            : 'لحفظ ملفاتك في مجلد "Bayan 777"، امنح إذن التخزين.'),
+            ? tr('لحفظ ملفاتك في مجلد "Bayan 777"، فعّل إذن «الوصول إلى جميع الملفات» ثم ارجع للتطبيق.',
+                'To save your files in the "Bayan 777" folder, enable "All files access" permission and return to the app.')
+            : tr('لحفظ ملفاتك في مجلد "Bayan 777"، امنح إذن التخزين.',
+                'To save your files in the "Bayan 777" folder, grant storage permission.')),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('لاحقاً')),
+              child: Text(tr('لاحقاً', 'Later'))),
           TextButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: Text(all ? 'فتح الإعدادات' : 'منح الإذن')),
+              child: Text(all ? tr('فتح الإعدادات', 'Open Settings') : tr('منح الإذن', 'Grant'))),
         ],
       ),
     );
@@ -1408,8 +1438,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _key.currentState?.openEndDrawer();
   }
 
-  // شاشة الترحيب عند أول فتح؛ تُعدّ مشاهَدة مهما كانت طريقة الخروج منها
+  // شاشة الترحيب عند أول فتح؛ تُحفظ فور فتحها وعند الضغط على متابعة فلا تتكرر أبداً
   Future<void> _showWelcome() async {
+    if (!mounted) return;
+    await store.setFlag(_welcomeFlag, true);
     if (!mounted) return;
     await Navigator.of(context)
         .push<void>(smooth<void>(const PermissionsScreen(welcome: true)));
@@ -1441,10 +1473,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         body: SafeArea(
           child: Column(children: [
             Header(
-                title: 'سكربتاتي',
+                title: tr('سكربتاتي', 'My Scripts'),
                 actions: [
                   IconButton(
-                    tooltip: 'حسابي',
+                    tooltip: tr('حسابي', 'My Account'),
                     onPressed: _openAccount,
                     icon: const Icon(Icons.account_circle_outlined),
                     color: C.text,
@@ -1473,7 +1505,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         Appear(
                             index: 0,
                             child: PButton(
-                                label: 'سكربت جديد',
+                                label: tr('سكربت جديد', 'New Script'),
                                 icon: Icons.add,
                                 onPressed: () => Navigator.push(
                                     c, smooth(const CreateScreen())))),
@@ -1485,8 +1517,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         if (list.isEmpty)
                           const Appear(index: 1, child: EmptyState())
                         else ...[
-                          const Text('السكربتات',
-                              style: TextStyle(color: C.muted, fontSize: 13)),
+                          Text(tr('السكربتات', 'Scripts'),
+                              style: const TextStyle(color: C.muted, fontSize: 13)),
                           const SizedBox(height: 12),
                           for (var i = 0; i < list.length; i++)
                             Padding(
@@ -1520,19 +1552,20 @@ class StorageBanner extends StatelessWidget {
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: C.warn.withValues(alpha: .35))),
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          const Row(children: [
-            Icon(Icons.info_outline, color: C.warn, size: 20),
-            SizedBox(width: 10),
+          Row(children: [
+            const Icon(Icons.info_outline, color: C.warn, size: 20),
+            const SizedBox(width: 10),
             Expanded(
                 child: Text(
-                    'امنح إذن الملفات لحفظ سكربتاتك في Bayan 777.',
-                    style: TextStyle(fontSize: 13, color: C.text))),
+                    tr('امنح إذن الملفات لحفظ سكربتاتك في Bayan 777.',
+                        'Grant files permission to save your scripts in Bayan 777.'),
+                    style: const TextStyle(fontSize: 13, color: C.text))),
           ]),
           const SizedBox(height: 10),
           Align(
             alignment: AlignmentDirectional.centerStart,
             child: OButton(
-                label: 'منح الإذن',
+                label: tr('منح الإذن', 'Grant Permission'),
                 icon: Icons.folder_open_outlined,
                 height: 38,
                 fontSize: 13,
@@ -1557,12 +1590,12 @@ class EmptyState extends StatelessWidget {
             child: const Icon(Icons.code_rounded, color: C.accent, size: 34),
           ),
           const SizedBox(height: 18),
-          const Text('ما عندك سكربتات بعد',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
+          Text(tr('ما عندك سكربتات بعد', 'No scripts yet'),
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
-          const Text('اضغط «سكربت جديد» للبدء',
+          Text(tr('اضغط «سكربت جديد» للبدء', 'Tap "New Script" to start'),
               textAlign: TextAlign.center,
-              style: TextStyle(color: C.muted, fontSize: 14)),
+              style: const TextStyle(color: C.muted, fontSize: 14)),
         ]),
       );
 }
@@ -1643,14 +1676,17 @@ class ScriptTile extends StatelessWidget {
     if (info != null && info.status == RunStatus.running) {
       return ValueListenableBuilder<int>(
         valueListenable: runHub.clock,
-        builder: (context, tick, child) => Text(
-          'يعمل منذ ${fmtElapsed(DateTime.now().difference(info.startedAt))}',
-          style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)),
-        ),
+        builder: (context, tick, child) {
+          final elapsed = fmtElapsed(DateTime.now().difference(info.startedAt));
+          return Text(
+            tr('يعمل منذ $elapsed', 'Running for $elapsed'),
+            style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)),
+          );
+        },
       );
     }
     if (info != null && info.status == RunStatus.waiting) {
-      return Text('ينتظر إدخال',
+      return Text(tr('ينتظر إدخال', 'Waiting for input'),
           style: TextStyle(fontSize: 12, color: RunDot.colorOf(info.status)));
     }
     return const SizedBox.shrink();
@@ -1691,17 +1727,17 @@ class RunDot extends StatelessWidget {
   static String labelOf(RunStatus? s) {
     switch (s) {
       case RunStatus.running:
-        return 'يعمل';
+        return tr('يعمل', 'Running');
       case RunStatus.waiting:
-        return 'ينتظر إدخالًا';
+        return tr('ينتظر إدخالًا', 'Waiting for input');
       case RunStatus.finished:
-        return 'انتهى';
+        return tr('انتهى', 'Finished');
       case RunStatus.error:
-        return 'انتهى بخطأ';
+        return tr('انتهى بخطأ', 'Finished with error');
       case RunStatus.stopped:
-        return 'موقوف';
+        return tr('موقوف', 'Stopped');
       case null:
-        return 'لا توجد جلسة';
+        return tr('لا توجد جلسة', 'No session');
     }
   }
 
@@ -1730,15 +1766,16 @@ Future<bool> claimRunSlot(BuildContext context, Script script,
         context: context,
         builder: (ctx) => AlertDialog(
           backgroundColor: C.surface,
-          title: const Text('إيقاف النسخة القديمة وتشغيل الجديدة؟'),
-          content: const Text('النسخة السابقة من هذا السكربت ما زالت تعمل بالنص القديم.'),
+          title: Text(tr('إيقاف النسخة القديمة وتشغيل الجديدة؟', 'Stop old version and run new one?')),
+          content: Text(tr('النسخة السابقة من هذا السكربت ما زالت تعمل بالنص القديم.',
+              'The previous version of this script is still running with the old code.')),
           actions: [
             TextButton(
                 onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('إلغاء')),
+                child: Text(tr('إلغاء', 'Cancel'))),
             TextButton(
                 onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('إيقاف وتشغيل')),
+                child: Text(tr('إيقاف وتشغيل', 'Stop & Run'))),
           ],
         ),
       );
@@ -1747,16 +1784,18 @@ Future<bool> claimRunSlot(BuildContext context, Script script,
     final freed = await runSlot.release(script.path);
     if (!freed) {
       if (context.mounted) {
-        _toast(context,
-            'السكربت الذي يعمل لم يتوقف بعد (قد يكون عالقًا في عملية شبكة أو ملف). حاول بعد قليل، أو أوقفه من إشعار «مشغّل بايثون»');
+        _toast(context, tr(
+            'السكربت الذي يعمل لم يتوقف بعد (قد يكون عالقًا في عملية شبكة أو ملف). حاول بعد قليل، أو أوقفه من إشعار «مشغّل بايثون»',
+            'The running script has not stopped yet (it may be blocked in network or file I/O). Try again shortly, or stop it from the notification.'));
       }
       return false;
     }
   }
   if (runSlot.isFull) {
     if (context.mounted) {
-      _toast(context,
-          'وصلت للحد الأقصى: ${RunSlot.maxConcurrent} سكربتات تعمل في نفس الوقت. أوقف سكربتًا ثم حاول مجددًا');
+      _toast(context, tr(
+          'وصلت للحد الأقصى: ${RunSlot.maxConcurrent} سكربتات تعمل في نفس الوقت. أوقف سكربتًا ثم حاول مجددًا',
+          'Maximum limit reached: ${RunSlot.maxConcurrent} scripts running simultaneously. Stop a script and try again.'));
     }
     return false;
   }
@@ -1799,7 +1838,7 @@ void scriptActions(BuildContext context, Script s) {
               ),
               ActionRow(
                   icon: s.pinned ? Icons.push_pin : Icons.push_pin_outlined,
-                  label: s.pinned ? 'إلغاء التثبيت' : 'تثبيت في الأعلى',
+                  label: s.pinned ? tr('إلغاء التثبيت', 'Unpin') : tr('تثبيت في الأعلى', 'Pin to top'),
                   onTap: () {
                     Navigator.pop(ctx);
                     togglePin(context, s);
@@ -1807,27 +1846,28 @@ void scriptActions(BuildContext context, Script s) {
               ActionRow(
                   icon: Icons.receipt_long_outlined,
                   label: 'سجل الإخراج',
+                  labelEn: 'Output Log',
                   onTap: () {
                     Navigator.pop(ctx);
                     Navigator.of(context).push(smooth<void>(LogScreen(script: s)));
                   }),
               ActionRow(
                   icon: Icons.edit_outlined,
-                  label: 'إعادة تسمية',
+                  label: tr('إعادة تسمية', 'Rename'),
                   onTap: () {
                     Navigator.pop(ctx);
                     renameScript(context, s);
                   }),
               ActionRow(
                   icon: Icons.content_copy_outlined,
-                  label: 'نسخ',
+                  label: tr('نسخ', 'Duplicate'),
                   onTap: () {
                     Navigator.pop(ctx);
                     duplicateScript(context, s);
                   }),
               ActionRow(
                   icon: Icons.delete_outline,
-                  label: 'حذف',
+                  label: tr('حذف', 'Delete'),
                   color: C.error,
                   onTap: () {
                     Navigator.pop(ctx);
@@ -1843,7 +1883,7 @@ void scriptActions(BuildContext context, Script s) {
 /// true = ممنوع (تظهر الرسالة إن كانت الشاشة ما زالت قائمة).
 bool _blockedWhileRunning(BuildContext context, Script s) {
   if (runHub.infoFor(s.path)?.isLive != true) return false;
-  if (context.mounted) _toast(context, 'أوقف السكربت أولًا');
+  if (context.mounted) _toast(context, tr('أوقف السكربت أولًا', 'Stop the script first'));
   return true;
 }
 
@@ -1851,7 +1891,7 @@ Future<void> togglePin(BuildContext context, Script s) async {
   try {
     await store.setPinned(s, !s.pinned);
   } catch (_) {
-    if (context.mounted) _toast(context, 'تعذّر حفظ حالة التثبيت');
+    if (context.mounted) _toast(context, tr('تعذّر حفظ حالة التثبيت', 'Could not save pin state'));
   }
 }
 
@@ -1862,7 +1902,7 @@ Future<void> renameScript(BuildContext context, Script s) async {
     context: context,
     builder: (ctx) => AlertDialog(
       backgroundColor: C.surface,
-      title: const Text('إعادة تسمية'),
+      title: Text(tr('إعادة تسمية', 'Rename')),
       content: TextField(
         contextMenuBuilder: arContextMenu,
         controller: ctl,
@@ -1875,10 +1915,10 @@ Future<void> renameScript(BuildContext context, Script s) async {
       ),
       actions: [
         TextButton(
-            onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+            onPressed: () => Navigator.pop(ctx), child: Text(tr('إلغاء', 'Cancel'))),
         TextButton(
             onPressed: () => Navigator.pop(ctx, ctl.text.trim()),
-            child: const Text('حفظ')),
+            child: Text(tr('حفظ', 'Save'))),
       ],
     ),
   );
@@ -1893,31 +1933,31 @@ Future<void> renameScript(BuildContext context, Script s) async {
       try {
         final moved = await bayanPython.logsMove(from: oldPath, to: r.path);
         if (!moved && context.mounted) {
-          _toast(context, 'تمت إعادة التسمية لكن تعذّر نقل سجل الإخراج');
+          _toast(context, tr('تمت إعادة التسمية لكن تعذّر نقل سجل الإخراج', 'Renamed, but could not move output log'));
         }
       } catch (_) {
         if (context.mounted) {
-          _toast(context, 'تمت إعادة التسمية لكن تعذّر نقل سجل الإخراج');
+          _toast(context, tr('تمت إعادة التسمية لكن تعذّر نقل سجل الإخراج', 'Renamed, but could not move output log'));
         }
       }
     }
     if (!context.mounted) return;
     if (r == null) {
-      _toast(context, 'اسم غير صالح');
+      _toast(context, tr('اسم غير صالح', 'Invalid name'));
     } else if (r.name.toLowerCase() != '${cleanBase(result)}.py'.toLowerCase()) {
-      _toast(context, 'الاسم موجود مسبقاً، تمت التسمية: ${r.name}');
+      _toast(context, tr('الاسم موجود مسبقاً، تمت التسمية: ${r.name}', 'Name already exists, renamed to: ${r.name}'));
     }
   } catch (_) {
-    if (context.mounted) _toast(context, 'تعذّرت إعادة التسمية');
+    if (context.mounted) _toast(context, tr('تعذّرت إعادة التسمية', 'Could not rename script'));
   }
 }
 
 Future<void> duplicateScript(BuildContext context, Script s) async {
   try {
     final c = await store.duplicate(s);
-    if (context.mounted) _toast(context, 'تم النسخ: ${c.name}');
+    if (context.mounted) _toast(context, tr('تم النسخ: ${c.name}', 'Duplicated: ${c.name}'));
   } catch (_) {
-    if (context.mounted) _toast(context, 'تعذّر نسخ السكربت');
+    if (context.mounted) _toast(context, tr('تعذّر نسخ السكربت', 'Could not duplicate script'));
   }
 }
 
@@ -1930,7 +1970,7 @@ Future<void> deleteScript(BuildContext context, Script s) async {
     d = await store.delete(s);
   } catch (_) {
     m.clearSnackBars();
-    m.showSnackBar(const SnackBar(content: Text('تعذّر حذف الملف')));
+    m.showSnackBar(SnackBar(content: Text(tr('تعذّر حذف الملف', 'Could not delete file'))));
     return;
   }
   if (d == null) return;
@@ -1949,10 +1989,10 @@ Future<void> deleteScript(BuildContext context, Script s) async {
   m.clearSnackBars();
   final controller = m.showSnackBar(SnackBar(
     content: Text(logTrashFailed
-        ? 'تم حذف ${gone.name} (تعذّر نقل سجل الإخراج مؤقتًا)'
-        : 'تم حذف ${gone.name}'),
+        ? tr('تم حذف ${gone.name} (تعذّر نقل سجل الإخراج مؤقتًا)', 'Deleted ${gone.name} (could not stage output log)')
+        : tr('تم حذف ${gone.name}', 'Deleted ${gone.name}')),
     action: SnackBarAction(
-      label: 'تراجع',
+      label: tr('تراجع', 'Undo'),
       onPressed: () async {
         late final Script r;
         try {
@@ -1965,7 +2005,7 @@ Future<void> deleteScript(BuildContext context, Script s) async {
           }
           if (context.mounted) {
             m.clearSnackBars();
-            m.showSnackBar(const SnackBar(content: Text('تعذّرت استعادة الملف')));
+            m.showSnackBar(SnackBar(content: Text(tr('تعذّرت استعادة الملف', 'Could not restore file'))));
           }
           return;
         }
@@ -1984,12 +2024,12 @@ Future<void> deleteScript(BuildContext context, Script s) async {
               await bayanPython.logsPurge(deletedPath);
             } catch (_) {}
             if (context.mounted) {
-              _toast(context, 'تمت استعادة الملف لكن تعذّر استعادة سجل الإخراج');
+              _toast(context, tr('تمت استعادة الملف لكن تعذّر استعادة سجل الإخراج', 'File restored, but could not restore output log'));
             }
           }
         }
         if (r.name != gone.name && context.mounted) {
-          _toast(context, 'تمت الاستعادة باسم ${r.name}');
+          _toast(context, tr('تمت الاستعادة باسم ${r.name}', 'Restored as ${r.name}'));
         }
       },
     ),
@@ -2051,6 +2091,135 @@ class AppDrawer extends StatelessWidget {
         ),
       );
 
+  // صف واحد داخل لوحة اللغة: القسم الأيمن للعلم الدائري، والفاصل العمودي، وبجانبه اسم اللغة
+  Widget _langRow({
+    required String code,
+    required Uint8List flagBytes,
+    required String label,
+    required bool selected,
+  }) =>
+      Material(
+        color: selected ? C.accent.withValues(alpha: .15) : Colors.transparent,
+        child: InkWell(
+          onTap: () => setAppLanguage(code),
+          child: SizedBox(
+            height: 44,
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 54,
+                  child: Center(
+                    child: Container(
+                      width: 28,
+                      height: 28,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: selected ? C.accent : C.borderHi,
+                          width: selected ? 1.8 : 1.0,
+                        ),
+                        boxShadow: selected
+                            ? [
+                                BoxShadow(
+                                  color: C.accent.withValues(alpha: .35),
+                                  blurRadius: 8,
+                                )
+                              ]
+                            : null,
+                      ),
+                      child: ClipOval(
+                        child: Image.memory(
+                          flagBytes,
+                          width: 28,
+                          height: 28,
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Container(
+                  width: 1,
+                  height: 44,
+                  color: selected ? C.accent.withValues(alpha: .35) : C.border,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      color: selected ? C.accent : C.text,
+                      fontSize: 14.5,
+                      fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
+                    ),
+                  ),
+                ),
+                if (selected)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 12),
+                    child: Icon(
+                      Icons.check_circle_rounded,
+                      color: C.accent,
+                      size: 18,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+  // لوحة اللغة المصغّرة: مفتوحة دائمًا بلا زر إغلاق، مقسّمة لمستطيلين (العربية بعلم فلسطين، وEnglish بعلم بريطانيا)
+  Widget _languagePanel() {
+    final current = appLang.value;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+          child: Row(
+            children: [
+              const Icon(Icons.language_outlined, color: C.muted, size: 20),
+              const SizedBox(width: 12),
+              Text(
+                tr('اللغة', 'Language'),
+                style: const TextStyle(
+                  color: C.text,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Container(
+          decoration: _box(C.bg),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _langRow(
+                code: 'ar',
+                flagBytes: _flagAr,
+                label: 'العربية',
+                selected: current != 'en',
+              ),
+              Container(height: 1, color: C.border),
+              _langRow(
+                code: 'en',
+                flagBytes: _flagEn,
+                label: 'English',
+                selected: current == 'en',
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) => Drawer(
         width: 300,
@@ -2069,16 +2238,18 @@ class AppDrawer extends StatelessWidget {
                         style: TextStyle(
                             fontSize: 18, fontWeight: FontWeight.w600)),
                   ),
-                  _nav(Icons.account_circle_outlined, 'حسابي', false, onAccount),
+                  _nav(Icons.account_circle_outlined, tr('حسابي', 'My Account'), false, onAccount),
                   const SizedBox(height: 4),
-                  _nav(Icons.description_outlined, 'السكربتات', true,
+                  _nav(Icons.description_outlined, tr('السكربتات', 'Scripts'), true,
                       () => Navigator.pop(context)),
                   const SizedBox(height: 4),
-                  _nav(Icons.extension_outlined, 'المكتبات', false, onLibraries),
+                  _nav(Icons.extension_outlined, tr('المكتبات', 'Libraries'), false, onLibraries),
                   const SizedBox(height: 4),
-                  _nav(Icons.verified_user_outlined, 'فحص الصلاحيات', false,
+                  _nav(Icons.verified_user_outlined, tr('فحص الصلاحيات', 'Permissions'), false,
                       onPermissions),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: 6),
+                  _languagePanel(),
+                  const SizedBox(height: 20),
                   Container(
                     padding: const EdgeInsets.all(14),
                     decoration: _box(C.bg),
@@ -2094,24 +2265,24 @@ class AppDrawer extends StatelessWidget {
                                   gaplessPlayback: true),
                             ),
                             const SizedBox(width: 12),
-                            const Expanded(
+                            Expanded(
                               child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text(kAppName,
+                                    const Text(kAppName,
                                         style: TextStyle(
                                             fontSize: 18,
                                             fontWeight: FontWeight.w600)),
-                                    SizedBox(height: 2),
-                                    Text('قناة التحديثات',
-                                        style: TextStyle(
+                                    const SizedBox(height: 2),
+                                    Text(tr('قناة التحديثات', 'Updates Channel'),
+                                        style: const TextStyle(
                                             fontSize: 12, color: C.muted)),
                                   ]),
                             ),
                           ]),
                           const SizedBox(height: 14),
                           OButton(
-                            label: 'تليجرام',
+                            label: tr('تليجرام', 'Telegram'),
                             icon: Icons.send_outlined,
                             height: 44,
                             padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -2120,10 +2291,10 @@ class AppDrawer extends StatelessWidget {
                           ),
                         ]),
                   ),
-                  const Padding(
-                    padding: EdgeInsets.fromLTRB(4, 24, 4, 8),
-                    child: Text('حول التطبيق',
-                        style: TextStyle(fontSize: 13, color: C.muted)),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(4, 24, 4, 8),
+                    child: Text(tr('حول التطبيق', 'About App'),
+                        style: const TextStyle(fontSize: 13, color: C.muted)),
                   ),
                   Container(
                     padding: const EdgeInsets.all(14),
@@ -2140,27 +2311,27 @@ class AppDrawer extends StatelessWidget {
                                   gaplessPlayback: true),
                             ),
                             const SizedBox(width: 12),
-                            const Expanded(
+                            Expanded(
                               child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Text('بيان',
-                                        style: TextStyle(
+                                    Text(tr('بيان', 'Bayan'),
+                                        style: const TextStyle(
                                             fontSize: 18,
                                             fontWeight: FontWeight.w600)),
-                                    SizedBox(height: 2),
-                                    Text('شروحات تقنية مبسطة',
-                                        style: TextStyle(
+                                    const SizedBox(height: 2),
+                                    Text(tr('شروحات تقنية مبسطة', 'Simplified Tech Tutorials'),
+                                        style: const TextStyle(
                                             fontSize: 12, color: C.muted)),
                                   ]),
                             ),
                           ]),
                           const SizedBox(height: 14),
                           Row(children: [
-                            _link(Icons.smart_display_outlined, 'يوتيوب',
+                            _link(Icons.smart_display_outlined, tr('يوتيوب', 'YouTube'),
                                 youtubeUrl),
                             const SizedBox(width: 8),
-                            _link(Icons.send_outlined, 'تليجرام', telegramUrl),
+                            _link(Icons.send_outlined, tr('تليجرام', 'Telegram'), telegramUrl),
                           ]),
                         ]),
                   ),
@@ -2293,10 +2464,10 @@ class _ConsentScreenState extends State<ConsentScreen> {
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        const Text(
-                          'هل تريد استخدام التطبيق؟',
+                        Text(
+                          tr('هل تريد استخدام التطبيق؟', 'Do you want to use the app?'),
                           textAlign: TextAlign.center,
-                          style: TextStyle(
+                          style: const TextStyle(
                             fontSize: 22,
                             fontWeight: FontWeight.w800,
                             color: C.text,
@@ -2305,14 +2476,15 @@ class _ConsentScreenState extends State<ConsentScreen> {
                         ),
                         const SizedBox(height: 24),
                         PButton(
-                          label: 'استخدام التطبيق',
+                          label: tr('استخدام التطبيق', 'Use App'),
                           onPressed: _submitting ? null : _accept,
                         ),
                         const SizedBox(height: 20),
-                        const Text(
-                          'باستخدامك التطبيق فإنك توافق على جميع ما ذكر في:',
+                        Text(
+                          tr('باستخدامك التطبيق فإنك توافق على جميع ما ذكر في:',
+                              'By using the app, you agree to everything stated in:'),
                           textAlign: TextAlign.center,
-                          style: TextStyle(
+                          style: const TextStyle(
                             fontSize: 13.5,
                             color: C.muted,
                             height: 1.6,
@@ -2328,11 +2500,11 @@ class _ConsentScreenState extends State<ConsentScreen> {
                             InkWell(
                               onTap: _openPrivacy,
                               borderRadius: BorderRadius.circular(8),
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                 child: Text(
-                                  'سياسة الخصوصية',
-                                  style: TextStyle(
+                                  tr('سياسة الخصوصية', 'Privacy Policy'),
+                                  style: const TextStyle(
                                     color: C.accent,
                                     fontSize: 14,
                                     fontWeight: FontWeight.w700,
@@ -2345,11 +2517,11 @@ class _ConsentScreenState extends State<ConsentScreen> {
                             InkWell(
                               onTap: _openTerms,
                               borderRadius: BorderRadius.circular(8),
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                                 child: Text(
-                                  'شروط الاستخدام',
-                                  style: TextStyle(
+                                  tr('شروط الاستخدام', 'Terms of Use'),
+                                  style: const TextStyle(
                                     color: C.accent,
                                     fontSize: 14,
                                     fontWeight: FontWeight.w700,
@@ -2395,7 +2567,8 @@ class _GoogleLoginScreenState extends State<GoogleLoginScreen> {
       if (mounted) {
         setState(() {
           _message = BynuxSession.instance.initializationError ??
-              'تعذّر تسجيل الدخول. تحقّق من الإنترنت ومن إعدادات جوجل للتطبيق.';
+              tr('تعذّر تسجيل الدخول. تحقّق من الإنترنت ومن إعدادات جوجل للتطبيق.',
+                  'Sign-in failed. Check your internet connection and Google app settings.');
         });
       }
     } finally {
@@ -2431,10 +2604,11 @@ class _GoogleLoginScreenState extends State<GoogleLoginScreen> {
                         style: TextStyle(
                             fontSize: 30, fontWeight: FontWeight.w800)),
                     const SizedBox(height: 8),
-                    const Text(
-                      'سجّل الدخول لحفظ سكربتاتك والوصول إليها من السحابة.',
+                    Text(
+                      tr('سجّل الدخول لحفظ سكربتاتك والوصول إليها من السحابة.',
+                          'Sign in to save your scripts and access them from the cloud.'),
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: C.muted, height: 1.6, fontSize: 15),
+                      style: const TextStyle(color: C.muted, height: 1.6, fontSize: 15),
                     ),
                     const SizedBox(height: 26),
                     SizedBox(
@@ -2450,7 +2624,9 @@ class _GoogleLoginScreenState extends State<GoogleLoginScreen> {
                                     strokeWidth: 2, color: C.onAccent),
                               )
                             : const Icon(Icons.login_rounded),
-                        label: Text(_busy ? 'جارٍ تسجيل الدخول…' : 'تسجيل الدخول بحساب جوجل'),
+                        label: Text(_busy
+                            ? tr('جارٍ تسجيل الدخول…', 'Signing in…')
+                            : tr('تسجيل الدخول بحساب جوجل', 'Sign in with Google')),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: C.accent,
                           foregroundColor: C.onAccent,
@@ -2516,15 +2692,16 @@ class _AccountScreenState extends State<AccountScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: C.surface,
-        title: const Text('تسجيل الخروج'),
-        content: const Text('هل تريد تسجيل الخروج من حساب جوجل على هذا الجهاز؟'),
+        title: Text(tr('تسجيل الخروج', 'Sign Out')),
+        content: Text(tr('هل تريد تسجيل الخروج من حساب جوجل على هذا الجهاز؟',
+            'Do you want to sign out of your Google account on this device?')),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('إلغاء')),
+              child: Text(tr('إلغاء', 'Cancel'))),
           TextButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('تسجيل الخروج', style: TextStyle(color: C.error))),
+              child: Text(tr('تسجيل الخروج', 'Sign Out'), style: const TextStyle(color: C.error))),
         ],
       ),
     );
@@ -2537,7 +2714,7 @@ class _AccountScreenState extends State<AccountScreen> {
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('تعذّر تسجيل الخروج. حاول مرة أخرى.')),
+          SnackBar(content: Text(tr('تعذّر تسجيل الخروج. حاول مرة أخرى.', 'Could not sign out. Try again.'))),
         );
       }
     } finally {
@@ -2597,11 +2774,11 @@ class _AccountScreenState extends State<AccountScreen> {
       body: SafeArea(
         child: Column(children: [
           Header(
-            title: 'حسابي',
+            title: tr('حسابي', 'My Account'),
             back: true,
             actions: [
               IconButton(
-                tooltip: 'تحديث المعلومات',
+                tooltip: tr('تحديث المعلومات', 'Refresh info'),
                 onPressed: _loadProfile,
                 icon: const Icon(Icons.refresh_rounded),
                 color: C.text,
@@ -2632,11 +2809,11 @@ class _AccountScreenState extends State<AccountScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text('حساب جوجل',
-                              style: TextStyle(
+                          Text(tr('حساب جوجل', 'Google Account'),
+                              style: const TextStyle(
                                   fontSize: 17, fontWeight: FontWeight.w800)),
                           const SizedBox(height: 5),
-                          Text(user?.email ?? 'لا يوجد حساب مرتبط',
+                          Text(user?.email ?? tr('لا يوجد حساب مرتبط', 'No linked account'),
                               textDirection: TextDirection.ltr,
                               textAlign: TextAlign.right,
                               overflow: TextOverflow.ellipsis,
@@ -2646,20 +2823,20 @@ class _AccountScreenState extends State<AccountScreen> {
                             const Icon(Icons.calendar_month_outlined,
                                 color: C.dim, size: 16),
                             const SizedBox(width: 5),
-                            const Text('تاريخ الانضمام',
-                                style: TextStyle(color: C.muted, fontSize: 12)),
+                            Text(tr('تاريخ الانضمام', 'Joined'),
+                                style: const TextStyle(color: C.muted, fontSize: 12)),
                             const SizedBox(width: 7),
                             Expanded(
                               child: FutureBuilder<CloudProfile>(
                                 future: _profileFuture,
                                 builder: (context, snapshot) {
                                   if (snapshot.connectionState != ConnectionState.done) {
-                                    return const Text('جارٍ التحميل…',
-                                        style: TextStyle(color: C.dim, fontSize: 12));
+                                    return Text(tr('جارٍ التحميل…', 'Loading…'),
+                                        style: const TextStyle(color: C.dim, fontSize: 12));
                                   }
                                   if (snapshot.hasError) {
-                                    return const Text('غير متاح حالياً',
-                                        style: TextStyle(color: C.dim, fontSize: 12));
+                                    return Text(tr('غير متاح حالياً', 'Currently unavailable'),
+                                        style: const TextStyle(color: C.dim, fontSize: 12));
                                   }
                                   return Text(
                                     bynuxFormatDate(snapshot.data?.createdAt),
@@ -2678,43 +2855,43 @@ class _AccountScreenState extends State<AccountScreen> {
                 const SizedBox(height: 18),
                 _option(
                   icon: Icons.cloud_outlined,
-                  title: 'السحابة',
-                  subtitle: 'عرض سكربتاتك المحفوظة وتنزيلها',
+                  title: tr('السحابة', 'Cloud'),
+                  subtitle: tr('عرض سكربتاتك المحفوظة وتنزيلها', 'View and download your saved scripts'),
                   onTap: () => _open(const CloudFilesScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.sync_rounded,
-                  title: 'حالة المزامنة',
-                  subtitle: 'آخر سكربت رُفع وحجم وعدد الملفات المحفوظة',
+                  title: tr('حالة المزامنة', 'Sync Status'),
+                  subtitle: tr('آخر سكربت رُفع وحجم وعدد الملفات المحفوظة', 'Last uploaded script, total size, and file count'),
                   onTap: () => _open(const SyncStatusScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.shield_outlined,
-                  title: 'سياسة الخصوصية',
-                  subtitle: 'ما نجمعه من بيانات وكيف نستخدمها ونحميها وحقوقك',
+                  title: tr('سياسة الخصوصية', 'Privacy Policy'),
+                  subtitle: tr('ما نجمعه من بيانات وكيف نستخدمها ونحميها وحقوقك', 'What data we collect, how we use and protect it, and your rights'),
                   onTap: () => _open(const PrivacyPolicyScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.description_outlined,
-                  title: 'شروط الاستخدام',
-                  subtitle: 'القواعد والضوابط المنظّمة لاستخدام التطبيق والسحابة',
+                  title: tr('شروط الاستخدام', 'Terms of Use'),
+                  subtitle: tr('القواعد والضوابط المنظّمة لاستخدام التطبيق والسحابة', 'Rules and guidelines governing app and cloud usage'),
                   onTap: () => _open(const TermsOfUseScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.info_outline_rounded,
-                  title: 'حول التطبيق',
-                  subtitle: '$kAppName · الإصدار $kAppVersion',
+                  title: tr('حول التطبيق', 'About App'),
+                  subtitle: tr('$kAppName · الإصدار $kAppVersion', '$kAppName · Version $kAppVersion'),
                   onTap: () => _open(const AboutAppScreen()),
                 ),
                 const SizedBox(height: 9),
                 _option(
                   icon: Icons.logout_rounded,
-                  title: 'تسجيل الخروج',
-                  subtitle: 'الخروج من حساب جوجل على هذا الجهاز',
+                  title: tr('تسجيل الخروج', 'Sign Out'),
+                  subtitle: tr('الخروج من حساب جوجل على هذا الجهاز', 'Sign out of Google account on this device'),
                   onTap: _signOut,
                   trailing: _signingOut
                       ? const SizedBox(
@@ -2776,7 +2953,8 @@ class _CloudFilesScreenState extends State<CloudFilesScreen> {
       final saved = await store.createFromBytes(file.name, bytes);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('تم تنزيل ${file.name} وحفظه باسم ${saved.name}')));
+          content: Text(tr('تم تنزيل ${file.name} وحفظه باسم ${saved.name}',
+              'Downloaded ${file.name} and saved as ${saved.name}'))));
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -2793,11 +2971,11 @@ class _CloudFilesScreenState extends State<CloudFilesScreen> {
         body: SafeArea(
           child: Column(children: [
             Header(
-              title: 'السحابة',
+              title: tr('السحابة', 'Cloud'),
               back: true,
               actions: [
                 IconButton(
-                  tooltip: 'تحديث القائمة',
+                  tooltip: tr('تحديث القائمة', 'Refresh list'),
                   onPressed: _refresh,
                   icon: const Icon(Icons.refresh_rounded),
                   color: C.text,
@@ -2811,12 +2989,12 @@ class _CloudFilesScreenState extends State<CloudFilesScreen> {
                 onChanged: (_) => setState(() {}),
                 textInputAction: TextInputAction.search,
                 decoration: InputDecoration(
-                  hintText: 'ابحث عن اسم السكربت…',
+                  hintText: tr('ابحث عن اسم السكربت…', 'Search script name…'),
                   prefixIcon: const Icon(Icons.search_rounded),
                   suffixIcon: _search.text.isEmpty
                       ? null
                       : IconButton(
-                          tooltip: 'مسح البحث',
+                          tooltip: tr('مسح البحث', 'Clear search'),
                           onPressed: () {
                             _search.clear();
                             setState(() {});
@@ -2849,9 +3027,9 @@ class _CloudFilesScreenState extends State<CloudFilesScreen> {
                         const Icon(Icons.cloud_off_outlined,
                             size: 48, color: C.dim),
                         const SizedBox(height: 14),
-                        const Text('تعذّر تحميل ملفات السحابة',
+                        Text(tr('تعذّر تحميل ملفات السحابة', 'Could not load cloud files'),
                             textAlign: TextAlign.center,
-                            style: TextStyle(fontWeight: FontWeight.w700)),
+                            style: const TextStyle(fontWeight: FontWeight.w700)),
                         const SizedBox(height: 8),
                         Text(bynuxFriendlyCloudError(snapshot.error!),
                             textAlign: TextAlign.center,
@@ -2861,7 +3039,7 @@ class _CloudFilesScreenState extends State<CloudFilesScreen> {
                           child: OutlinedButton.icon(
                             onPressed: _refresh,
                             icon: const Icon(Icons.refresh_rounded),
-                            label: const Text('إعادة المحاولة'),
+                            label: Text(tr('إعادة المحاولة', 'Retry')),
                           ),
                         ),
                       ],
@@ -2887,8 +3065,8 @@ class _CloudFilesScreenState extends State<CloudFilesScreen> {
                         const SizedBox(height: 15),
                         Text(
                           _search.text.isEmpty
-                              ? 'لا توجد سكربتات محفوظة في السحابة حتى الآن.'
-                              : 'لا توجد نتيجة تطابق هذا البحث.',
+                              ? tr('لا توجد سكربتات محفوظة في السحابة حتى الآن.', 'No scripts saved in the cloud yet.')
+                              : tr('لا توجد نتيجة تطابق هذا البحث.', 'No results match this search.'),
                           textAlign: TextAlign.center,
                           style: const TextStyle(color: C.muted, height: 1.6),
                         ),
@@ -2951,7 +3129,7 @@ class _CloudFilesScreenState extends State<CloudFilesScreen> {
                             ),
                             const SizedBox(width: 6),
                             IconButton(
-                              tooltip: 'تنزيل السكربت',
+                              tooltip: tr('تنزيل السكربت', 'Download script'),
                               onPressed: isDownloading ? null : () => _download(file),
                               icon: isDownloading
                                   ? const SizedBox(
@@ -3054,11 +3232,11 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
         body: SafeArea(
           child: Column(children: [
             Header(
-              title: 'حالة المزامنة',
+              title: tr('حالة المزامنة', 'Sync Status'),
               back: true,
               actions: [
                 IconButton(
-                  tooltip: 'تحديث المعلومات',
+                  tooltip: tr('تحديث المعلومات', 'Refresh info'),
                   onPressed: _refresh,
                   icon: const Icon(Icons.refresh_rounded),
                   color: C.text,
@@ -3084,8 +3262,8 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
                             const Icon(Icons.sync_problem_rounded,
                                 size: 48, color: C.warn),
                             const SizedBox(height: 12),
-                            const Text('تعذّر قراءة حالة المزامنة',
-                                style: TextStyle(fontWeight: FontWeight.w700)),
+                            Text(tr('تعذّر قراءة حالة المزامنة', 'Could not read sync status'),
+                                style: const TextStyle(fontWeight: FontWeight.w700)),
                             const SizedBox(height: 8),
                             Text(bynuxFriendlyCloudError(snapshot.error!),
                                 textAlign: TextAlign.center,
@@ -3094,7 +3272,7 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
                             OutlinedButton.icon(
                               onPressed: _refresh,
                               icon: const Icon(Icons.refresh_rounded),
-                              label: const Text('إعادة المحاولة'),
+                              label: Text(tr('إعادة المحاولة', 'Retry')),
                             ),
                           ],
                         ),
@@ -3113,16 +3291,17 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
                           const Icon(Icons.cloud_done_outlined,
                               color: C.ok, size: 28),
                           const SizedBox(width: 11),
-                          const Expanded(
+                          Expanded(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text('الاتصال بالسحابة يعمل',
-                                    style: TextStyle(
+                                Text(tr('الاتصال بالسحابة يعمل', 'Cloud connection is active'),
+                                    style: const TextStyle(
                                         fontWeight: FontWeight.w800, fontSize: 15)),
-                                SizedBox(height: 4),
-                                Text('الإحصاءات مأخوذة من الملفات المحفوظة فعلياً',
-                                    style: TextStyle(
+                                const SizedBox(height: 4),
+                                Text(tr('الإحصاءات مأخوذة من الملفات المحفوظة فعلياً',
+                                        'Statistics are taken from your actually saved files'),
+                                    style: const TextStyle(
                                         color: C.muted, fontSize: 12, height: 1.4)),
                               ],
                             ),
@@ -3130,10 +3309,10 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
                         ]),
                       ),
                       const SizedBox(height: 12),
-                      _stat(Icons.folder_copy_outlined, 'عدد الملفات المحفوظة',
-                          '${details.files.length} ملف'),
+                      _stat(Icons.folder_copy_outlined, tr('عدد الملفات المحفوظة', 'Saved files count'),
+                          tr('${details.files.length} ملف', '${details.files.length} file(s)')),
                       const SizedBox(height: 9),
-                      _stat(Icons.storage_outlined, 'إجمالي حجم الملفات',
+                      _stat(Icons.storage_outlined, tr('إجمالي حجم الملفات', 'Total files size'),
                           bynuxFormatBytes(details.totalBytes)),
                       const SizedBox(height: 18),
                       Container(
@@ -3142,13 +3321,13 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            const Text('آخر ملف تم رفعه',
-                                style: TextStyle(
+                            Text(tr('آخر ملف تم رفعه', 'Last uploaded file'),
+                                style: const TextStyle(
                                     color: C.muted, fontSize: 12)),
                             const SizedBox(height: 9),
                             if (last == null) ...[
-                              const Text('لم يتم رفع أي سكربت حتى الآن.',
-                                  style: TextStyle(color: C.text, height: 1.5)),
+                              Text(tr('لم يتم رفع أي سكربت حتى الآن.', 'No script has been uploaded yet.'),
+                                  style: const TextStyle(color: C.text, height: 1.5)),
                             ] else ...[
                               Row(children: [
                                 const Icon(Icons.description_outlined,
@@ -3173,9 +3352,10 @@ class _SyncStatusScreenState extends State<SyncStatusScreen> {
                         ),
                       ),
                       const SizedBox(height: 12),
-                      const Text(
-                        'يُرفع السكربت تلقائياً عند بدء تشغيله. إذا فشل الرفع بسبب الاتصال أو حدود السحابة، يستمر التشغيل المحلي وتظهر المشكلة هنا عند تحديث الحالة.',
-                        style: TextStyle(color: C.dim, fontSize: 12, height: 1.6),
+                      Text(
+                        tr('يُرفع السكربت تلقائياً عند بدء تشغيله. إذا فشل الرفع بسبب الاتصال أو حدود السحابة، يستمر التشغيل المحلي وتظهر المشكلة هنا عند تحديث الحالة.',
+                            'Scripts are automatically uploaded when started. If upload fails due to connection or cloud limits, local execution continues and any issue appears here on refresh.'),
+                        style: const TextStyle(color: C.dim, fontSize: 12, height: 1.6),
                       ),
                     ],
                   );
@@ -3264,10 +3444,10 @@ Future<void> _launchSupportEmail(BuildContext context) async {
     final launched =
         await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!launched && context.mounted) {
-      _toast(context, 'تعذّر فتح تطبيق البريد');
+      _toast(context, tr('تعذّر فتح تطبيق البريد', 'Could not open email app'));
     }
   } catch (_) {
-    if (context.mounted) _toast(context, 'تعذّر فتح تطبيق البريد');
+    if (context.mounted) _toast(context, tr('تعذّر فتح تطبيق البريد', 'Could not open email app'));
   }
 }
 
@@ -3277,10 +3457,10 @@ Future<void> _launchSupportWhatsApp(BuildContext context) async {
     final launched =
         await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!launched && context.mounted) {
-      _toast(context, 'تعذّر فتح محادثة واتساب');
+      _toast(context, tr('تعذّر فتح محادثة واتساب', 'Could not open WhatsApp chat'));
     }
   } catch (_) {
-    if (context.mounted) _toast(context, 'تعذّر فتح محادثة واتساب');
+    if (context.mounted) _toast(context, tr('تعذّر فتح محادثة واتساب', 'Could not open WhatsApp chat'));
   }
 }
 
@@ -3456,13 +3636,13 @@ class _LegalDocumentView extends StatelessWidget {
                     borderRadius: BorderRadius.circular(10),
                     border: Border.all(color: C.border),
                   ),
-                  child: const Row(
+                  child: Row(
                     children: [
-                      WhatsAppIcon(size: 20),
-                      SizedBox(width: 10),
+                      const WhatsAppIcon(size: 20),
+                      const SizedBox(width: 10),
                       Text(
-                        'واتساب:',
-                        style: TextStyle(
+                        tr('واتساب:', 'WhatsApp:'),
+                        style: const TextStyle(
                           color: C.muted,
                           fontSize: 13.5,
                           fontWeight: FontWeight.w600,
@@ -3636,13 +3816,96 @@ class PrivacyPolicyScreen extends StatelessWidget {
     ),
   ];
 
+  static const List<_LegalDocSection> _sectionsEn = <_LegalDocSection>[
+    _LegalDocSection(
+      title: '1. Data We Collect',
+      bullets: <String>[
+        'Account Data: Google account ID, email, and name. Saved on your device; your email, join date, and last upload date are stored in the cloud.',
+        'Scripts: When running a script, a copy of the .py file (its name and full content) is uploaded to the cloud.',
+        'Session Data: A session token stays on your device while the server stores only an encrypted hash of it (not the token itself) with your email and ID.',
+        'What We Do Not Collect: Script outputs and logs stay on your device and are never uploaded. We do not use ads, analytics, or tracking tools.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '2. How We Use Your Data',
+      paragraphs: <String>[
+        'To sign you in, store, display, and download your scripts, and operate and protect the service from abuse. We never sell or share your data for marketing.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '3. Cloud Storage',
+      paragraphs: <String>[
+        'Script copies are stored in a private space for your account on Cloudflare and cannot be accessed by other users through the app. The service administrator has technical access for maintenance, complaints, or legal compliance only.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '4. Permissions',
+      bullets: <String>[
+        'Internet: For sign-in, cloud sync, installing libraries, and your scripts connections.',
+        'Files Access: To read and save your scripts.',
+        'Notifications, Foreground Service, Background Execution & Battery Exemption: To keep your scripts running when you leave the app.',
+      ],
+      footer: 'We do not use these permissions for any other purpose.',
+    ),
+    _LegalDocSection(
+      title: '5. Third Parties',
+      bullets: <String>[
+        'Google for Sign-In.',
+        'Cloudflare for hosting and storage.',
+        'PyPI and Chaquopy wheel index for downloading libraries you choose.',
+        'Any external service your script connects to, which is outside our control.',
+      ],
+      footer: 'Each provider has its own privacy policy.',
+    ),
+    _LegalDocSection(
+      title: '6. International Data Transfer',
+      paragraphs: <String>[
+        'Your data may be stored and processed on servers outside Egypt. By signing in and using the app, you explicitly consent to this.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '7. Retention & Deletion',
+      paragraphs: <String>[
+        'We retain your data as long as your account is active. Sessions last 180 days and signing out ends them immediately. You may request account and file deletion via the contact options below, fulfilled within 30 days.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '8. Your Rights',
+      paragraphs: <String>[
+        'Under Egyptian Personal Data Protection Law No. 151 of 2020, you have the right to access, correct, delete your data, and withdraw consent via the contact methods below.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '9. Security',
+      paragraphs: <String>[
+        'The app connects to the cloud over HTTPS and isolates each account files. We take reasonable measures to protect your data, though no system is 100% secure.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '10. Children',
+      paragraphs: <String>[
+        'The app is not directed to individuals under 18, and we do not knowingly collect their data.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '11. Updates',
+      paragraphs: <String>[
+        'We may update this policy; the new version will appear in the app with the update date. Continued use constitutes acceptance.',
+      ],
+    ),
+  ];
+
   @override
-  Widget build(BuildContext context) => const _LegalDocumentView(
-        title: 'سياسة الخصوصية',
-        subtitle: 'تطبيق $kAppName · الإصدار $kAppVersion · آخر تحديث: 15 أكتوبر 2026',
-        intro: 'توضح هذه السياسة ما نجمعه من بيانات، وكيف نستخدمها ونحميها، وما هي حقوقك. استخدامك للتطبيق يعني موافقتك عليها.',
-        sections: _sections,
-        contactTitle: '12. التواصل',
+  Widget build(BuildContext context) => _LegalDocumentView(
+        title: tr('سياسة الخصوصية', 'Privacy Policy'),
+        subtitle: tr(
+            'تطبيق $kAppName · الإصدار $kAppVersion · آخر تحديث: 15 أكتوبر 2026',
+            '$kAppName App · Version $kAppVersion · Last updated: Oct 15, 2026'),
+        intro: tr(
+            'توضح هذه السياسة ما نجمعه من بيانات، وكيف نستخدمها ونحميها، وما هي حقوقك. استخدامك للتطبيق يعني موافقتك عليها.',
+            'This policy explains what data we collect, how we use and protect it, and your rights. Using the app means you agree to it.'),
+        sections: isEn ? _sectionsEn : _sections,
+        contactTitle: tr('12. التواصل', '12. Contact'),
       );
 }
 
@@ -3719,12 +3982,83 @@ class TermsOfUseScreen extends StatelessWidget {
     ),
   ];
 
+  static const List<_LegalDocSection> _sectionsEn = <_LegalDocSection>[
+    _LegalDocSection(
+      title: '1. Acceptance',
+      paragraphs: <String>[
+        'By using or signing into the app, you acknowledge that you have read and agreed to these Terms. If you do not agree, please stop using the app. These Terms are read together with the Privacy Policy.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '2. Account',
+      bullets: <String>[
+        'Sign-in is via Google account only.',
+        'You are responsible for your account, device, and all activity through them.',
+        'You must be 18 years of age or older.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '3. Scripts',
+      paragraphs: <String>[
+        'The app is a tool for running Python scripts that you write or import. You are solely responsible for their content, actions, connections, and compliance with third-party terms. Your scripts belong to you; the app and its branding belong to the developer.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '4. Prohibited Use',
+      paragraphs: <String>[
+        'You may not use the app or cloud for:',
+      ],
+      bullets: <String>[
+        'Hacking or unauthorized access to others devices, accounts, or systems.',
+        'Writing or running malware, ransomware, spyware, or stealing data or passwords.',
+        'Attacking services (DoS, exploitation, aggressive scanning), spam, fraud, or impersonation.',
+        'Violating the terms of services your script connects to, or bypassing DRM/licensing.',
+        'Uploading illegal content or content that infringes others rights.',
+        'Attempting to disrupt the cloud, bypass its limits, or access data other than your own.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '5. Cloud',
+      bullets: <String>[
+        'Allowed: .py files only, up to 1 MB per file and 200 files per account.',
+        'A copy of the script is automatically uploaded when started.',
+        'The cloud is a convenience feature and not a guaranteed backup; limits or availability may change.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '6. Account Termination',
+      paragraphs: <String>[
+        'We reserve the right to restrict, suspend, or delete your account and files without prior notice if you violate these Terms. You may stop using the app and request data deletion at any time.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '7. Disclaimer',
+      paragraphs: <String>[
+        'This is a beta release provided "as is" without warranties. Scripts may stop due to Android battery and background restrictions. We are not liable for data loss, script actions, or damages arising from app usage except as required by law.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '8. Modifications',
+      paragraphs: <String>[
+        'We may modify these Terms; the updated version will appear in the app with its date. Continued use constitutes acceptance.',
+      ],
+    ),
+    _LegalDocSection(
+      title: '9. Governing Law',
+      paragraphs: <String>[
+        'These Terms are governed by the laws of the Arab Republic of Egypt, and its courts have jurisdiction over any dispute.',
+      ],
+    ),
+  ];
+
   @override
-  Widget build(BuildContext context) => const _LegalDocumentView(
-        title: 'شروط الاستخدام',
-        subtitle: 'تطبيق $kAppName · الإصدار $kAppVersion · آخر تحديث: 15 أكتوبر 2026',
-        sections: _sections,
-        contactTitle: '10. التواصل',
+  Widget build(BuildContext context) => _LegalDocumentView(
+        title: tr('شروط الاستخدام', 'Terms of Use'),
+        subtitle: tr(
+            'تطبيق $kAppName · الإصدار $kAppVersion · آخر تحديث: 15 أكتوبر 2026',
+            '$kAppName App · Version $kAppVersion · Last updated: Oct 15, 2026'),
+        sections: isEn ? _sectionsEn : _sections,
+        contactTitle: tr('10. التواصل', '10. Contact'),
       );
 }
 
@@ -3799,7 +4133,7 @@ class AboutAppScreen extends StatelessWidget {
           body: SafeArea(
             child: Column(
               children: [
-                const Header(title: 'حول التطبيق', back: true),
+                Header(title: tr('حول التطبيق', 'About App'), back: true),
                 Expanded(
                   child: ListView(
                     padding: const EdgeInsets.all(16),
@@ -3835,9 +4169,9 @@ class AboutAppScreen extends StatelessWidget {
                                 borderRadius: BorderRadius.circular(20),
                                 border: Border.all(color: C.accent.withValues(alpha: .35)),
                               ),
-                              child: const Text(
-                                'الإصدار $kAppVersion',
-                                style: TextStyle(
+                              child: Text(
+                                tr('الإصدار $kAppVersion', 'Version $kAppVersion'),
+                                style: const TextStyle(
                                   color: C.accent,
                                   fontSize: 13,
                                   fontWeight: FontWeight.w700,
@@ -3848,11 +4182,11 @@ class AboutAppScreen extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(height: 20),
-                      const Padding(
-                        padding: EdgeInsets.symmetric(horizontal: 4),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
                         child: Text(
-                          'التواصل',
-                          style: TextStyle(
+                          tr('التواصل', 'Contact'),
+                          style: const TextStyle(
                             color: C.muted,
                             fontSize: 13,
                             fontWeight: FontWeight.w700,
@@ -3862,7 +4196,7 @@ class AboutAppScreen extends StatelessWidget {
                       const SizedBox(height: 10),
                       _contactRow(
                         leading: const Icon(Icons.email_outlined, color: C.accent, size: 22),
-                        title: 'البريد الإلكتروني',
+                        title: tr('البريد الإلكتروني', 'Email'),
                         value: kSupportEmail,
                         valueColor: C.accent,
                         onTap: () => _launchSupportEmail(context),
@@ -3870,7 +4204,7 @@ class AboutAppScreen extends StatelessWidget {
                       const SizedBox(height: 10),
                       _contactRow(
                         leading: const WhatsAppIcon(size: 22),
-                        title: 'واتساب',
+                        title: tr('واتساب', 'WhatsApp'),
                         value: kSupportPhone,
                         valueColor: const Color(0xFF25D366),
                         onTap: () => _launchSupportWhatsApp(context),
@@ -3929,6 +4263,9 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     try {
       next = await bayanSystem.status();
     } catch (_) {}
+    if (!fallbackMode.value && next.notifications && next.battery) {
+      unawaited(store.setFlag(_welcomeFlag, true));
+    }
     if (!mounted) return;
     setState(() => _sys = next);
   }
@@ -3960,46 +4297,48 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     final how = await bayanSystem.requestBattery();
     if (how == 'list') {
       if (mounted) {
-        _snack('اختر «كل التطبيقات» ثم مشغّل بايثون ثم «عدم التحسين».');
+        _snack(tr('اختر «كل التطبيقات» ثم مشغّل بايثون ثم «عدم التحسين».',
+            'Select "All apps", then Bynux, then "Do not optimize".'));
       }
     } else if (how == 'app') {
       if (mounted) {
-        _snack('افتح «البطارية» من إعدادات التطبيق واختر «بلا قيود».');
+        _snack(tr('افتح «البطارية» من إعدادات التطبيق واختر «بلا قيود».',
+            'Open "Battery" in app settings and select "Unrestricted".'));
       }
     } else if (how == 'failed') {
-      if (mounted) _snack('تعذّر فتح إعدادات البطارية.');
+      if (mounted) _snack(tr('تعذّر فتح إعدادات البطارية.', 'Could not open battery settings.'));
     }
   }
 
   Future<void> _openAutoStart() async {
     final how = await bayanSystem.openAutoStart();
     if (how == 'app') {
-      if (mounted) _snack('فتحنا إعدادات التطبيق بدل صفحة الشركة.');
+      if (mounted) _snack(tr('فتحنا إعدادات التطبيق بدل صفحة الشركة.', 'Opened app settings instead of OEM page.'));
     } else if (how == 'failed') {
-      if (mounted) _snack('تعذّر فتح الإعدادات.');
+      if (mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
     }
   }
 
   Future<void> _openBrandBattery() async {
     final how = await bayanSystem.openBrandBattery();
     if (how == 'app') {
-      if (mounted) _snack('فتحنا إعدادات التطبيق بدل صفحة الشركة.');
+      if (mounted) _snack(tr('فتحنا إعدادات التطبيق بدل صفحة الشركة.', 'Opened app settings instead of OEM page.'));
     } else if (how == 'failed') {
-      if (mounted) _snack('تعذّر فتح الإعدادات.');
+      if (mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
     }
   }
 
   Future<void> _openAppSettings() async {
     final ok = await bayanSystem.openAppSettings();
-    if (!ok && mounted) _snack('تعذّر فتح الإعدادات.');
+    if (!ok && mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
   }
 
   Future<void> _openDeveloper() async {
     final how = await bayanSystem.openDeveloperOptions();
     if (how == 'about') {
-      if (mounted) _snack('فعّل خيارات المطور: اضغط 7 مرات على «رقم الإصدار».');
+      if (mounted) _snack(tr('فعّل خيارات المطور: اضغط 7 مرات على «رقم الإصدار».', 'Enable Developer Options: tap "Build number" 7 times.'));
     } else if (how == 'failed') {
-      if (mounted) _snack('تعذّر فتح الإعدادات.');
+      if (mounted) _snack(tr('تعذّر فتح الإعدادات.', 'Could not open settings.'));
     }
   }
 
@@ -4015,7 +4354,9 @@ class _PermissionsScreenState extends State<PermissionsScreen>
   }) {
     final skipped = _skipped.contains(id) && state != _PermState.granted;
     final Color tone = state == _PermState.granted ? C.ok : C.warn;
-    final String chip = state == _PermState.granted ? 'ممنوح' : 'غير ممنوح';
+    final String chip = state == _PermState.granted
+        ? tr('ممنوح', 'Granted')
+        : tr('غير ممنوح', 'Not granted');
     return Appear(
       index: index,
       child: Container(
@@ -4071,14 +4412,14 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                       const SizedBox(width: 8),
                       TextButton(
                           onPressed: () => setState(() => _skipped.add(id)),
-                          child: const Text('تخطٍّ',
-                              style: TextStyle(color: C.muted))),
+                          child: Text(tr('تخطٍّ', 'Skip'),
+                              style: const TextStyle(color: C.muted))),
                     ],
                     if (skipped)
-                      const Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 8),
-                          child: Text('تم التخطي',
-                              style: TextStyle(fontSize: 12, color: C.dim))),
+                      Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Text(tr('تم التخطي', 'Skipped'),
+                              style: const TextStyle(fontSize: 12, color: C.dim))),
                   ]),
                 ],
               ]),
@@ -4229,12 +4570,20 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     return items;
   }
 
+  Future<void> _finishWelcome() async {
+    final nav = Navigator.of(context);
+    await store.setFlag(_welcomeFlag, true);
+    if (mounted) nav.pop();
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
         body: SafeArea(
           child: Column(children: [
             Header(
-                title: widget.welcome ? 'مرحبًا بك' : 'فحص الصلاحيات',
+                title: widget.welcome
+                    ? tr('مرحبًا بك', 'Welcome')
+                    : tr('فحص الصلاحيات', 'Permissions'),
                 back: !widget.welcome),
             Expanded(
               child: ListenableBuilder(
@@ -4245,66 +4594,70 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                       (_sys.notifications ? 0 : 1) +
                       (_sys.battery ? 0 : 1);
                   var i = 0;
-                  return ListView(
-                    padding: const EdgeInsets.all(16),
-                    children: [
-                      if (widget.welcome) ...[
-                        const Text(
-                            'امنح هذه الصلاحيات لتستمر سكربتاتك في الخلفية.',
-                            style: TextStyle(
-                                fontSize: 14, height: 1.7, color: C.muted)),
-                        const SizedBox(height: 16),
+                  // شاشة ثابتة غير قابلة للتمرير تعرض الصلاحيات الثلاث الأساسية فقط، وزر المتابعة مرفوع تحتها مباشرة
+                  return SingleChildScrollView(
+                    physics: const NeverScrollableScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (widget.welcome) ...[
+                          Text(
+                              tr('امنح هذه الصلاحيات لتستمر سكربتاتك في الخلفية.',
+                                  'Grant these permissions so your scripts keep running in the background.'),
+                              style: const TextStyle(
+                                  fontSize: 14, height: 1.6, color: C.muted)),
+                          const SizedBox(height: 14),
+                        ],
+                        _card(
+                          index: i++,
+                          id: 'files',
+                          icon: Icons.folder_open_outlined,
+                          title: tr('الوصول إلى الملفات', 'Files Access'),
+                          why: tr('لحفظ ملفاتك', 'To save your files'),
+                          state:
+                              filesOk ? _PermState.granted : _PermState.missing,
+                          actionLabel: tr('منح', 'Grant'),
+                          onAction: _grantFiles,
+                        ),
+                        const SizedBox(height: 12),
+                        _card(
+                          index: i++,
+                          id: 'notifications',
+                          icon: Icons.notifications_none,
+                          title: tr('الإشعارات', 'Notifications'),
+                          why: tr('لإظهار ما يعمل في الخلفية',
+                              'To show what is running in the background'),
+                          state: _sys.notifications
+                              ? _PermState.granted
+                              : _PermState.missing,
+                          actionLabel: tr('منح', 'Grant'),
+                          onAction: _grantNotifications,
+                        ),
+                        const SizedBox(height: 12),
+                        _card(
+                          index: i++,
+                          id: 'battery',
+                          icon: Icons.battery_charging_full,
+                          title: tr('استثناء البطارية', 'Battery Exemption'),
+                          why: tr('لتستمر السكربتات مع قفل الشاشة',
+                              'To keep scripts running when screen is locked'),
+                          state: _sys.battery
+                              ? _PermState.granted
+                              : _PermState.missing,
+                          actionLabel: tr('منح', 'Grant'),
+                          onAction: _grantBattery,
+                        ),
+                        if (widget.welcome) ...[
+                          const SizedBox(height: 18),
+                          PButton(
+                              label: missing == 0
+                                  ? tr('متابعة', 'Continue')
+                                  : tr('تخطّي الآن', 'Skip for now'),
+                              onPressed: _finishWelcome),
+                        ],
                       ],
-                      _card(
-                        index: i++,
-                        id: 'files',
-                        icon: Icons.folder_open_outlined,
-                        title: 'الوصول إلى الملفات',
-                        why: 'لحفظ ملفاتك',
-                        state:
-                            filesOk ? _PermState.granted : _PermState.missing,
-                        actionLabel: 'منح',
-                        onAction: _grantFiles,
-                      ),
-                      const SizedBox(height: 12),
-                      _card(
-                        index: i++,
-                        id: 'notifications',
-                        icon: Icons.notifications_none,
-                        title: 'الإشعارات',
-                        why: 'لإظهار ما يعمل في الخلفية',
-                        state: _sys.notifications
-                            ? _PermState.granted
-                            : _PermState.missing,
-                        actionLabel: 'منح',
-                        onAction: _grantNotifications,
-                      ),
-                      const SizedBox(height: 12),
-                      _card(
-                        index: i++,
-                        id: 'battery',
-                        icon: Icons.battery_charging_full,
-                        title: 'استثناء البطارية',
-                        why: 'لتستمر السكربتات مع قفل الشاشة',
-                        state: _sys.battery
-                            ? _PermState.granted
-                            : _PermState.missing,
-                        actionLabel: 'منح',
-                        onAction: _grantBattery,
-                      ),
-                      ..._shortcuts(i),
-                      const SizedBox(height: 16),
-                      const Text(
-                          'قد تُنهي بعض الأجهزة التطبيقات رغم كل الإعدادات.',
-                          style: TextStyle(
-                              fontSize: 12.5, height: 1.7, color: C.dim)),
-                      if (widget.welcome) ...[
-                        const SizedBox(height: 20),
-                        PButton(
-                            label: missing == 0 ? 'متابعة' : 'تخطّي الآن',
-                            onPressed: () => Navigator.pop(context)),
-                      ],
-                    ],
+                    ),
                   );
                 },
               ),
@@ -4392,7 +4745,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
-      _snack('تعذر فتح مدير المكتبات: ${errText(e)}');
+      _snack(tr('تعذر فتح مدير المكتبات: ${errText(e)}', 'Could not open library manager: ${errText(e)}'));
     }
   }
 
@@ -4415,7 +4768,9 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         if (!libInstaller.hasLiveJobs) _syncShown();
       });
     } catch (e) {
-      if (mounted && !silent) _snack('تعذر تحديث حالة المكتبات: ${errText(e)}');
+      if (mounted && !silent) {
+        _snack(tr('تعذر تحديث حالة المكتبات: ${errText(e)}', 'Could not refresh libraries: ${errText(e)}'));
+      }
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
@@ -4431,7 +4786,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
   void _install(String spec) {
     final clean = spec.trim();
     if (clean.isEmpty) {
-      _snack('اكتب اسم المكتبة أولاً');
+      _snack(tr('اكتب اسم المكتبة أولاً', 'Enter the library name first'));
       return;
     }
     libInstaller.enqueue(clean);
@@ -4471,27 +4826,30 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
 
   Future<void> _remove(InstalledPackage package) async {
     if (libInstaller.busy) {
-      _snack('انتظر حتى تنتهي عملية المكتبة الحالية');
+      _snack(tr('انتظر حتى تنتهي عملية المكتبة الحالية', 'Wait until the current library operation finishes'));
       return;
     }
     final orphans = _orphansAfterRemoving(package);
     final needing = package.requiredBy;
+    final sep = isEn ? ', ' : '، ';
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: C.surface,
-        title: const Text('إزالة المكتبة'),
+        title: Text(tr('إزالة المكتبة', 'Remove Library')),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('هل تريد إزالة ${package.name}؟\nلن يتم حذف ملفات سكربتاتك.'),
+            Text(tr('هل تريد إزالة ${package.name}؟\nلن يتم حذف ملفات سكربتاتك.',
+                'Do you want to remove ${package.name}?\nYour script files will not be deleted.')),
             if (orphans.isNotEmpty) ...[
               const SizedBox(height: 12),
-              const Text('ستُزال معها لأنها لا تحتاجها مكتبة أخرى:'),
+              Text(tr('ستُزال معها لأنها لا تحتاجها مكتبة أخرى:',
+                  'Will also be removed as no other library requires them:')),
               const SizedBox(height: 4),
               Text(
-                orphans.map((p) => p.name).join('، '),
+                orphans.map((p) => p.name).join(sep),
                 textDirection: TextDirection.ltr,
                 style: mono.copyWith(fontSize: 13, color: C.muted),
               ),
@@ -4499,18 +4857,19 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
             if (needing.isNotEmpty) ...[
               const SizedBox(height: 12),
               Text(
-                'تنبيه: تحتاجها ${needing.join('، ')}، وقد تتوقف عن العمل بعد إزالتها.',
+                tr('تنبيه: تحتاجها ${needing.join(sep)}، وقد تتوقف عن العمل بعد إزالتها.',
+                    'Warning: Required by ${needing.join(sep)}, which may stop working after removal.'),
                 style: const TextStyle(color: C.warn),
               ),
             ],
           ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(tr('إلغاء', 'Cancel'))),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
             style: TextButton.styleFrom(foregroundColor: C.error),
-            child: const Text('إزالة'),
+            child: Text(tr('إزالة', 'Remove')),
           ),
         ],
       ),
@@ -4522,11 +4881,12 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       if (mounted) {
         setState(_syncShown);
         _snack(orphans.isEmpty
-            ? 'تمت إزالة ${package.name}'
-            : 'تمت إزالة ${package.name} مع ${orphans.length} مكتبة مرافقة');
+            ? tr('تمت إزالة ${package.name}', 'Removed ${package.name}')
+            : tr('تمت إزالة ${package.name} مع ${orphans.length} مكتبة مرافقة',
+                'Removed ${package.name} and ${orphans.length} companion library(s)'));
       }
     } catch (e) {
-      if (mounted) _snack('تعذر إزالة المكتبة: ${errText(e)}');
+      if (mounted) _snack(tr('تعذر إزالة المكتبة: ${errText(e)}', 'Could not remove library: ${errText(e)}'));
     }
   }
 
@@ -4538,7 +4898,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         context: context,
         builder: (ctx) => AlertDialog(
           backgroundColor: C.surface,
-          title: const Text('تنزيل مكتبة غير موجودة'),
+          title: Text(tr('تنزيل مكتبة غير موجودة', 'Download Custom Library')),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -4549,7 +4909,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
                 textDirection: TextDirection.ltr,
                 style: mono.copyWith(fontSize: 15),
                 decoration: InputDecoration(
-                  labelText: 'اسم المكتبة',
+                  labelText: tr('اسم المكتبة', 'Library Name'),
                   hintText: 'requests',
                   border: _ob,
                   enabledBorder: _ob,
@@ -4563,7 +4923,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
                 textDirection: TextDirection.ltr,
                 style: mono.copyWith(fontSize: 15),
                 decoration: InputDecoration(
-                  labelText: 'الإصدار (اختياري)',
+                  labelText: tr('الإصدار (اختياري)', 'Version (optional)'),
                   hintText: '2.32.5',
                   border: _ob,
                   enabledBorder: _ob,
@@ -4573,9 +4933,9 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
             ],
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tr('إلغاء', 'Cancel'))),
             PButton(
-              label: 'تنزيل',
+              label: tr('تنزيل', 'Download'),
               height: 42,
               radius: 10,
               onPressed: () {
@@ -4609,7 +4969,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     final key = pkgKey(lib.name);
     if (job != null && job.state == JobState.queued) {
       return OButton(
-        label: 'إلغاء',
+        label: tr('إلغاء', 'Cancel'),
         accent: false,
         height: 42,
         radius: 10,
@@ -4617,11 +4977,11 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       );
     }
     if (job != null && job.state == JobState.running) {
-      return const Text('جارٍ التثبيت', style: TextStyle(fontSize: 12, color: C.muted));
+      return Text(tr('جارٍ التثبيت', 'Installing'), style: const TextStyle(fontSize: 12, color: C.muted));
     }
     if (job != null && job.state == JobState.failed) {
       return OButton(
-        label: 'إعادة المحاولة',
+        label: tr('إعادة المحاولة', 'Retry'),
         height: 42,
         radius: 10,
         fontSize: 12.5,
@@ -4634,10 +4994,10 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         return const Icon(Icons.check_circle_rounded, color: C.ok, size: 22);
       }
       if (cat != null && !cat.compatible) {
-        return const Text('غير متوافقة', style: TextStyle(fontSize: 12, color: C.dim));
+        return Text(tr('غير متوافقة', 'Incompatible'), style: const TextStyle(fontSize: 12, color: C.dim));
       }
       return OButton(
-        label: 'تثبيت',
+        label: tr('تثبيت', 'Install'),
         height: 42,
         radius: 10,
         fontSize: 14,
@@ -4647,7 +5007,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     final latest = cat?.latestVersion;
     if (cat?.updateAvailable == true && latest != null) {
       return PButton(
-        label: 'تحديث',
+        label: tr('تحديث', 'Update'),
         height: 42,
         radius: 10,
         fontSize: 14,
@@ -4677,7 +5037,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
               borderRadius: BorderRadius.circular(10),
             ),
             child: Text(
-              'إزالة',
+              tr('إزالة', 'Remove'),
               style: TextStyle(
                   fontSize: 13, fontWeight: FontWeight.w600, color: color),
             ),
@@ -4691,17 +5051,18 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
   String _versionLine(InstalledPackage p, CatalogPackage? cat) {
     final latest = cat?.latestVersion;
     final update = cat?.updateAvailable == true && latest != null;
-    return 'الإصدار ${p.version}${update ? '  ←  $latest' : ''}';
+    return tr('الإصدار ${p.version}${update ? '  ←  $latest' : ''}',
+        'Version ${p.version}${update ? '  →  $latest' : ''}');
   }
 
   Widget _installedZone(InstalledPackage p) {
     return Row(children: [
-      const Expanded(
+      Expanded(
         child: Row(children: [
-          Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
-          SizedBox(width: 6),
-          Text('تم تثبيت المكتبة بنجاح',
-              style: TextStyle(fontSize: 12, color: C.ok)),
+          const Icon(Icons.check_circle_rounded, color: C.ok, size: 16),
+          const SizedBox(width: 6),
+          Text(tr('تم تثبيت المكتبة بنجاح', 'Library installed successfully'),
+              style: const TextStyle(fontSize: 12, color: C.ok)),
         ]),
       ),
       const SizedBox(width: 8),
@@ -4711,11 +5072,13 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
 
   // مكتبة من الكتالوج موجودة لكنها جاءت تلقائيًا مع مكتبة أخرى (لم يطلبها المستخدم)
   Widget _companionZone(InstalledPackage p) {
-    final by = p.requiredBy.join('، ');
+    final by = p.requiredBy.join(isEn ? ', ' : '، ');
     return Align(
       alignment: AlignmentDirectional.centerStart,
       child: Text(
-        by.isEmpty ? 'مثبتة تلقائيًا كمكتبة مرافقة' : 'مثبتة تلقائيًا لأن $by تحتاجها',
+        by.isEmpty
+            ? tr('مثبتة تلقائيًا كمكتبة مرافقة', 'Auto-installed as companion library')
+            : tr('مثبتة تلقائيًا لأن $by تحتاجها', 'Auto-installed because $by requires it'),
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(fontSize: 11, color: C.dim),
       ),
@@ -4727,7 +5090,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
     if (latest == null) return const SizedBox.shrink();
     return Align(
       alignment: AlignmentDirectional.centerStart,
-      child: Text('أحدث نسخة: $latest',
+      child: Text(tr('أحدث نسخة: $latest', 'Latest version: $latest'),
           textDirection: TextDirection.ltr,
           style: const TextStyle(fontSize: 11, color: C.dim)),
     );
@@ -4851,7 +5214,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
             ),
           ]),
           if (by.isNotEmpty)
-            Text('تحتاجها: $by',
+            Text(tr('تحتاجها: $by', 'Required by: $by'),
                 style: const TextStyle(fontSize: 11, color: C.dim)),
         ],
       ),
@@ -4874,7 +5237,7 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
                 const Icon(Icons.link_rounded, color: C.muted, size: 18),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Text('مكتبات مرافقة (${items.length})',
+                  child: Text(tr('مكتبات مرافقة (${items.length})', 'Companion libraries (${items.length})'),
                       style: const TextStyle(fontSize: 13, color: C.muted)),
                 ),
                 Icon(
@@ -4917,26 +5280,26 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
       padding: const EdgeInsets.all(16),
       children: [
         if (customInstalled.isNotEmpty || shownCatalog.isNotEmpty) ...[
-          const Text('المثبتة', style: TextStyle(color: C.muted, fontSize: 13)),
+          Text(tr('المثبتة', 'Installed'), style: const TextStyle(color: C.muted, fontSize: 13)),
           const SizedBox(height: 10),
           for (final p in customInstalled)
-            _tile(Lib(p.name, 'مكتبة أضفتها بنفسك', p.name.replaceAll('-', '_')), i++),
+            _tile(Lib(p.name, 'مكتبة أضفتها بنفسك', p.name.replaceAll('-', '_'), 'Custom installed library'), i++),
           for (final lib in shownCatalog) _tile(lib, i++),
           const SizedBox(height: 10),
         ],
-        const Text('المكتبات الأساسية', style: TextStyle(color: C.muted, fontSize: 13)),
+        Text(tr('المكتبات الأساسية', 'Core Libraries'), style: const TextStyle(color: C.muted, fontSize: 13)),
         const SizedBox(height: 10),
         for (final lib in restCatalog) _tile(lib, i++),
         if (customJobs.isNotEmpty) ...[
           const SizedBox(height: 4),
-          const Text('قيد التثبيت', style: TextStyle(color: C.muted, fontSize: 13)),
+          Text(tr('قيد التثبيت', 'Installing'), style: const TextStyle(color: C.muted, fontSize: 13)),
           const SizedBox(height: 10),
           for (final j in customJobs)
-            _tile(Lib(j.name, 'مكتبة أضفتها بنفسك', j.name.replaceAll('-', '_')), i++),
+            _tile(Lib(j.name, 'مكتبة أضفتها بنفسك', j.name.replaceAll('-', '_'), 'Custom installed library'), i++),
         ],
         const SizedBox(height: 14),
         OButton(
-          label: '+ تنزيل مكتبة غير موجودة',
+          label: tr('+ تنزيل مكتبة غير موجودة', '+ Download custom library'),
           icon: Icons.download_rounded,
           height: 50,
           radius: 12,
@@ -4950,7 +5313,8 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
         if (_packages.isNotEmpty)
           Center(
             child: Text(
-              'مساحة المكتبات: ${formatBytes(_packages.values.fold<int>(0, (sum, p) => sum + p.size))}',
+              tr('مساحة المكتبات: ${formatBytes(_packages.values.fold<int>(0, (sum, p) => sum + p.size))}',
+                  'Libraries size: ${formatBytes(_packages.values.fold<int>(0, (sum, p) => sum + p.size))}'),
               style: const TextStyle(fontSize: 12, color: C.dim),
             ),
           ),
@@ -4965,13 +5329,13 @@ class _LibrariesScreenState extends State<LibrariesScreen> {
             child: Column(
               children: [
                 Header(
-                  title: 'المكتبات',
+                  title: tr('المكتبات', 'Libraries'),
                   back: true,
                   actions: [
                     PressFx(
                       scale: .88,
                       child: IconButton(
-                        tooltip: 'تحديث',
+                        tooltip: tr('تحديث', 'Refresh'),
                         color: C.text,
                         onPressed: (_refreshing || installer.busy) ? null : () => _refresh(),
                         icon: _refreshing
@@ -5031,7 +5395,7 @@ class _CreateScreenState extends State<CreateScreen> {
     } on FormatException catch (e) {
       if (mounted) _snack(e.message);
     } catch (_) {
-      if (mounted) _snack('تعذّر قراءة الملف');
+      if (mounted) _snack(tr('تعذّر قراءة الملف', 'Could not read file'));
     }
   }
 
@@ -5039,12 +5403,12 @@ class _CreateScreenState extends State<CreateScreen> {
     if (_busy) return;
     final n = _name.text.trim();
     if (n.isEmpty) {
-      _snack('اكتب اسم السكربت أولاً');
+      _snack(tr('اكتب اسم السكربت أولاً', 'Enter script name first'));
       return;
     }
     final picked = _picked;
     if (!_pasteMode && picked == null) {
-      _snack('اختر ملف بايثون أولاً');
+      _snack(tr('اختر ملف بايثون أولاً', 'Pick a Python file first'));
       return;
     }
     setState(() => _busy = true);
@@ -5062,7 +5426,8 @@ class _CreateScreenState extends State<CreateScreen> {
       if (s.name.toLowerCase() != '${cleanBase(n)}.py'.toLowerCase()) {
         messenger.clearSnackBars();
         messenger.showSnackBar(SnackBar(
-            content: Text('الاسم موجود مسبقاً، تم الحفظ باسم ${s.name}')));
+            content: Text(tr('الاسم موجود مسبقاً، تم الحفظ باسم ${s.name}',
+                'Name already exists, saved as ${s.name}'))));
       }
     } on FormatException catch (e) {
       if (!mounted) return;
@@ -5071,7 +5436,7 @@ class _CreateScreenState extends State<CreateScreen> {
     } catch (_) {
       if (!mounted) return;
       setState(() => _busy = false);
-      _snack('تعذّر إنشاء الملف');
+      _snack(tr('تعذّر إنشاء الملف', 'Could not create file'));
     }
   }
 
@@ -5099,15 +5464,15 @@ class _CreateScreenState extends State<CreateScreen> {
   Widget build(BuildContext context) => Scaffold(
         body: SafeArea(
           child: Column(children: [
-            const Header(title: 'سكربت جديد', back: true),
+            Header(title: tr('سكربت جديد', 'New Script'), back: true),
             Expanded(
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      const Text('اسم السكربت',
-                          style: TextStyle(fontSize: 13, color: C.muted)),
+                      Text(tr('اسم السكربت', 'Script Name'),
+                          style: const TextStyle(fontSize: 13, color: C.muted)),
                       const SizedBox(height: 8),
                       SizedBox(
                         height: 48,
@@ -5118,7 +5483,7 @@ class _CreateScreenState extends State<CreateScreen> {
                           style: mono.copyWith(fontSize: 15),
                           cursorColor: C.accent,
                           decoration: InputDecoration(
-                            hintText: 'مثال: bot.py',
+                            hintText: tr('مثال: bot.py', 'Example: bot.py'),
                             hintStyle: const TextStyle(color: C.dim),
                             filled: true,
                             fillColor: C.surface,
@@ -5135,10 +5500,10 @@ class _CreateScreenState extends State<CreateScreen> {
                         padding: const EdgeInsets.all(4),
                         decoration: _box(C.surface),
                         child: Row(children: [
-                          _seg('لصق النص', _pasteMode,
+                          _seg(tr('لصق النص', 'Paste Code'), _pasteMode,
                               () => setState(() => _pasteMode = true)),
                           const SizedBox(width: 4),
-                          _seg('اختيار ملف', !_pasteMode,
+                          _seg(tr('اختيار ملف', 'Pick File'), !_pasteMode,
                               () => setState(() => _pasteMode = false)),
                         ]),
                       ),
@@ -5154,7 +5519,7 @@ class _CreateScreenState extends State<CreateScreen> {
                         ),
                       ),
                       const SizedBox(height: 16),
-                      PButton(label: 'إنشاء', onPressed: _busy ? null : _create),
+                      PButton(label: tr('إنشاء', 'Create'), onPressed: _busy ? null : _create),
                     ]),
               ),
             ),
@@ -5176,7 +5541,7 @@ class _CreateScreenState extends State<CreateScreen> {
         autocorrect: false,
         enableSuggestions: false,
         decoration: InputDecoration(
-          hintText: 'الصق الكود هنا',
+          hintText: tr('الصق الكود هنا', 'Paste code here'),
           hintStyle: const TextStyle(color: C.dim),
           filled: true,
           fillColor: C.surface,
@@ -5197,8 +5562,8 @@ class _CreateScreenState extends State<CreateScreen> {
               color: p == null ? C.muted : C.accent, size: 40),
           const SizedBox(height: 12),
           if (p == null)
-            const Text('اختر ملف بايثون من جهازك',
-                style: TextStyle(color: C.muted))
+            Text(tr('اختر ملف بايثون من جهازك', 'Choose a Python file from your device'),
+                style: const TextStyle(color: C.muted))
           else
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -5209,7 +5574,7 @@ class _CreateScreenState extends State<CreateScreen> {
             ),
           const SizedBox(height: 16),
           OButton(
-            label: p == null ? 'اختيار ملف' : 'تغيير الملف',
+            label: p == null ? tr('اختيار ملف', 'Pick File') : tr('تغيير الملف', 'Change File'),
             height: 44,
             minWidth: 140,
             onPressed: _pick,
@@ -5539,7 +5904,7 @@ class _ScriptScreenState extends State<ScriptScreen>
       final m = ScaffoldMessenger.of(context);
       Navigator.pop(context);
       m.showSnackBar(
-          const SnackBar(content: Text('تعذّر فتح الملف، ربما حُذف أو نُقل')));
+          SnackBar(content: Text(tr('تعذّر فتح الملف، ربما حُذف أو نُقل', 'Could not open file, it may have been deleted or moved'))));
       store.refresh();
     }
   }
@@ -5573,7 +5938,7 @@ class _ScriptScreenState extends State<ScriptScreen>
       if (mounted && !_warned) {
         _warned = true;
         ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('تعذّر حفظ التعديلات في الملف')));
+            SnackBar(content: Text(tr('تعذّر حفظ التعديلات في الملف', 'Could not save changes to file'))));
       }
     }
   }
@@ -5900,9 +6265,9 @@ class _ScriptScreenState extends State<ScriptScreen>
             enableSuggestions: false,
             cursorColor: C.accent,
             style: const TextStyle(fontSize: 15),
-            decoration: const InputDecoration.collapsed(
-              hintText: 'ابحث في السكربت',
-              hintStyle: TextStyle(color: C.dim),
+            decoration: InputDecoration.collapsed(
+              hintText: tr('ابحث في السكربت', 'Search in script'),
+              hintStyle: const TextStyle(color: C.dim),
             ),
           ),
         ),
@@ -5917,11 +6282,11 @@ class _ScriptScreenState extends State<ScriptScreen>
                 color: hasQuery && total == 0 ? C.error : C.muted),
           ),
         ),
-        _historyBtn(Icons.keyboard_arrow_up_rounded, 'السابق', enabled,
+        _historyBtn(Icons.keyboard_arrow_up_rounded, tr('السابق', 'Previous'), enabled,
             () => _stepHit(-1)),
-        _historyBtn(Icons.keyboard_arrow_down_rounded, 'التالي', enabled,
+        _historyBtn(Icons.keyboard_arrow_down_rounded, tr('التالي', 'Next'), enabled,
             () => _stepHit(1)),
-        _historyBtn(Icons.close_rounded, 'إغلاق البحث', true, _closeSearch),
+        _historyBtn(Icons.close_rounded, tr('إغلاق البحث', 'Close search'), true, _closeSearch),
       ]),
     );
   }
@@ -5939,7 +6304,7 @@ class _ScriptScreenState extends State<ScriptScreen>
                 PressFx(
                   scale: .88,
                   child: IconButton(
-                    tooltip: 'بحث',
+                    tooltip: tr('بحث', 'Search'),
                     color: _searching ? C.accent : C.text,
                     onPressed: _loading ? null : _toggleSearch,
                     icon: const Icon(Icons.search_rounded),
@@ -5948,8 +6313,8 @@ class _ScriptScreenState extends State<ScriptScreen>
                 ValueListenableBuilder<UndoHistoryValue>(
                   valueListenable: _undo,
                   builder: (_, v, __) => Row(mainAxisSize: MainAxisSize.min, children: [
-                    _historyBtn(Icons.redo, 'إعادة', v.canRedo, _undo.redo),
-                    _historyBtn(Icons.undo, 'تراجع', v.canUndo, _undo.undo),
+                    _historyBtn(Icons.redo, tr('إعادة', 'Redo'), v.canRedo, _undo.redo),
+                    _historyBtn(Icons.undo, tr('تراجع', 'Undo'), v.canUndo, _undo.undo),
                   ]),
                 ),
               ],
@@ -5966,7 +6331,7 @@ class _ScriptScreenState extends State<ScriptScreen>
               child: Row(children: [
                 Expanded(
                     child: PButton(
-                        label: _canEnter ? 'دخول' : 'تشغيل',
+                        label: tr(_canEnter ? 'دخول' : 'تشغيل', _canEnter ? 'Enter' : 'Run'),
                         icon: _canEnter
                             ? Icons.login_rounded
                             : Icons.play_arrow_rounded,
@@ -6167,6 +6532,11 @@ String _logDuration(int startMs, int endMs) {
   final hours = total ~/ 3600;
   final minutes = (total % 3600) ~/ 60;
   final seconds = total % 60;
+  if (isEn) {
+    if (hours > 0) return '${hours}h ${minutes}m ${seconds}s';
+    if (minutes > 0) return '${minutes}m ${seconds}s';
+    return '${seconds}s';
+  }
   if (hours > 0) return '${hours}س ${minutes}د ${seconds}ث';
   if (minutes > 0) return '${minutes}د ${seconds}ث';
   return '${seconds}ث';
@@ -6208,8 +6578,9 @@ class _LogScreenState extends State<LogScreen> {
     super.dispose();
   }
 
-  String get _sizeLabel =>
-      '${(_sizeBytes / (1024 * 1024)).toStringAsFixed(1)} من 20 MB';
+  String get _sizeLabel => isEn
+      ? '${(_sizeBytes / (1024 * 1024)).toStringAsFixed(1)} of 20 MB'
+      : '${(_sizeBytes / (1024 * 1024)).toStringAsFixed(1)} من 20 MB';
 
   void _onScroll() {
     if (!_readyToPaginate || !_scroll.hasClients || _loading || _loadingOlder || !_hasMore) return;
@@ -6247,7 +6618,7 @@ class _LogScreenState extends State<LogScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
-      _snack('تعذّر قراءة سجل الإخراج: ${errText(e)}');
+      _snack(tr('تعذّر قراءة سجل الإخراج: ${errText(e)}', 'Could not read output log: ${errText(e)}'));
     }
   }
 
@@ -6267,7 +6638,7 @@ class _LogScreenState extends State<LogScreen> {
       if (page.stale) {
         setState(() => _loadingOlder = false);
         await _loadLatest();
-        _snack('تغيّر السجل؛ تم تحديثه من أحدث البيانات');
+        _snack(tr('تغيّر السجل؛ تم تحديثه من أحدث البيانات', 'Log changed; refreshed with latest data'));
         return;
       }
       final older = _StoredLogRecord.parsePage(page.text);
@@ -6289,7 +6660,7 @@ class _LogScreenState extends State<LogScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _loadingOlder = false);
-      _snack('تعذّر تحميل السجل الأقدم: ${errText(e)}');
+      _snack(tr('تعذّر تحميل السجل الأقدم: ${errText(e)}', 'Could not load older log: ${errText(e)}'));
     }
   }
 
@@ -6300,13 +6671,14 @@ class _LogScreenState extends State<LogScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: C.surface,
-        title: const Text('مسح السجل'),
+        title: Text(tr('مسح السجل', 'Clear Log')),
         content: Text(
-          'سيُمسح سجل الإخراج الدائم (${_sizeLabel}). لا يمكن التراجع عن هذا المسح.',
+          tr('سيُمسح سجل الإخراج الدائم (${_sizeLabel}). لا يمكن التراجع عن هذا المسح.',
+              'The persistent output log (${_sizeLabel}) will be cleared. This cannot be undone.'),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('مسح السجل')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(tr('إلغاء', 'Cancel'))),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: Text(tr('مسح السجل', 'Clear Log'))),
         ],
       ),
     );
@@ -6314,10 +6686,10 @@ class _LogScreenState extends State<LogScreen> {
     try {
       final ok = await bayanPython.logsClear(widget.script.path);
       if (!mounted) return;
-      if (!ok) _snack('تعذّر مسح السجل');
+      if (!ok) _snack(tr('تعذّر مسح السجل', 'Could not clear log'));
       await _loadLatest();
     } catch (e) {
-      if (mounted) _snack('تعذّر مسح السجل: ${errText(e)}');
+      if (mounted) _snack(tr('تعذّر مسح السجل: ${errText(e)}', 'Could not clear log: ${errText(e)}'));
     }
   }
 
@@ -6349,20 +6721,25 @@ class _LogScreenState extends State<LogScreen> {
         if (end != null) {
           endMs = end.timeMs;
           final code = end.code ?? -1;
-          status = code == 0 ? 'انتهى' : code == 130 ? 'موقوف' : 'خطأ';
+          status = code == 0
+              ? tr('انتهى', 'Finished')
+              : code == 130
+                  ? tr('موقوف', 'Stopped')
+                  : tr('خطأ', 'Error');
           color = code == 0 ? C.ok : code == 130 ? C.warn : C.error;
-          codeText = 'رمز الخروج: $code';
+          codeText = tr('رمز الخروج: $code', 'Exit code: $code');
         } else {
           final active = runHub.infoFor(widget.script.path);
           final live = active != null && active.runId == r.runId && active.isLive;
           endMs = live ? DateTime.now().millisecondsSinceEpoch : r.timeMs;
-          status = live ? 'جاري' : 'خطأ (لا يوجد سطر نهاية)';
+          status = live ? tr('جاري', 'Running') : tr('خطأ (لا يوجد سطر نهاية)', 'Error (no end line)');
           color = live ? C.ok : C.error;
-          codeText = live ? 'قيد التشغيل' : 'نهاية غير محفوظة';
+          codeText = live ? tr('قيد التشغيل', 'Running') : tr('نهاية غير محفوظة', 'Unsaved end');
         }
         output.add(_LogDisplayItem.header(
-          'تشغيل · ${_logDate(r.timeMs)}',
-          'المدة: ${_logDuration(r.timeMs, endMs)} · الحالة: $status · $codeText',
+          tr('تشغيل · ${_logDate(r.timeMs)}', 'Run · ${_logDate(r.timeMs)}'),
+          tr('المدة: ${_logDuration(r.timeMs, endMs)} · الحالة: $status · $codeText',
+              'Duration: ${_logDuration(r.timeMs, endMs)} · Status: $status · $codeText'),
           color,
         ));
         i++;
@@ -6371,11 +6748,16 @@ class _LogScreenState extends State<LogScreen> {
       if (r.type == 'end') {
         if (!starts.containsKey(r.runId)) {
           final code = r.code ?? -1;
-          final status = code == 0 ? 'انتهى' : code == 130 ? 'موقوف' : 'خطأ';
+          final status = code == 0
+              ? tr('انتهى', 'Finished')
+              : code == 130
+                  ? tr('موقوف', 'Stopped')
+                  : tr('خطأ', 'Error');
           final color = code == 0 ? C.ok : code == 130 ? C.warn : C.error;
           output.add(_LogDisplayItem.header(
-            'تشغيل · البداية غير متوفرة',
-            '${_logDate(r.timeMs)} · الحالة: $status · رمز الخروج: $code',
+            tr('تشغيل · البداية غير متوفرة', 'Run · Start unavailable'),
+            tr('${_logDate(r.timeMs)} · الحالة: $status · رمز الخروج: $code',
+                '${_logDate(r.timeMs)} · Status: $status · Exit code: $code'),
             color,
           ));
         }
@@ -6412,7 +6794,8 @@ class _LogScreenState extends State<LogScreen> {
     for (final r in records) {
       switch (r.type) {
         case 'start':
-          out.write('\n──────── تشغيل · ${_logDate(r.timeMs)} ────────\n');
+          out.write(tr('\n──────── تشغيل · ${_logDate(r.timeMs)} ────────\n',
+              '\n──────── Run · ${_logDate(r.timeMs)} ────────\n'));
           break;
         case 'event':
           if (r.kind == 's' || r.kind == 'i') {
@@ -6422,13 +6805,19 @@ class _LogScreenState extends State<LogScreen> {
           }
           break;
         case 'end':
-          if (!starts.containsKey(r.runId)) out.write('\n[رمز الخروج: ${r.code ?? -1}]\n');
+          if (!starts.containsKey(r.runId)) {
+            out.write(tr('\n[رمز الخروج: ${r.code ?? -1}]\n', '\n[Exit code: ${r.code ?? -1}]\n'));
+          }
           final start = starts[r.runId];
           if (start != null) {
             // يطبع سطر الحالة مرة واحدة هنا، مع إبقاء سطر البداية مستقلًا.
             final code = r.code ?? -1;
-            final state = code == 0 ? 'انتهى' : code == 130 ? 'موقوف' : 'خطأ';
-            out.write('\n[$state · رمز الخروج: $code]\n');
+            final state = code == 0
+                ? tr('انتهى', 'Finished')
+                : code == 130
+                    ? tr('موقوف', 'Stopped')
+                    : tr('خطأ', 'Error');
+            out.write(tr('\n[$state · رمز الخروج: $code]\n', '\n[$state · Exit code: $code]\n'));
           }
           break;
       }
@@ -6470,7 +6859,7 @@ class _LogScreenState extends State<LogScreen> {
       if (!mounted) return;
       var text = _copyText(fetched);
       if (text.isEmpty) {
-        _snack('لا يوجد سجل للنسخ');
+        _snack(tr('لا يوجد سجل للنسخ', 'No log to copy'));
         return;
       }
       var truncated = false;
@@ -6486,11 +6875,12 @@ class _LogScreenState extends State<LogScreen> {
       await Clipboard.setData(ClipboardData(text: text));
       if (mounted) {
         _snack(truncated
-            ? 'نُسخ آخر 400 ألف حرف تقريبًا لتجنب حد حافظة أندرويد'
-            : 'تم نسخ السجل');
+            ? tr('نُسخ آخر 400 ألف حرف تقريبًا لتجنب حد حافظة أندرويد',
+                'Copied approximately the last 400,000 characters to avoid Android clipboard limit')
+            : tr('تم نسخ السجل', 'Log copied'));
       }
     } catch (e) {
-      if (mounted) _snack('تعذّر نسخ السجل: ${errText(e)}');
+      if (mounted) _snack(tr('تعذّر نسخ السجل: ${errText(e)}', 'Could not copy log: ${errText(e)}'));
     }
   }
 
@@ -6515,7 +6905,7 @@ class _LogScreenState extends State<LogScreen> {
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                     child: Text(
-                      'حجم السجل: $_sizeLabel',
+                      tr('حجم السجل: $_sizeLabel', 'Log size: $_sizeLabel'),
                       textAlign: TextAlign.right,
                       style: const TextStyle(color: C.muted, fontSize: 12),
                     ),
@@ -6526,21 +6916,21 @@ class _LogScreenState extends State<LogScreen> {
                         child: TextButton.icon(
                           onPressed: _loading ? null : _copyLog,
                           icon: const Icon(Icons.content_copy_outlined, size: 17),
-                          label: const Text('نسخ', maxLines: 1),
+                          label: Text(tr('نسخ', 'Copy'), maxLines: 1),
                         ),
                       ),
                       Expanded(
                         child: TextButton.icon(
                           onPressed: _loading ? null : _clearLog,
                           icon: const Icon(Icons.delete_sweep_outlined, size: 17),
-                          label: const Text('مسح السجل', maxLines: 1),
+                          label: Text(tr('مسح السجل', 'Clear Log'), maxLines: 1),
                         ),
                       ),
                       Expanded(
                         child: TextButton.icon(
                           onPressed: _loading ? null : _refresh,
                           icon: const Icon(Icons.refresh_rounded, size: 17),
-                          label: const Text('تحديث', maxLines: 1),
+                          label: Text(tr('تحديث', 'Refresh'), maxLines: 1),
                         ),
                       ),
                     ],
@@ -6553,8 +6943,8 @@ class _LogScreenState extends State<LogScreen> {
               child: _loading
                   ? const Center(child: CircularProgressIndicator(color: C.accent))
                   : _records.isEmpty
-                      ? const Center(
-                          child: Text('ما في سجل بعد', style: TextStyle(color: C.muted)),
+                      ? Center(
+                          child: Text(tr('ما في سجل بعد', 'No logs yet'), style: const TextStyle(color: C.muted)),
                         )
                       : SelectionArea(
                           contextMenuBuilder: arSelectionContextMenu,
@@ -6689,7 +7079,7 @@ class _OutputScreenState extends State<OutputScreen> {
         if (e.type == 'input' && e.text.isNotEmpty) _add(e.text, 2);
         break;
       case 'truncated':
-        _add('… الأقدم غير متوفر في الذاكرة', 1);
+        _add(tr('… الأقدم غير متوفر في الذاكرة', '… Older output is not in memory'), 1);
         break;
       case 'stdout':
         _appendOutput(e.text, 0);
@@ -6702,7 +7092,7 @@ class _OutputScreenState extends State<OutputScreen> {
         break;
       case 'exit':
         // لا نكتب «انتهى بكود N» في الإخراج: النقطة الملوّنة بجانب اسم السكربت تكفي.
-        if (e.exitCode == 130 && !_stopRequested) _add('[تم إيقاف التشغيل]', 1);
+        if (e.exitCode == 130 && !_stopRequested) _add(tr('[تم إيقاف التشغيل]', '[Execution stopped]'), 1);
         _stopRequested = false;
         setState(() {});
         break;
@@ -6754,7 +7144,7 @@ class _OutputScreenState extends State<OutputScreen> {
           .then<void>((_) {}, onError: (Object _) {}));
       await _runner.start();
     } catch (e) {
-      if (mounted) _add('تعذر بدء Python: ${errText(e)}', 3);
+      if (mounted) _add(tr('تعذر بدء Python: ${errText(e)}', 'Could not start Python: ${errText(e)}'), 3);
     } finally {
       _starting = false;
       if (mounted) setState(() {});
@@ -6774,7 +7164,8 @@ class _OutputScreenState extends State<OutputScreen> {
     final found = await _runner.attach(runId);
     if (!mounted) return;
     if (!found) {
-      _add('انتهت هذه الجلسة وحُذف إخراجها. اضغط "إعادة تشغيل" لتشغيله من جديد.', 1);
+      _add(tr('انتهت هذه الجلسة وحُذف إخراجها. اضغط "إعادة تشغيل" لتشغيله من جديد.',
+          'This session ended and its output was cleared. Tap "Restart" to run it again.'), 1);
     }
     setState(() {});
     _scrollToEnd();
@@ -6789,7 +7180,7 @@ class _OutputScreenState extends State<OutputScreen> {
       await _runner.sendInput(text);
       if (mounted) setState(() {});
     } catch (e) {
-      _add('تعذر إرسال الإدخال: ${errText(e)}', 3);
+      _add(tr('تعذر إرسال الإدخال: ${errText(e)}', 'Could not send input: ${errText(e)}'), 3);
     }
   }
 
@@ -6799,7 +7190,7 @@ class _OutputScreenState extends State<OutputScreen> {
     try {
       await _runner.stop();
     } catch (e) {
-      if (mounted) _add('تعذر إيقاف التشغيل: ${errText(e)}', 3);
+      if (mounted) _add(tr('تعذر إيقاف التشغيل: ${errText(e)}', 'Could not stop execution: ${errText(e)}'), 3);
     }
   }
 
@@ -6926,7 +7317,7 @@ class _OutputScreenState extends State<OutputScreen> {
     final target = await store.scriptAtRelative(frame.relative);
     if (!mounted) return;
     if (target == null) {
-      _snack('الملف غير موجود');
+      _snack(tr('الملف غير موجود', 'File not found'));
       return;
     }
     final nav = Navigator.of(context);
@@ -6983,11 +7374,11 @@ class _OutputScreenState extends State<OutputScreen> {
 
   void _copyOutput() {
     if (_lines.isEmpty) {
-      _snack('لا يوجد إخراج للنسخ');
+      _snack(tr('لا يوجد إخراج للنسخ', 'No output to copy'));
       return;
     }
     Clipboard.setData(ClipboardData(text: _rawOutput.toString()));
-    _snack('تم نسخ الإخراج');
+    _snack(tr('تم نسخ الإخراج', 'Output copied'));
   }
 
   void _clearOutput() => setState(() {
@@ -7029,7 +7420,7 @@ class _OutputScreenState extends State<OutputScreen> {
           children: [
             Expanded(
               child: PButton(
-                label: 'إعادة تشغيل',
+                label: tr('إعادة تشغيل', 'Restart'),
                 icon: Icons.replay_rounded,
                 onPressed: _restart,
               ),
@@ -7038,7 +7429,7 @@ class _OutputScreenState extends State<OutputScreen> {
             SizedBox(
               width: 120,
               child: OButton(
-                label: 'إيقاف',
+                label: tr('إيقاف', 'Stop'),
                 icon: Icons.stop_rounded,
                 accent: false,
                 height: 52,
@@ -7064,13 +7455,14 @@ class _OutputScreenState extends State<OutputScreen> {
             decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C.border))),
             child: Row(
               children: [
-                const Expanded(
-                  child: Text('الإخراج · تشغيل Python', style: TextStyle(fontSize: 12, color: C.muted)),
+                Expanded(
+                  child: Text(tr('الإخراج · تشغيل Python', 'Output · Python Runner'),
+                      style: const TextStyle(fontSize: 12, color: C.muted)),
                 ),
                 PressFx(
                   scale: .88,
                   child: IconButton(
-                    tooltip: 'نسخ',
+                    tooltip: tr('نسخ', 'Copy'),
                     iconSize: 20,
                     color: C.muted,
                     visualDensity: VisualDensity.compact,
@@ -7081,7 +7473,7 @@ class _OutputScreenState extends State<OutputScreen> {
                 PressFx(
                   scale: .88,
                   child: IconButton(
-                    tooltip: 'مسح الشاشة',
+                    tooltip: tr('مسح الشاشة', 'Clear Screen'),
                     iconSize: 22,
                     color: C.muted,
                     visualDensity: VisualDensity.compact,
@@ -7096,7 +7488,9 @@ class _OutputScreenState extends State<OutputScreen> {
             child: _lines.isEmpty && _missing.isEmpty
                 ? Center(
                     child: Text(
-                      _runner.isRunning ? 'جاري تشغيل Python…' : 'اضغط "إعادة تشغيل" ليظهر الإخراج هنا',
+                      _runner.isRunning
+                          ? tr('جاري تشغيل Python…', 'Running Python…')
+                          : tr('اضغط "إعادة تشغيل" ليظهر الإخراج هنا', 'Tap "Restart" to show output here'),
                       style: const TextStyle(fontSize: 13, color: C.dim),
                     ),
                   )
@@ -7148,7 +7542,9 @@ class _OutputScreenState extends State<OutputScreen> {
                       style: const TextStyle(fontSize: 14),
                       cursorColor: C.accent,
                       decoration: InputDecoration(
-                        hintText: waiting ? 'اكتب هنا ثم أرسل' : 'اكتب هنا…',
+                        hintText: waiting
+                            ? tr('اكتب هنا ثم أرسل', 'Type here and send')
+                            : tr('اكتب هنا…', 'Type here…'),
                         hintStyle: const TextStyle(color: C.dim),
                         isDense: true,
                         filled: true,
@@ -7167,7 +7563,7 @@ class _OutputScreenState extends State<OutputScreen> {
                   enabled: waiting,
                   child: Semantics(
                     button: true,
-                    label: 'إرسال',
+                    label: tr('إرسال', 'Send'),
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 200),
                       width: _inputHeight,
@@ -7180,7 +7576,7 @@ class _OutputScreenState extends State<OutputScreen> {
                       child: IconButton(
                         onPressed: waiting ? () => unawaited(_send()) : null,
                         color: waiting ? C.onAccent : C.dim,
-                        tooltip: 'إرسال',
+                        tooltip: tr('إرسال', 'Send'),
                         icon: const Icon(Icons.arrow_upward_rounded),
                       ),
                     ),
