@@ -24,6 +24,12 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import android.util.Rational
+import android.app.Activity
+import android.app.AlertDialog
+import android.os.Bundle
+import android.os.Process
+import java.lang.ref.WeakReference
+import java.security.MessageDigest
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import io.flutter.embedding.android.FlutterActivity
@@ -44,9 +50,35 @@ import java.util.concurrent.TimeUnit
 class MainActivity : FlutterActivity() {
     private var attachedEngine: FlutterEngine? = null
     private var system: BayanSystem? = null
+    private var integrityChannel: MethodChannel? = null
+
+    // (أ) فحص التوقيع الأول: عند إنشاء النشاط، قبل أي واجهة أو بايثون.
+    override fun onCreate(savedInstanceState: Bundle?) {
+        BayanIntegrity.activityRef = WeakReference(this)
+        when (BayanIntegrity.verdict(applicationContext)) {
+            BayanIntegrity.Verdict.TAMPERED -> {
+                super.onCreate(savedInstanceState)
+                BayanIntegrity.punish(this)
+                return
+            }
+            else -> super.onCreate(savedInstanceState)
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // (ج) قناة يستدعيها Dart عند الإقلاع وقبل تسجيل الدخول للسحابة.
+        integrityChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "bayan/integrity").also {
+            it.setMethodCallHandler { call, result ->
+                if (call.method == "verify") {
+                    val ok = BayanIntegrity.isIntactHex(applicationContext)
+                    if (!ok) BayanIntegrity.punish(this)
+                    result.success(mapOf("ok" to ok))
+                } else {
+                    result.notImplemented()
+                }
+            }
+        }
         attachedEngine = flutterEngine
         val bridge = BayanPythonBridge.get(applicationContext)
         bridge.attach(flutterEngine)
@@ -81,6 +113,8 @@ class MainActivity : FlutterActivity() {
         bridge.unbindActivity(this)
         attachedEngine?.let { bridge.detach(it) }
         system?.detach()
+        integrityChannel?.setMethodCallHandler(null)
+        integrityChannel = null
         attachedEngine = null
         system = null
         super.onDestroy()
@@ -1030,6 +1064,10 @@ class BayanPythonBridge private constructor(private val context: Context) :
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "init" -> {
+                if (!BayanIntegrity.guard(context)) {
+                    fail(result, "tampered", BayanIntegrity.MESSAGE)
+                    return
+                }
                 controlExecutor.execute {
                     try {
                         val py = ensurePython()
@@ -1056,6 +1094,10 @@ class BayanPythonBridge private constructor(private val context: Context) :
             }
 
             "run" -> {
+                if (!BayanIntegrity.guard(context)) {
+                    fail(result, "tampered", BayanIntegrity.MESSAGE)
+                    return
+                }
                 val runId = call.argument<String>("runId")
                 val scriptPath = call.argument<String>("scriptPath")
                 // بصمة النص تُخزَّن كما هي (نص فقط)، وKotlin لا يفهمها
@@ -1382,6 +1424,10 @@ class BayanPythonBridge private constructor(private val context: Context) :
 
             "packages.install" -> {
                 val spec = call.argument<String>("spec")?.trim()
+                if (!BayanIntegrity.guard(context)) {
+                    fail(result, "tampered", BayanIntegrity.MESSAGE)
+                    return
+                }
                 val jobId = call.argument<String>("jobId")?.trim()
                 if (spec.isNullOrBlank() || jobId.isNullOrBlank()) {
                     fail(result, "bad_arguments", "بيانات تثبيت المكتبة ناقصة")
@@ -2169,5 +2215,141 @@ class BayanSystem(private val context: Context) : MethodChannel.MethodCallHandle
             BayanScriptService.onRunsChanged()
         }
         return ok
+    }
+}
+
+
+/**
+ * المرحلة 3: التحقق من توقيع الـ APK (يكشف النسخة المعدّلة والمعاد توقيعها). بلا أي خدمة خارجية.
+ * القيمة المتوقعة تُحقن وقت البناء في BayanIntegrityData (مقسّمة ومعمّاة بـ XOR، لا hex صريح).
+ * حدود صادقة: من يعدّل التطبيق نفسه يستطيع حذف هذا الفحص أو تعديله؛ الهدف رفع الكلفة فقط.
+ * عند استثناء غير متوقع من PackageManager (ROM غريب) نفتح الفحص ولا نحجب المستخدم الشرعي ونسجّل الخطأ.
+ */
+object BayanIntegrity {
+    enum class Verdict { OK, TAMPERED, ERROR, DISABLED }
+
+    const val MESSAGE = "هذه النسخة معدّلة أو غير رسمية، حمّل التطبيق من المصدر الرسمي"
+    private const val TAG = "BayanIntegrity"
+
+    @Volatile var activityRef: WeakReference<Activity>? = null
+
+    /** يعيد بناء SHA-256 المتوقع من الجزأين المعمّيين. */
+    private fun expectedBytes(): ByteArray? {
+        if (!BayanIntegrityData.ENABLED) return null
+        val a = BayanIntegrityData.A
+        val k = BayanIntegrityData.K
+        if (a.size != 32 || k.size != 32) return null
+        return ByteArray(32) { i -> (a[i] xor k[i]).toByte() }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun signerCerts(context: Context): List<ByteArray> {
+        val pm = context.packageManager
+        val pkg = context.packageName
+        return if (Build.VERSION.SDK_INT >= 28) {
+            val info = pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES)
+            val si = info.signingInfo ?: throw IllegalStateException("signingInfo null")
+            // كل الموقّعين الحاليين يجب أن يطابقوا المتوقع (عادةً واحد فقط).
+            val signers = si.apkContentsSigners // الموقّعون الحاليون (يشمل hasMultipleSigners)
+            (signers ?: emptyArray()).map { it.toByteArray() }
+        } else {
+            val info = pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES)
+            (info.signatures ?: emptyArray()).map { it.toByteArray() }
+        }
+    }
+
+    /** الصياغة 1 (للنشاط): مقارنة بايتات مباشرة بزمن ثابت. */
+    fun verdict(context: Context): Verdict {
+        val expected = expectedBytes()
+        if (expected == null) {
+            Log.w(TAG, "integrity check disabled for this build (no release keystore at build time)")
+            return Verdict.DISABLED
+        }
+        return try {
+            val certs = signerCerts(context)
+            if (certs.isEmpty()) return Verdict.TAMPERED
+            val sha = MessageDigest.getInstance("SHA-256")
+            val allMatch = certs.all { MessageDigest.isEqual(sha.digest(it), expected) }
+            if (allMatch) Verdict.OK else Verdict.TAMPERED
+        } catch (t: Throwable) {
+            Log.e(TAG, "integrity check error (allowing): ${t.message}")
+            Verdict.ERROR
+        }
+    }
+
+    private fun hex(bytes: ByteArray): String {
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            sb.append("0123456789abcdef"[(b.toInt() shr 4) and 0xF])
+            sb.append("0123456789abcdef"[b.toInt() and 0xF])
+        }
+        return sb.toString()
+    }
+
+    /** الصياغة 2 (لقناة Dart): مقارنة نصية hex بطريقة مختلفة عن الأولى. true = سليم أو غير قابل للفحص. */
+    fun isIntactHex(context: Context): Boolean {
+        val expected = expectedBytes() ?: return true
+        return try {
+            val want = hex(expected)
+            val certs = signerCerts(context)
+            if (certs.isEmpty()) return false
+            var bad = 0
+            for (c in certs) {
+                val got = hex(MessageDigest.getInstance("SHA-256").digest(c))
+                var diff = got.length xor want.length
+                for (i in 0 until minOf(got.length, want.length)) diff = diff or (got[i].code xor want[i].code)
+                if (diff != 0) bad++
+            }
+            bad == 0
+        } catch (t: Throwable) {
+            Log.e(TAG, "integrity (hex) error (allowing): ${t.message}")
+            true
+        }
+    }
+
+    /** الصياغة 3 (لمدخل بايثون/الجسر): حارس بقرار منطقي مستقل. true = مسموح المتابعة. */
+    fun guard(context: Context): Boolean {
+        val expected = expectedBytes() ?: return true
+        return try {
+            val certs = signerCerts(context)
+            var matched = 0
+            for (c in certs) {
+                if (java.util.Arrays.equals(MessageDigest.getInstance("SHA-256").digest(c), expected)) matched++
+            }
+            val ok = certs.isNotEmpty() && matched == certs.size
+            if (!ok) punishLater(context)
+            ok
+        } catch (t: Throwable) {
+            Log.e(TAG, "integrity guard error (allowing): ${t.message}")
+            true
+        }
+    }
+
+    private fun punishLater(context: Context) {
+        Handler(Looper.getMainLooper()).post {
+            val act = activityRef?.get()
+            if (act != null) punish(act) else Process.killProcess(Process.myPid())
+        }
+    }
+
+    /** حوار عربي ثم إغلاق التطبيق (ومنع بايثون والسحابة لأن الفحوص الأخرى ترفض أيضًا). */
+    fun punish(activity: Activity) {
+        activity.runOnUiThread {
+            try {
+                AlertDialog.Builder(activity)
+                    .setTitle("Bynux")
+                    .setMessage(MESSAGE)
+                    .setCancelable(false)
+                    .setPositiveButton("إغلاق") { _, _ -> kill(activity) }
+                    .show()
+            } catch (t: Throwable) {
+                kill(activity)
+            }
+        }
+    }
+
+    private fun kill(activity: Activity) {
+        try { activity.finishAffinity() } catch (_: Throwable) {}
+        Process.killProcess(Process.myPid())
     }
 }

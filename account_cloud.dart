@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 
 import 'python_runtime.dart';
+import 'secure_http.dart';
 
 /// إعدادات الخدمة. معرّف تطبيق الويب ليس سرّاً، ولا نضع أي سرّ داخل التطبيق.
 const String bynuxGoogleWebClientId =
@@ -354,6 +356,13 @@ class BynuxSession extends ChangeNotifier {
   Future<void> initialize() => _initializationFuture ??= _initializeOnce();
 
   Future<void> _initializeOnce() async {
+    if (!await BayanIntegrityGate.isIntact()) {
+      _initializationError = tr(
+          'هذه النسخة معدّلة أو غير رسمية. حمّل التطبيق من المصدر الرسمي.',
+          'This build is modified or unofficial. Download the app from the official source.');
+      notifyListeners();
+      return;
+    }
     try {
       await _google.initialize(serverClientId: bynuxGoogleWebClientId);
       _events = _google.authenticationEvents.listen(
@@ -607,6 +616,22 @@ class BynuxSession extends ChangeNotifier {
   }
 }
 
+/// المرحلة 3 (ج): يسأل Kotlin عن سلامة توقيع التطبيق قبل أي عمل سحابي.
+/// عند استثناء غير متوقع من القناة نسمح (لا نحجب المستخدم الشرعي)؛ الحجب الفعلي يتم في Kotlin.
+class BayanIntegrityGate {
+  static const MethodChannel _channel = MethodChannel('bayan/integrity');
+
+  static Future<bool> isIntact() async {
+    try {
+      final dynamic raw = await _channel.invokeMethod<dynamic>('verify');
+      if (raw is Map) return raw['ok'] != false;
+      return true;
+    } catch (_) {
+      return true;
+    }
+  }
+}
+
 class CloudApiException implements Exception {
   const CloudApiException(this.message, {this.statusCode});
   final String message;
@@ -666,11 +691,23 @@ class BynuxCloudApi {
   BynuxCloudApi._();
   static final BynuxCloudApi instance = BynuxCloudApi._();
 
-  final HttpClient _client = HttpClient()
-    ..connectionTimeout = const Duration(seconds: 20)
-    ..idleTimeout = const Duration(seconds: 20);
+  // عميل مثبَّت الجذور (secure_http.dart): يقبل هذا المضيف فقط عبر https.
+  final HttpClient _client = createPinnedHttpClient();
 
-  Uri _uri(String path) => Uri.parse('$bynuxCloudApiBase$path');
+  Uri _uri(String path) => requirePinnedUri(Uri.parse('$bynuxCloudApiBase$path'));
+
+  /// يفتح الطلب عبر العميل المثبَّت ويحوّل فشل TLS إلى رسالة عربية داخل السحابة فقط.
+  Future<HttpClientRequest> _openPinned(
+    String method,
+    Uri uri,
+    Duration timeout,
+  ) async {
+    try {
+      return await openPinned(_client, method, uri, timeout: timeout);
+    } on PinnedConnectionException catch (error) {
+      throw CloudApiException(error.message);
+    }
+  }
 
   /// إذا رفض الخادم رمز الجلسة المحفوظ (401) نسقطه ونعيد الطلب مرة واحدة برمز جوجل.
   Future<T> _withAuthRetry<T>(Future<T> Function() action) async {
@@ -688,9 +725,8 @@ class BynuxCloudApi {
   /// يطلب من الخادم رمز جلسة طويلًا مقابل رمز جوجل صالح. يُرمى CloudApiException
   /// برمز 404/405 إذا كان الخادم قديمًا ولا يدعم الجلسات.
   Future<CloudSessionGrant> createSession(String googleIdToken) async {
-    final request = await _client
-        .postUrl(_uri('/v1/session'))
-        .timeout(const Duration(seconds: 15));
+    final request = await _openPinned(
+        'POST', _uri('/v1/session'), const Duration(seconds: 15));
     request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $googleIdToken');
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     request.headers.contentType = ContentType.json;
@@ -723,9 +759,8 @@ class BynuxCloudApi {
   /// إلغاء رمز الجلسة على الخادم عند تسجيل الخروج (أفضل جهد، لا يعطّل الخروج).
   Future<void> revokeSession(String sessionToken) async {
     try {
-      final request = await _client
-          .postUrl(_uri('/v1/session/revoke'))
-          .timeout(const Duration(seconds: 10));
+      final request = await _openPinned(
+          'POST', _uri('/v1/session/revoke'), const Duration(seconds: 10));
       request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $sessionToken');
       request.headers.contentType = ContentType.json;
       request.add(utf8.encode('{}'));
@@ -738,9 +773,8 @@ class BynuxCloudApi {
 
   Future<HttpClientRequest> _open(String method, String path) async {
     final token = await BynuxSession.instance.authToken();
-    final request = await _client.openUrl(method, _uri(path)).timeout(
-          const Duration(seconds: 25),
-        );
+    final request =
+        await _openPinned(method, _uri(path), const Duration(seconds: 25));
     request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     return request;
