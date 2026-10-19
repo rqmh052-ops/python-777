@@ -1844,6 +1844,74 @@ def test_fixes_md_documents_build_2c() -> None:
         assert needle in fixes, needle
 
 
+# ---------------------------------------------------------------------------
+# Kotlin cross-references: an unresolved `Class.member` only fails in Gradle (4+ minutes into the
+# build), e.g. "Unresolved reference 'sync'" for BayanScriptService.sync(context). Catch it here.
+# ---------------------------------------------------------------------------
+def _kt_strip_noise(src: str) -> str:
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    src = re.sub(r"//[^\n]*", "", src)
+    src = re.sub(r'"""(?:.|\n)*?"""', '""', src)
+    return re.sub(r'"(?:\\.|[^"\\\n])*"', '""', src)
+
+
+def _kt_body_after(src: str, start: int) -> str:
+    i = src.index("{", start)
+    depth = 0
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[i + 1 : j]
+    raise ValueError("unbalanced braces")
+
+
+def _kt_decls(body: str) -> set[str]:
+    names = set(re.findall(r"\bfun\s+(?:<[^>]*>\s*)?(?:\w+\.)?(\w+)\s*\(", body))
+    return names | set(re.findall(r"\b(?:val|var)\s+(\w+)", body))
+
+
+def test_kotlin_class_member_references_resolve() -> None:
+    src = _kt_strip_noise(KOTLIN.read_text(encoding="utf-8"))
+    companions: dict[str, set[str]] = {}
+    nested: dict[str, set[str]] = {}
+    bodies: dict[str, str] = {}
+    for m in re.finditer(r"^[ \t]*(?:(?:private|internal|data|sealed|open|abstract)\s+)*(class|object)\s+(\w+)", src, re.M):
+        kind, name = m.groups()
+        body = _kt_body_after(src, m.end())
+        bodies[name] = body
+        nested[name] = set(re.findall(r"(?:class|object|interface)\s+(\w+)", body))
+        comp = re.search(r"companion object[^{]*\{", body)
+        if comp:
+            companions[name] = _kt_decls(_kt_body_after(body, comp.start()))
+        elif kind == "object":
+            companions[name] = _kt_decls(body)
+    assert {"BayanScriptService", "BayanPythonBridge"} <= set(companions), sorted(companions)
+
+    unresolved = sorted(
+        {
+            f"{cls}.{use}"
+            for cls, names in companions.items()
+            for use in re.findall(rf"\b{cls}\.(\w+)", src)
+            if use not in names | nested.get(cls, set()) | {"Companion", "class"}
+        }
+    )
+    assert not unresolved, f"Kotlin references members that do not exist (Gradle: Unresolved reference): {unresolved}"
+
+    # instance members reached through the singleton accessors
+    declared = _kt_decls(bodies["BayanPythonBridge"]) | nested["BayanPythonBridge"]
+    used = set(re.findall(r"BayanPythonBridge\.peek\(\)\??\.(\w+)", src)) | set(
+        re.findall(r"BayanPythonBridge\.get\([^)]*\)\??\.(\w+)", src)
+    )
+    assert used, "no BayanPythonBridge instance calls found: the pattern is stale"
+    assert not used - declared, f"BayanPythonBridge has no member(s) {sorted(used - declared)}"
+
+    # the language switch must refresh the running service's notification through a real function
+    assert "BayanScriptService.onRunsChanged()" in src and "BayanScriptService.sync(" not in src
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in tests:
